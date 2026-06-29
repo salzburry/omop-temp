@@ -1,0 +1,1829 @@
+file1
+#!/usr/bin/env Rscript
+# ONE combined dashboard for both cohorts + exploratory.
+#
+#   Rscript apr_30_2026/07_combined_dashboard.R
+#
+# Output: combined_dashboard.html in cfg$output_dir.
+#
+# The two standalone dashboards still build exactly as before:
+#   Rscript apr_30_2026/05_regimen_dashboard.R  -> whole (overall) cohort
+#   Rscript apr_30_2026/06_ndmm_dashboard.R     -> NDMM cohort
+# This script reuses their builders + cohort-prep functions to produce a
+# single HTML. The left sidebar has cohort pills:
+#
+#   Summary  executive landing page - Overall vs NDMM headline numbers,
+#            data-quality strip, and a Key findings panel (built last, then
+#            sorted to the front by tag_and_order()); the opening view.
+#   Overall  whole parent LOT_LONG cohort (regimen transitions + steroids +
+#            payer + QC + LOT1-5 detail)
+#   NDMM     1L newly-diagnosed cohort (IE filters)
+#
+# Within each cohort, tag_and_order() groups views into collapsible buckets
+# (Cohort & attrition / Treatment patterns / Steroids & payer, plus the
+# full-only Patient explorer / Validation / Debug), and a Stakeholder/Full
+# toggle hides the full-only buckets by default.
+#
+# The "Exploratory analysis" cohort pill carries the study-team validation
+# Q&A (Q1-Q6, "MM LOT Validation next steps"), built by
+# build_validation_exploratory() from the shared R/validation_qs_jun29.R
+# module (same logic as the standalone validation_qs_jun29.R program).
+# build_exploratory_scaffold() remains below as documentation of the
+# placement rule for future ad-hoc asks.
+#
+# Parent derivation logic is unchanged.
+
+.script_dir <- local({
+  args <- commandArgs(trailingOnly = FALSE)
+  fa <- grep("^--file=", args, value = TRUE)
+  if (length(fa) > 0)
+    return(dirname(normalizePath(sub("^--file=", "", fa[1]))))
+  for (i in seq_len(sys.nframe())) {
+    o <- tryCatch(sys.frame(i)$ofile, error = function(e) NULL)
+    if (!is.null(o)) return(dirname(normalizePath(o)))
+  }
+  getwd()
+})
+
+# Source 06_ndmm_dashboard.R (which itself sources 05_regimen_dashboard.R)
+# AND 04_lot_detail_dashboard.R without letting any of them auto-run their
+# own single-cohort main(). The script_dir overrides pin each file's
+# R/ helper + CSV resolution to this folder, since commandArgs("--file=")
+# now points at THIS combined script.
+options(ndmm_dashboard.no_autorun       = TRUE)
+options(ndmm_dashboard.script_dir       = .script_dir)
+options(regimen_dashboard.script_dir    = .script_dir)
+options(lot_detail_dashboard.no_autorun = TRUE)
+source(file.path(.script_dir, "06_ndmm_dashboard.R"))
+source(file.path(.script_dir, "04_lot_detail_dashboard.R"))
+
+# Shared study-team validation Q&A logic (Q1-Q6, "MM LOT Validation next
+# steps"). Same module the standalone validation_qs_jun29.R uses, so the
+# Exploratory tables here and that program's CSVs can never drift apart.
+# load_codelist_csv (needed only for the guarded raw-claim examples) may not
+# be sourced by the dashboard chain; source it best-effort.
+try(source(file.path(.script_dir, "R", "codelists_lot.R")), silent = TRUE)
+source(file.path(.script_dir, "R", "validation_qs_jun29.R"))
+
+# Rewrite the section/title fields of items newly added by a builder so
+# they cluster under one cohort heading in the combined sidebar while
+# preserving their original subsection name in the title. Range
+# [from_idx+1, length(dashboard_items)] is the freshly appended slice.
+# This is the post-processing alternative to parameterising every
+# save_*() call inside the LOT1-5 detail collector - new views added
+# there will be re-sectioned automatically.
+resection_recent_items <- function(from_idx, cohort_label,
+                                   subsection_in_title = TRUE) {
+  n <- length(dashboard_items)
+  if (n <= from_idx) return(invisible())
+  for (i in (from_idx + 1):n) {
+    it <- dashboard_items[[i]]
+    orig_section <- it$section
+    if (isTRUE(subsection_in_title) &&
+        !identical(orig_section, cohort_label)) {
+      it$title <- paste0(orig_section, ": ", it$title)
+    }
+    it$section <- cohort_label
+    dashboard_items[[i]] <<- it
+  }
+}
+
+# ---- Per-cohort view collection -------------------------------------
+# Runs both the shared regimen-transition / steroid builders AND the
+# LOT1-5 detail collector from 04_lot_detail_dashboard.R against this
+# cohort's data, tagging every produced item with section = cohort_label
+# so the combined sidebar groups them under one collapsible cohort
+# heading.
+#
+# Within the cohort group, title prefixes cluster related views:
+#   Transitions: / Steroids: / QC:   regimen builders (Sankeys, steroids)
+#   FUNNEL: / START_TYPE: / ...       LOT1-5 detail (carried in by re-section)
+#
+# Callers MUST have populated LOT_LONG_AUG for this cohort (via
+# prepare_overall_cohort / prepare_ndmm_cohort) immediately before, and
+# must not repopulate it until this returns. lot_long_tbl is what the
+# LOT1-5 collector aggregates over; usually the cohort-filtered LOT_LONG
+# view so all the FUNNEL / START_TYPE / etc. detail reflects the cohort.
+# include_debug = TRUE only on the first call (Overall) - the DEBUG/QC
+# work-table inventory + ANY-PATID drilldown are schema-wide, not
+# cohort-scoped, so repeating them for NDMM would mislead.
+collect_cohort_views <- function(con, cohort_label, lookups, lot_long_tbl,
+                                 include_debug = FALSE,
+                                 ndmm_flags_tbl = NULL) {
+  # Per-step progress logging: these builders are otherwise silent, so a slow
+  # or stalled one used to look like the run simply stopped after the cohort's
+  # attrition figure. Each line names the view group about to be built, so the
+  # last line printed before a stall pinpoints the culprit (for both cohorts).
+  log_msg("[", cohort_label, "] views 1/8: steroid prevalence + missing-steroid LOT1 + DEXA-vs-LENA timing + pre-LOT steroid")
+  # Shared gate: an unavailable codelist yields one "analyses unavailable" card
+  # instead of 0%/"0 of N" tables that read as real absence in the
+  # stakeholder-visible Steroids section.
+  build_steroid_section(con, lot_long_tbl, section = cohort_label,
+                        title_prefix = "Steroids: ")
+  log_msg("[", cohort_label, "] views 2/8: focused regimen-pair transitions")
+  for (n in 1:4)
+    build_focused_pair(con, n, n + 1L, section = cohort_label,
+                       title_prefix = "Transitions: ")
+  log_msg("[", cohort_label, "] views 3/8: category-pair transitions")
+  for (n in 1:4)
+    build_category_pair(con, n, n + 1L, lookups, section = cohort_label,
+                        title_prefix = "Transitions: ")
+  log_msg("[", cohort_label, "] views 4/8: category coverage QC")
+  build_category_coverage(con, lookups, section = cohort_label,
+                          title_prefix = "QC: ")
+  log_msg("[", cohort_label, "] views 5/8: patient gallery")
+  build_patient_gallery(con, lot_long_tbl, section = cohort_label,
+                        title_prefix = "Examples: ")
+  log_msg("[", cohort_label, "] views 6/8: validation views")
+  build_validation_views(con, lot_long_tbl, section = cohort_label,
+                         title_prefix = "Validation: ",
+                         ndmm_flags_tbl = ndmm_flags_tbl)
+  log_msg("[", cohort_label, "] views 6b/8: payer split (Medicare vs Commercial)")
+  build_payer_lot_qc(con, section = cohort_label, title_prefix = "Payer: ")
+
+  # LOT1-5 detail (FUNNEL, START_TYPE, END_REASON, LENGTH, REGIMENS,
+  # PROGRESSION, GAPS, TRANSITIONS, SANKEY, MEDCOUNT, MTX, TREND,
+  # MED JOURNEY, +DEBUG/DRILLDOWN if include_debug). The collector
+  # tags items with its original section names; we re-section them
+  # under cohort_label and fold the original name into the title.
+  log_msg("[", cohort_label, "] views 7/8: LOT1-5 detail (funnel/sankey/transitions/...)")
+  before <- length(dashboard_items)
+  collect_lot_long_views(con, lot_long_tbl, include_debug = include_debug)
+  resection_recent_items(before, cohort_label)
+  log_msg("[", cohort_label, "] views 8/8: done (", length(dashboard_items), " items)")
+}
+
+# ---- Exploratory analysis scaffold ----------------------------------
+build_exploratory_scaffold <- function() {
+  add_html_card(paste0(
+    '<div style="font-family:system-ui;padding:14px;max-width:900px">',
+    '<h3>Exploratory analysis</h3>',
+    '<p style="color:#555;font-size:13px">Home for ad-hoc / one-off ',
+    'requests. Placement rule:</p>',
+    '<ul style="font-size:13px;color:#444">',
+    '<li>An ask that <b>reuses the Overall or NDMM cohort</b> (same ',
+    'patient denominator) is added <b>under that cohort</b> in the left ',
+    'sidebar as a <code>QC:</code> or <code>Sensitivity:</code> ',
+    'item - not here.</li>',
+    '<li>An ask that <b>changes the cohort</b> (a different denominator, ',
+    'e.g. a POMA-specific subset) is added <b>here</b> as its own view, ',
+    'with the cohort definition stated on the view.</li>',
+    '</ul>',
+    '<p style="color:#888;font-size:12px">The study-team validation Q&amp;A ',
+    '(Q1-Q6) is wired in here via <code>build_validation_exploratory()</code>; ',
+    'further different-cohort ad-hoc analyses land here as they come in.</p>',
+    '</div>'),
+    section = "Exploratory analysis",
+    title   = "About this section")
+}
+
+# ---- Exploratory objective: MM LOT Validation next steps (Q1-Q6) ----------
+# Renders the six study-team validation questions (Julia Moore, Jun-2026) as
+# labelled tables under the Exploratory cohort pill. Denominator = the parent
+# (Overall) LOT_LONG cohort; the cohort definition is stated on the intro card.
+# Summary tables are stakeholder-visible; the raw-claim / MAP-journey patient
+# examples carry "(sample)" so classify_item() routes them to the full-only
+# Patient explorer (no raw PATID table leaks into the stakeholder view).
+# Whole body is guarded so a failure degrades to one note card instead of
+# killing the combined dashboard.
+SEC_EXPL <- "Exploratory analysis"
+
+build_validation_exploratory <- function(con) {
+  lot_long <- wrk("LOT_LONG"); map_tbl <- wrk("MAP_STACKED"); sct_tbl <- wrk("LOT1_SCT")
+  have_map <- isTRUE(tryCatch({ db_q(con, glue("SELECT 1 FROM {map_tbl} LIMIT 1")); TRUE },
+                              error = function(e) FALSE))
+  have_sct <- isTRUE(tryCatch({ db_q(con, glue("SELECT 1 FROM {sct_tbl} LIMIT 1")); TRUE },
+                              error = function(e) FALSE))
+  tokens <- tryCatch(vqs_resolve_agent_tokens(con),
+                     error = function(e) list(poma = "POMA", elot = "ELOT",
+                                              pano = "PANO", notes = character(0)))
+  # Observation-window bounds for the raw-claim examples + the raw CAR-T scan
+  # (the only source that can answer "CAR-T before LOT1").
+  bounds   <- tryCatch(vqs_obs_bounds_src(con),
+                       error = function(e) list(sql = NULL, available = FALSE))
+  cart_raw <- if (have_sct)
+    tryCatch(vqs_build_raw_cart_dates(con, lot_long, bounds$sql),
+             error = function(e) NULL) else NULL
+
+  add_html_card(paste0(
+    '<div style="font-family:system-ui;padding:14px;max-width:900px">',
+    '<h3>MM LOT Validation next steps (study-team Q&amp;A)</h3>',
+    '<p style="color:#555;font-size:13px">Six follow-up questions from the ',
+    'study team (Jun&nbsp;2026). Denominator = the parent <b>Overall</b> ',
+    '<code>LOT_LONG</code> cohort. The same logic backs the standalone ',
+    '<code>validation_qs_jun29.R</code> program (CSV outputs).</p>',
+    '<ul style="font-size:13px;color:#444">',
+    '<li><b>Steroid signal</b>: a <code>STEROID</code>-class segment in ',
+    '<code>MAP_STACKED</code> (the codelist class the LOT engine excludes ',
+    'from regimens). "Steroid at LOT<i>n</i>" = a steroid MAP starting inside ',
+    'the induction window (', VQS_W1, 'd for LOT1, ', VQS_W2, 'd for LOT2).</li>',
+    '<li><b>Before/after windows</b> (7/14/30d) are cumulative (&le;N days) ',
+    'and measured from a steroid MAP start date.</li>',
+    '<li><b>CAR-T (Q6)</b>: "during or closing LOT1" = <code>LOT1_SCT.',
+    'FIRST_CART_DT</code> in <code>[LOT1_START, LOT_BASE_END_DT]</code>, ',
+    'extended to <code>LOT_BASE_END_DT+1</code> <b>only when</b> ',
+    '<code>LOT_BASE_END_REASON</code> is <code>SCT_CART</code>/',
+    '<code>CART_INIT</code> (the engine sets the LOT end to the CAR-T date',
+    '&minus;1 for a CAR-T-ending line, so the closing CAR-T lands one day past ',
+    'the end). "Before LOT1" comes from raw SCT claims',
+    if (is.null(cart_raw)) ' (unavailable this run &mdash; shown as NA)' else '',
+    ', since <code>FIRST_CART_DT</code> only captures CAR-T on/after LOT1 start.</li>',
+    '<li><b>Agent tokens</b>: POMA=', tokens$poma, ', ELOT=', tokens$elot,
+    ', PANO=', tokens$pano, ' (best-effort from <code>cl_mma_codelist.csv</code>).</li>',
+    '<li><b>Raw-claim examples</b> are ',
+    if (isTRUE(bounds$available)) 'bounded to each patient&rsquo;s [INDEX_DATE, OBS_END_DT] window.'
+    else 'NOT observation-window bounded this run (ELIG_COH_FINAL unavailable).',
+    '</li>',
+    '</ul></div>'),
+    section = SEC_EXPL, title = "About this section")
+
+  # Q1 ----------------------------------------------------------------------
+  tryCatch({
+    q1 <- vqs_q1_exclusion_agents(con, lot_long, tokens)
+    save_table(q1, section = SEC_EXPL,
+               title = "Q1: LOT1 regimens with pomalidomide / elotuzumab / panobinostat")
+  }, error = function(e) log_msg("  [Exploratory] Q1 failed: ", conditionMessage(e)))
+
+  # Q3 / Q4 / Q5 (steroid timing) ------------------------------------------
+  if (have_map) {
+    tryCatch({
+      q3 <- vqs_steroid_windows(con, lot_long, map_tbl, lot_num = 1L, w = VQS_W1)
+      save_table(q3, section = SEC_EXPL, title = paste0(
+        "Q3: LOT1 no-steroid patients - steroid before/after induction (n=",
+        attr(q3, "line_without_steroid"), " of ", attr(q3, "line_patients"), ")"))
+      # "who" (patient-level, full-only via "sample"); capped for the HTML.
+      q3p <- vqs_steroid_windows_patients(con, lot_long, map_tbl, lot_num = 1L, w = VQS_W1, limit = 500L)
+      if (!is.null(q3p) && nrow(q3p) > 0)
+        save_table(q3p, section = SEC_EXPL,
+                   title = "Q3: LOT1 no-steroid patients - who got a steroid in-window (sample, max 500)")
+    }, error = function(e) log_msg("  [Exploratory] Q3 failed: ", conditionMessage(e)))
+    tryCatch({
+      q4 <- vqs_steroid_windows(con, lot_long, map_tbl, lot_num = 2L, w = VQS_W2)
+      save_table(q4, section = SEC_EXPL, title = paste0(
+        "Q4: LOT2 no-steroid patients - steroid before/after induction (n=",
+        attr(q4, "line_without_steroid"), " of ", attr(q4, "line_patients"), ")"))
+      q4p <- vqs_steroid_windows_patients(con, lot_long, map_tbl, lot_num = 2L, w = VQS_W2, limit = 500L)
+      if (!is.null(q4p) && nrow(q4p) > 0)
+        save_table(q4p, section = SEC_EXPL,
+                   title = "Q4: LOT2 no-steroid patients - who got a steroid in-window (sample, max 500)")
+    }, error = function(e) log_msg("  [Exploratory] Q4 failed: ", conditionMessage(e)))
+    tryCatch({
+      q5 <- vqs_q5_lot2_attribution(con, lot_long, map_tbl, w1 = VQS_W1, w2 = VQS_W2)
+      save_table(q5, section = SEC_EXPL,
+                 title = "Q5: LOT2 pre-start steroid - attributable to LOT1?")
+    }, error = function(e) log_msg("  [Exploratory] Q5 failed: ", conditionMessage(e)))
+
+    # Q2 examples (full-only: titles carry "(sample)") --------------------
+    tryCatch({
+      q2 <- vqs_q2_poma_examples(con, lot_long, map_tbl, tokens, n = 5L, bounds = bounds$sql)
+      if (!is.null(q2$journey) && nrow(q2$journey) > 0)
+        save_table(q2$journey, section = SEC_EXPL,
+                   title = "Q2: Pomalidomide LOT1 - MAP journey examples (sample)")
+      if (!is.null(q2$raw) && nrow(q2$raw) > 0)
+        save_table(q2$raw, section = SEC_EXPL,
+                   title = "Q2: Pomalidomide LOT1 - raw claims before MAPs (sample)")
+      else
+        vqs_note_card(paste0("Q2 raw-claim examples unavailable. ",
+                             if (!is.null(q2$note)) q2$note else ""),
+                      "Q2: Pomalidomide LOT1 - raw claims (sample, unavailable)")
+    }, error = function(e) log_msg("  [Exploratory] Q2 examples failed: ", conditionMessage(e)))
+  }
+
+  # Q6 (CAR-T) --------------------------------------------------------------
+  if (have_sct) {
+    tryCatch({
+      q6 <- vqs_q6_cart(con, lot_long, sct_tbl, w1 = VQS_W1, cart_raw_tbl = cart_raw)
+      save_table(q6, section = SEC_EXPL, title = "Q6: CAR-T prior to or during LOT1")
+    }, error = function(e) log_msg("  [Exploratory] Q6 failed: ", conditionMessage(e)))
+    tryCatch({
+      ex <- vqs_q6_cart_examples(con, lot_long, sct_tbl, map_tbl, n = 5L,
+                                 bounds = bounds$sql, cart_raw_tbl = cart_raw)
+      if (!is.null(ex$sct_raw) && nrow(ex$sct_raw) > 0)
+        save_table(ex$sct_raw, section = SEC_EXPL,
+                   title = "Q6: CAR-T prior/during LOT1 - raw SCT claims (sample)")
+      if (!is.null(ex$mma_raw) && nrow(ex$mma_raw) > 0)
+        save_table(ex$mma_raw, section = SEC_EXPL,
+                   title = "Q6: CAR-T prior/during LOT1 - raw MM claims (sample)")
+      if (!is.null(ex$journey) && nrow(ex$journey) > 0)
+        save_table(ex$journey, section = SEC_EXPL,
+                   title = "Q6: CAR-T prior/during LOT1 - MAP journey examples (sample)")
+      # Surface the example helper's note in both gap cases:
+      #  - no example patients selected (carries the honest "before-LOT1 not
+      #    assessed" caveat when the raw scan was unavailable), and
+      #  - patients selected but the requested RAW CAR-T claims came back empty
+      #    (Julia asked specifically for raw examples; don't let the MAP
+      #    journey stand in silently for them).
+      if (length(ex$patids) == 0)
+        vqs_note_card(if (!is.null(ex$note)) ex$note else
+                        "No CAR-T prior-to/during-LOT1 example patients selected.",
+                      "Q6: CAR-T prior/during LOT1 - examples (none)")
+      else if (is.null(ex$sct_raw) || nrow(ex$sct_raw) == 0)
+        vqs_note_card(paste0("Requested RAW CAR-T claim examples are unavailable",
+                             if (!is.null(ex$journey) && nrow(ex$journey) > 0)
+                               " (the MAP-derived journey above is shown instead)"
+                             else "", ". ",
+                             if (!is.null(ex$note)) ex$note else ""),
+                      "Q6: CAR-T prior/during LOT1 - raw SCT claims (sample, unavailable)")
+    }, error = function(e) log_msg("  [Exploratory] Q6 examples failed: ", conditionMessage(e)))
+  }
+  invisible()
+}
+
+# Small note card used when a guarded example pull yields nothing, so the
+# Exploratory section explains the gap rather than silently omitting it.
+vqs_note_card <- function(msg, title) {
+  add_html_card(paste0(
+    '<div style="font-family:system-ui;padding:12px;max-width:760px">',
+    '<h3 style="margin:0 0 6px">', title, '</h3>',
+    '<p style="color:#a06000;font-size:13px">', msg, '</p></div>'),
+    section = SEC_EXPL, title = title)
+}
+
+# ---- Summary landing page (data-driven, opens first) ----------------
+# Side-by-side Overall vs NDMM headline numbers pulled straight from
+# query_cohort_kpis() - no hard-coded findings. Every figure is computed
+# at build time from each cohort's LOT_LONG. The NDMM column degrades to
+# "n/a" when that cohort could not be built this run. Rendered as a
+# self-contained html_card (sandboxed iframe), so it cannot affect the
+# rest of the dashboard's navigation.
+build_summary_landing <- function(kpi_overall, kpi_ndmm, ndmm_ok, run_ts,
+                                   n_ster = NA, n_rules = NA, study_end = NA,
+                                   n_hcpcs = NA, n_ndc = NA, n_cpt = NA,
+                                   ndmm_notes = character(0)) {
+  has_o <- length(kpi_overall) > 0 && !is.null(kpi_overall$n_patients) &&
+           !is.na(kpi_overall$n_patients)
+  has_n <- isTRUE(ndmm_ok) && length(kpi_ndmm) > 0 &&
+           !is.null(kpi_ndmm$n_patients) && !is.na(kpi_ndmm$n_patients)
+
+  fmt_days <- function(x)
+    if (length(x) == 0 || is.null(x) || is.na(x)) "-" else paste0(fmt_n(x), " d")
+  reached <- function(k, key)
+    paste0(fmt_n(k[[key]]), " <span style='color:#6B7280'>(",
+           fmt_pct(k[[key]], k$n_patients), ")</span>")
+
+  ov <- if (has_o) list(
+    pat = fmt_n(kpi_overall$n_patients),
+    pct = "&mdash;",
+    l2  = reached(kpi_overall, "n_lot2"),
+    l3  = reached(kpi_overall, "n_lot3"),
+    med = fmt_days(kpi_overall$lot1_median_len),
+    rng = fmt_date_range(kpi_overall$lot1_min, kpi_overall$lot1_max)
+  ) else NULL
+  nd <- if (has_n) list(
+    pat = fmt_n(kpi_ndmm$n_patients),
+    pct = fmt_pct(kpi_ndmm$n_patients, if (has_o) kpi_overall$n_patients else NA),
+    l2  = reached(kpi_ndmm, "n_lot2"),
+    l3  = reached(kpi_ndmm, "n_lot3"),
+    med = fmt_days(kpi_ndmm$lot1_median_len),
+    rng = fmt_date_range(kpi_ndmm$lot1_min, kpi_ndmm$lot1_max)
+  ) else NULL
+  ovcell <- function(key) if (is.null(ov)) "-" else ov[[key]]
+  ndcell <- function(key)
+    if (is.null(nd)) "<span style='color:#a06000'>n/a</span>" else nd[[key]]
+
+  rowh <- function(metric, key, hint = "")
+    paste0('<tr>',
+      '<td style="padding:10px 14px;border-bottom:1px solid #EEE">',
+        '<div style="font-weight:600;color:#2A2A33">', metric, '</div>',
+        if (nzchar(hint))
+          paste0('<div style="font-size:11px;color:#9aa0aa">', hint, '</div>')
+        else '',
+      '</td>',
+      '<td style="padding:10px 14px;border-bottom:1px solid #EEE;text-align:right;',
+        'font-variant-numeric:tabular-nums">', ovcell(key), '</td>',
+      '<td style="padding:10px 14px;border-bottom:1px solid #EEE;text-align:right;',
+        'font-variant-numeric:tabular-nums">', ndcell(key), '</td>',
+    '</tr>')
+
+  body <- paste0(
+    rowh("Patients (any LOT)", "pat", "distinct PATID"),
+    rowh("NDMM as % of Overall", "pct", "shared-denominator check"),
+    rowh("Reached LOT2+", "l2"),
+    rowh("Reached LOT3+", "l3"),
+    rowh("Median LOT1 length", "med", "LOT_BASE_LENGTH"),
+    rowh("LOT1 start range", "rng", "earliest &rarr; latest")
+  )
+
+  ndmm_note <- if (!has_n)
+    paste0('<p style="margin:10px 0 0;font-size:12px;color:#a06000">',
+           'The NDMM (1L) cohort could not be built this run, so its column ',
+           'shows <b>n/a</b>. See the NDMM section for the reason.</p>') else ""
+
+  or_na <- function(x)
+    if (length(x) == 0 || is.null(x) || (length(x) == 1 && is.na(x))) "n/a"
+    else as.character(x)
+  # One headline stat callout (accent = coloured top border per cohort).
+  stat_card <- function(label, value, sub, accent)
+    paste0('<div style="flex:1 1 200px;border:1px solid #E5E7EB;border-top:3px solid ',
+           accent, ';border-radius:10px;padding:14px 16px;background:#fff">',
+           '<div style="font-size:11px;text-transform:uppercase;letter-spacing:.05em;',
+           'color:#6B7280;font-weight:800">', label, '</div>',
+           '<div style="font-size:30px;font-weight:800;color:#1f2937;line-height:1.1;',
+           'margin-top:3px">', value, '</div>',
+           '<div style="font-size:12px;color:#6B7280;margin-top:2px">', sub, '</div></div>')
+  ov_pat <- if (has_o) fmt_n(kpi_overall$n_patients) else "n/a"
+  nd_pat <- if (has_n) fmt_n(kpi_ndmm$n_patients) else "n/a"
+  nd_sub <- if (has_n)
+      paste0(fmt_pct(kpi_ndmm$n_patients, if (has_o) kpi_overall$n_patients else NA),
+             " of Overall")
+    else "cohort unavailable this run"
+  stat_band <- paste0(
+    '<div style="display:flex;gap:14px;margin:0 0 18px;flex-wrap:wrap">',
+    stat_card("Overall cohort",   ov_pat, "patients with any LOT", "#0E7C7B"),
+    stat_card("NDMM cohort (1L)",  nd_pat, nd_sub,                  "#F36633"),
+    '</div>')
+  is_num <- function(x) !is.null(x) && length(x) == 1 && !is.na(x)
+  # Steroid codelist state. The tracked CSV can ship HCPCS-only (NDC absent ->
+  # oral steroids undercounted) or be missing/empty entirely (no codes at all
+  # -> the steroid analyses did not run, so a "0 of N" finding must NOT read as
+  # a real zero). Distinguish unavailable from HCPCS-only below.
+  # steroid_state() (defined in 05) is the shared source of truth, so the
+  # Summary, the overview banner and the per-cohort gate always agree - and
+  # unset counts (rx/medical unreadable) collapse to "unavailable" too.
+  st_steroid   <- steroid_state(n_hcpcs, n_cpt, n_ndc)
+  ster_unavail <- st_steroid == "unavailable"
+  codes_known  <- is_num(n_hcpcs) || is_num(n_ndc) || is_num(n_cpt)
+  ster_codes <- if (ster_unavail) "none loaded"
+    else if (codes_known) {
+      parts <- c(if (is_num(n_hcpcs)) paste0(n_hcpcs, " HCPCS"),
+                 if (is_num(n_cpt) && n_cpt > 0) paste0(n_cpt, " CPT"),
+                 if (is_num(n_ndc)) paste0(n_ndc, " NDC"))
+      if (length(parts) == 0) or_na(n_ster) else paste(parts, collapse = " + ")
+    } else or_na(n_ster)
+  # NDMM gate status: built / built with warnings (configured gates skipped) /
+  # unavailable - so a degraded run cannot look fully valid on the landing page.
+  ndmm_status <- if (!has_n) "unavailable"
+    else if (length(ndmm_notes) > 0) "built with warnings"
+    else "built"
+
+  warn_box <- function(html) paste0(
+    '<div style="margin-top:12px;padding:10px 12px;background:#FFF7ED;',
+    'border:1px solid #FED7AA;border-left:4px solid #EA8C00;border-radius:8px;',
+    'font-size:12.5px;color:#7c4a03">', html, '</div>')
+  alert_box <- function(html) paste0(
+    '<div style="margin-top:12px;padding:10px 12px;background:#FEF2F2;',
+    'border:1px solid #FECACA;border-left:4px solid #DC2626;border-radius:8px;',
+    'font-size:12.5px;color:#7f1d1d">', html, '</div>')
+  # Unavailable (no usable codes / inputs unreadable) is a red alert and
+  # suppresses steroid findings; procedure-only (HCPCS/CPT present, no NDC)
+  # keeps findings with an amber undercount caveat.
+  ster_warn <- if (ster_unavail) alert_box(paste0(
+      '<b>Steroid codelist unavailable.</b> No usable steroid codes were ',
+      'loaded (<code>steroid_codes.csv</code> missing/empty/unreadable, or the ',
+      'rx/medical inputs were unreadable), so the steroid analyses did not run ',
+      '&mdash; steroid findings are omitted here rather than shown as a real ',
+      'zero. Supply a valid codelist and re-run.'))
+    else if (st_steroid == "procedure_only") warn_box(paste0(
+      '<b>Steroid codelist has 0 NDC codes.</b> Oral pharmacy steroids are ',
+      'undercounted &mdash; steroid figures here reflect ',
+      '<b>procedure-code (HCPCS/CPT)-observed</b> claims only. Replace ',
+      '<code>steroid_codes.csv</code> with an NDC-complete file before ',
+      'stakeholder distribution.'))
+    else ""
+  ndmm_warn <- if (has_n && length(ndmm_notes) > 0) warn_box(paste0(
+    '<b>NDMM built with warnings.</b> One or more configured NDMM gates were ',
+    'skipped this run (a required source was unavailable), so the NDMM cohort ',
+    'is broader than the full specification:<ul style="margin:6px 0 0;padding-left:18px">',
+    paste(vapply(as.character(ndmm_notes),
+                 function(x) paste0("<li>", x, "</li>"), character(1)), collapse = ""),
+    '</ul>')) else ""
+
+  dq <- paste0(
+    '<div style="margin-top:16px;padding:10px 12px;background:#F7F8FA;',
+         'border:1px solid #E5E7EB;border-radius:8px;font-size:12px;color:#6B7280">',
+    '<b style="color:#2A2A33">Run &amp; data quality</b>',
+    ' &nbsp;&bull;&nbsp; Study end ',      or_na(study_end),
+    ' &nbsp;&bull;&nbsp; Steroid codes: ', ster_codes,
+    ' &nbsp;&bull;&nbsp; Category rules ', or_na(n_rules),
+    ' &nbsp;&bull;&nbsp; Generated ',      run_ts,
+    ' &nbsp;&bull;&nbsp; Overall: ', if (has_o) 'built' else 'unavailable',
+    ' &nbsp;&bull;&nbsp; NDMM: ', ndmm_status,
+    '</div>')
+
+  # Optional stakeholder-ask findings recorded by the steroid/payer builders -
+  # the exact numbers shown in their detail views, reused here, grouped by
+  # cohort (Overall then NDMM). Failsafe: any problem yields an empty panel.
+  findings_html <- tryCatch({
+    all_f <- if (exists("dashboard_findings")) dashboard_findings else list()
+    # No steroid-finding suppression needed here: build_steroid_section() gates
+    # at record time per cohort, so a steroid finding only exists when THAT
+    # cohort's steroids were available. (Suppressing on the global state would
+    # wrongly drop valid Overall findings if a later NDMM pass cleared it.)
+    render_cohort <- function(coh) {
+      ff <- Filter(function(f) identical(f$cohort, coh), all_f)
+      if (length(ff) == 0) return("")
+      rows <- paste(vapply(ff, function(f)
+        paste0('<li style="margin:4px 0"><b style="color:#0E7C7B">', f$group,
+               '</b> &mdash; ', f$text, '</li>'), character(1)), collapse = "")
+      paste0('<div style="margin-top:8px"><div style="font-size:12px;font-weight:800;',
+             'text-transform:uppercase;letter-spacing:.04em;color:#6B7280">', coh,
+             '</div><ul style="margin:2px 0 0;padding-left:18px;font-size:13px;',
+             'color:#2A2A33;line-height:1.5">', rows, '</ul></div>')
+    }
+    blocks <- paste0(render_cohort("Overall"), render_cohort("NDMM"))
+    if (!nzchar(blocks)) "" else
+      paste0('<h3 style="margin:20px 0 6px;font-size:15px;font-weight:800">Key findings ',
+             '<span style="font-weight:600;color:#6B7280;font-size:12px">',
+             '(full detail in each cohort&rsquo;s Steroids &amp; payer section)</span></h3>',
+             blocks)
+  }, error = function(e) "")
+
+  card <- paste0(
+'<div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;',
+     'padding:18px 20px;max-width:920px;color:#2A2A33">',
+  '<h2 style="margin:0 0 4px;font-size:20px;font-weight:800">Executive summary</h2>',
+  '<p style="margin:0 0 14px;font-size:13px;color:#6B7280;line-height:1.5">',
+    'Headline numbers for the two cohorts in this build. ',
+    '<b>Overall</b> is the whole parent line-of-therapy cohort; ',
+    '<b>NDMM</b> is the 1L newly-diagnosed subset (inclusion/exclusion gates applied; ',
+    'any skipped gates are flagged below). ',
+    'All figures are computed at build time from each cohort&rsquo;s LOT_LONG ',
+    '&mdash; nothing here is hard-coded.',
+  '</p>',
+  stat_band,
+  '<table style="border-collapse:collapse;width:100%;font-size:14px">',
+    '<thead><tr>',
+      '<th style="text-align:left;padding:8px 14px;border-bottom:2px solid #F36633;',
+        'font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:#6B7280">Metric</th>',
+      '<th style="text-align:right;padding:8px 14px;border-bottom:2px solid #F36633;',
+        'color:#0E7C7B">Overall</th>',
+      '<th style="text-align:right;padding:8px 14px;border-bottom:2px solid #F36633;',
+        'color:#D24E1F">NDMM</th>',
+    '</tr></thead>',
+    '<tbody>', body, '</tbody>',
+  '</table>',
+  ndmm_note,
+  ster_warn,
+  ndmm_warn,
+  findings_html,
+  dq,
+'</div>')
+
+  add_html_card(card, section = "Summary", title = "Executive summary")
+}
+
+# ---- Bucket + audience tagging --------------------------------------
+# Classify every item into a stakeholder-facing bucket and an audience by
+# the title prefix its builder emits (folded in by resection_recent_items
+# / the shared title_prefix= args). The bucket drives a two-level nav
+# (cohort pill -> collapsible bucket); the audience drives the
+# Stakeholder/Full toggle. Buckets and audience are aligned so the three
+# stakeholder buckets are uniformly stakeholder and the three internal
+# buckets are uniformly full - in stakeholder view the internal buckets
+# simply disappear, leaving a clean three-bucket nav per cohort.
+#
+# The data still ships in the file regardless of audience (acceptable
+# here: internal GSK audience with equivalent data access), so the toggle
+# is a presentation cut, not a privacy boundary.
+COHORT_ORDER <- c("Summary", "Overall", "NDMM", "Exploratory analysis")
+BUCKET_ORDER <- c("Summary", "Cohort & attrition", "Treatment patterns",
+                  "Steroids & payer", "Exploratory", "Patient explorer",
+                  "Validation", "Debug", "Other")
+
+classify_item <- function(title) {
+  # Rule order matters. Anchored internal prefixes are matched FIRST so a
+  # debug/validation view whose title happens to contain "sample" stays in
+  # its bucket. Then a catch-all routes any remaining raw patient-example /
+  # sample table (notably the "Steroids: ... examples (sample)" and
+  # "... - example patients" tables) into the full-only Patient explorer,
+  # BEFORE the stakeholder Steroids/Treatment rules can claim it - so no
+  # raw PATID table leaks into the stakeholder view. Aggregate steroid
+  # summaries (prevalence, before/same/after, mean lead time) have no
+  # example/sample marker and stay stakeholder.
+  rules <- list(
+    c("^Executive summary",                                  "Summary",            "stakeholder"),
+    c("^(Examples|MED JOURNEY): ",                           "Patient explorer",   "full"),
+    c("^(Validation|QC): ",                                  "Validation",         "full"),
+    c("^(DEBUG|DRILLDOWN): ",                                "Debug",              "full"),
+    c("[Ee]xample|[Ss]ample",                                "Patient explorer",   "full"),
+    c("^(KPI snapshot|Overview & cohort)",                   "Cohort & attrition", "stakeholder"),
+    c("^(Attrition|OVERVIEW|FUNNEL): ",                      "Cohort & attrition", "stakeholder"),
+    c(paste0("^(Transitions|START_TYPE|END_REASON|LENGTH|REGIMENS|",
+             "PROGRESSION|GAPS|TRANSITIONS|SANKEY|MEDCOUNT|MTX|TREND): "),
+                                                             "Treatment patterns", "stakeholder"),
+    c("^(Steroids|Payer): ",                                 "Steroids & payer",   "stakeholder"),
+    # Exploratory objective (study-team validation Q1-Q6). Reached only after
+    # the example/sample rule above, so Q2/Q6 "(sample)" tables still route to
+    # the full-only Patient explorer; the Q-summary + intro stay stakeholder.
+    c("^(About this section|Q[0-9]|Exploratory)",            "Exploratory",        "stakeholder")
+  )
+  for (r in rules) if (grepl(r[1], title)) return(list(bucket = r[2], audience = r[3]))
+  # Fail closed: an unrecognized title (e.g. a future builder with a new
+  # prefix) lands in "Other" as full-only, so it is hidden from the
+  # stakeholder view by default rather than leaking an unvetted view.
+  list(bucket = "Other", audience = "full")
+}
+
+# Tag $bucket + $audience on every item, then stable-sort into
+# (cohort, bucket) order so the nav reads top-down as a stakeholder would
+# expect, with unknowns falling to the end of their cohort.
+tag_and_order <- function() {
+  n <- length(dashboard_items)
+  for (i in seq_len(n)) {
+    it <- dashboard_items[[i]]
+    cl <- classify_item(it$title)
+    it$bucket   <- cl$bucket
+    it$audience <- cl$audience
+    dashboard_items[[i]] <<- it
+  }
+  rank <- function(x, levels) {
+    m <- match(x, levels); ifelse(is.na(m), length(levels) + 1L, m)
+  }
+  cr <- vapply(dashboard_items, function(it) rank(it$section, COHORT_ORDER), integer(1))
+  br <- vapply(dashboard_items, function(it) rank(it$bucket,  BUCKET_ORDER), integer(1))
+  dashboard_items <<- dashboard_items[order(cr, br, seq_len(n))]
+}
+
+main_combined <- function() {
+  stop_if_blank(cfg$pwd, "DATABRICKS_PWD environment variable is not set.")
+  cfg$build_dashboard <<- TRUE
+
+  con <- DBI::dbConnect(odbc::odbc(), dsn = cfg$dsn,
+                        pwd = cfg$pwd, timeout = 120)
+  on.exit(try(DBI::dbDisconnect(con), silent = TRUE), add = TRUE)
+
+  # One run timestamp for both cohorts so a row pair in
+  # lot_dashboard_run_summary clearly belongs to the same dashboard
+  # build.
+  run_ts_combined <- format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+
+  dashboard_items <<- list()
+  dashboard_findings <<- list()
+
+  # Cohort prefixes keep the LOT1-5 static PNG artifacts (lotlong_*.png)
+  # from clobbering each other across the two cohort passes. The HTML
+  # dashboard renders the in-memory plotly objects, so it is correct
+  # without this; the prefix is just for the on-disk PNG sidecars.
+  on.exit(cfg$plot_filename_prefix <<- NULL, add = TRUE)
+
+  # ---- Overall (whole cohort) ----
+  log_msg("==== Building OVERALL cohort views ====")
+  cfg$plot_filename_prefix <<- "overall_"
+  p_overall <- prepare_overall_cohort(con)
+  # Capture the Overall pass's steroid codelist state now, before the NDMM pass
+  # can overwrite or clear() the global cfg$steroid_*_count. The Summary (built
+  # last) reports this rather than the final global state, so a degraded NDMM
+  # pass cannot make valid Overall steroid evidence read as "unavailable".
+  ster_hcpcs_sum <- cfg$steroid_hcpcs_count
+  ster_cpt_sum   <- cfg$steroid_cpt_count
+  ster_ndc_sum   <- cfg$steroid_ndc_count
+  kpi_overall <- build_cohort_kpis(con, wrk("LOT_LONG"), section = "Overall",
+                                   title = "KPI snapshot")
+  build_overview_card(p_overall$n_ster, p_overall$n_rules,
+                      section = "Overall",
+                      title   = "Overview & cohort definition")
+  build_overall_attrition(con, section = "Overall",
+                          title_prefix = "Attrition: ")
+  # LOT1-5 detail runs on parent LOT_LONG so the funnel/start-type/end-
+  # reason counts match the persisted parent. include_debug = TRUE here
+  # so the audit + drilldown cards are produced once (under Overall).
+  collect_cohort_views(con, "Overall", p_overall$lookups,
+                       lot_long_tbl  = wrk("LOT_LONG"),
+                       include_debug = TRUE)
+  build_run_comparison(con, "Overall", wrk("LOT_LONG"),
+                       section = "Overall",
+                       title_prefix = "Validation: ",
+                       run_ts = run_ts_combined)
+
+  # ---- NDMM (1L newly-diagnosed cohort) ----
+  # Wrapped so a missing parent input (e.g. ELIG_COH_FINAL) degrades to
+  # an explanatory card instead of killing the whole combined dashboard;
+  # Overall + Exploratory still render.
+  log_msg("==== Building NDMM cohort views ====")
+  cfg$plot_filename_prefix <<- "ndmm_"
+  kpi_ndmm <- list()
+  ndmm_notes <- character(0)
+  # Checkpoint the collector lengths so a late NDMM builder failure can roll
+  # back any partial NDMM cards/findings appended before it - otherwise the
+  # Summary (which renders recorded findings) and the NDMM pill could show
+  # partial NDMM content beside an "unavailable" status.
+  ndmm_items0 <- length(dashboard_items)
+  ndmm_find0  <- length(dashboard_findings)
+  ndmm_ok <- tryCatch({
+    p_ndmm <- prepare_ndmm_cohort(con)
+    ndmm_notes <- if (!is.null(p_ndmm$overview_notes)) p_ndmm$overview_notes
+                  else character(0)
+    kpi_ndmm <- build_cohort_kpis(con, NDMM_LOT_LONG_FILT, section = "NDMM",
+                                  title = "KPI snapshot")
+    build_ndmm_overview_card(p_ndmm$counts, p_ndmm$n_ster, p_ndmm$n_rules,
+                             p_ndmm$overview_notes, section = "NDMM",
+                             title = "Overview & cohort definition")
+    build_ndmm_attrition(p_ndmm$counts, section = "NDMM",
+                         title_prefix = "Attrition: ")
+    build_ndmm_other_cancer_qc(con, section = "NDMM",
+                               title_prefix = "QC: ")
+    # LOT1-5 detail re-runs on NDMM_LOT_LONG_FILT so every count reflects
+    # the NDMM denominator. Debug/drilldown already produced under Overall.
+    collect_cohort_views(con, "NDMM", p_ndmm$lookups,
+                         lot_long_tbl   = NDMM_LOT_LONG_FILT,
+                         include_debug  = FALSE,
+                         ndmm_flags_tbl = NDMM_FLAGS_ALL)
+    build_run_comparison(con, "NDMM", NDMM_LOT_LONG_FILT,
+                         section = "NDMM",
+                         title_prefix = "Validation: ",
+                         run_ts = run_ts_combined)
+    TRUE
+  }, error = function(e) {
+    log_msg("  WARN: NDMM cohort could not be built: ", conditionMessage(e))
+    # Roll back any partial NDMM items/findings appended before the failure so
+    # an unavailable NDMM never shows stale partial content (only the card below).
+    if (length(dashboard_items) > ndmm_items0)
+      dashboard_items <<- dashboard_items[seq_len(ndmm_items0)]
+    if (length(dashboard_findings) > ndmm_find0)
+      dashboard_findings <<- dashboard_findings[seq_len(ndmm_find0)]
+    add_html_card(paste0(
+      '<div style="font-family:system-ui;padding:14px;max-width:900px">',
+      '<h3>NDMM cohort - not available</h3>',
+      '<p style="color:#a06000;font-size:13px">The NDMM (1L) cohort ',
+      'could not be built in this run:</p>',
+      '<pre style="font-size:12px;background:#f7f7f7;padding:8px;',
+      'border-radius:6px;white-space:pre-wrap">',
+      conditionMessage(e), '</pre>',
+      '<p style="color:#555;font-size:13px">Most often this means the ',
+      'parent <code>ELIG_COH_FINAL</code> / <code>MAP_STACKED</code> ',
+      'tables are not present in the work schema. Build the parent ',
+      'pipeline first, then re-run.</p></div>'),
+      section = "NDMM", title = "Overview & cohort definition")
+    FALSE
+  })
+
+  cfg$plot_filename_prefix <<- NULL
+
+  # ---- Exploratory objective (study-team validation Q1-Q6) ----
+  # Different-from-summary ad-hoc asks that reuse the Overall denominator but
+  # answer specific study-team questions; placed in their own cohort pill per
+  # the study team's request. Guarded so a failure can't sink the dashboard.
+  log_msg("==== Building EXPLORATORY objective views ====")
+  tryCatch(build_validation_exploratory(con), error = function(e) {
+    log_msg("  WARN: Exploratory objective could not be built: ", conditionMessage(e))
+    add_html_card(paste0(
+      '<div style="font-family:system-ui;padding:14px;max-width:900px">',
+      '<h3>Exploratory analysis - not available</h3>',
+      '<p style="color:#a06000;font-size:13px">The study-team validation ',
+      'questions could not be built in this run:</p>',
+      '<pre style="font-size:12px;background:#f7f7f7;padding:8px;border-radius:6px;',
+      'white-space:pre-wrap">', conditionMessage(e), '</pre></div>'),
+      section = SEC_EXPL, title = "About this section")
+  })
+
+  # ---- Summary landing page + nav structuring ----
+  # Built last (it needs both cohorts' KPIs); tag_and_order() then assigns
+  # every item a bucket + audience and stable-sorts the whole list into
+  # (cohort, bucket) order, so the Summary leads and each cohort reads
+  # top-down (cohort & attrition -> treatment -> steroids & payer ->
+  # internal). The Exploratory cohort (study-team validation Q1-Q6) was built
+  # just above and sorts after NDMM via COHORT_ORDER.
+  build_summary_landing(kpi_overall, kpi_ndmm, ndmm_ok, run_ts_combined,
+                        n_ster = p_overall$n_ster, n_rules = p_overall$n_rules,
+                        study_end = cfg$study_end,
+                        n_hcpcs = ster_hcpcs_sum,
+                        n_ndc   = ster_ndc_sum,
+                        n_cpt   = ster_cpt_sum,
+                        ndmm_notes = ndmm_notes)
+  tag_and_order()
+
+  build_dashboard(
+    out_name     = "combined_dashboard.html",
+    header_title = "MM LOT &mdash; combined (Overall + NDMM + Exploratory)",
+    header_sub   = paste0("Summary &bull; Overall &bull; NDMM",
+                          if (!ndmm_ok) " (unavailable)" else "",
+                          " &bull; Exploratory"),
+    cohort_sections = c("Summary", "Overall", "NDMM", "Exploratory analysis")
+  )
+  log_msg("Wrote ", file.path(cfg$output_dir, "combined_dashboard.html"))
+}
+
+if (!interactive() && !isTRUE(getOption("combined_dashboard.no_autorun")))
+  main_combined()
+  
+  apr_30_2026/validation_qs_jun29.R
+  
+ #!/usr/bin/env Rscript
+# Standalone program: "MM LOT Validation next steps" study-team questions
+# (Julia Moore, 24-Jun-2026 e-mail; question set filed under
+# Questions/June 29 2026/). Sibling of lot1_studyteam_qs.R.
+#
+#   Rscript validation_qs_jun29.R
+#
+# Answers, against the persisted work-schema tables (LOT_LONG, MAP_STACKED,
+# LOT1_SCT) and the raw CDM (for the patient-journey examples):
+#
+#   Q1  LOT1 regimens including pomalidomide / elotuzumab / panobinostat,
+#       split into mono- vs combination-therapy.
+#   Q2  Raw-claim examples (before MAPs were derived) for patients with
+#       pomalidomide in their LOT1 regimen.
+#   Q3  LOT1 patients with NO steroid at LOT1: steroid receipt within 7/14/30d
+#       before LOT1 start, and within 7/14/30d after the 60-day induction
+#       window.
+#   Q4  Same as Q3 for LOT2 (30-day induction window).
+#   Q5  No-steroid-at-LOT2 patients with a steroid in the 30d before LOT2:
+#       did they have a steroid at LOT1? (attribution check).
+#   Q6  CAR-T prior to or during LOT1, with raw-claim journey examples.
+#
+# Builds nothing persistent; safe to run any time. Writes one CSV per result
+# plus a run log. All operational definitions live in R/validation_qs_jun29.R
+# and are shared verbatim with the combined dashboard's Exploratory objective.
+
+.script_dir <- local({
+  args <- commandArgs(trailingOnly = FALSE)
+  file_arg <- grep("^--file=", args, value = TRUE)
+  if (length(file_arg) > 0)
+    return(dirname(normalizePath(sub("^--file=", "", file_arg[1]))))
+  for (i in seq_len(sys.nframe())) {
+    ofile <- tryCatch(sys.frame(i)$ofile, error = function(e) NULL)
+    if (!is.null(ofile)) return(dirname(normalizePath(ofile)))
+  }
+  getwd()
+})
+
+source_dir <- file.path(.script_dir, "R")
+if (file.exists(file.path(source_dir, "load_inputs.R"))) {
+  source(file.path(source_dir, "load_inputs.R"))
+  load_pipeline_inputs(c(.script_dir, dirname(.script_dir)))
+}
+source(file.path(source_dir, "config_lot.R"))
+source(file.path(source_dir, "db_utils_lot.R"))
+source(file.path(source_dir, "codelists_lot.R"))         # load_codelist_csv
+source(file.path(source_dir, "validation_qs_jun29.R"))   # vqs_* logic
+
+main <- function() {
+  stop_if_blank(cfg$pwd, "DATABRICKS_PWD environment variable is not set.")
+
+  con <- DBI::dbConnect(odbc::odbc(), dsn = cfg$dsn, pwd = cfg$pwd, timeout = 120)
+  on.exit(try(DBI::dbDisconnect(con), silent = TRUE), add = TRUE)
+
+  out_dir <- cfg$output_dir
+  if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  stamp <- format(Sys.time(), "%Y%m%d_%H%M%S")
+
+  write_out <- function(df, tag) {
+    if (is.null(df) || nrow(df) == 0) { log_msg("  (", tag, ": no rows)"); return(invisible()) }
+    f <- file.path(out_dir, paste0("validation_qs_jun29_", tag, "_", stamp, ".csv"))
+    write.csv(df, f, row.names = FALSE)
+    log_msg("  wrote ", tag, " -> ", f, " (", nrow(df), " rows)")
+  }
+
+  lot_long <- wrk("LOT_LONG")
+  map_tbl  <- wrk("MAP_STACKED")
+  sct_tbl  <- wrk("LOT1_SCT")
+
+  log_msg(SEP)
+  log_msg("MM LOT Validation next steps - study-team questions (Jun 2026)")
+  log_msg(SEP)
+  if (!vqs_readable(con, lot_long))
+    stop("Cannot read ", lot_long, ". Build the LOT pipeline (02_lot1.R / 03_lot2_5.R) first.")
+  have_map <- vqs_readable(con, map_tbl)
+  have_sct <- vqs_readable(con, sct_tbl)
+  if (!have_map)
+    log_msg("WARNING: ", map_tbl, " not readable - steroid questions (Q3/Q4/Q5) ",
+            "and MAP journeys will be skipped.")
+  if (!have_sct)
+    log_msg("WARNING: ", sct_tbl, " not readable - CAR-T question (Q6) will be skipped.")
+
+  tokens <- vqs_resolve_agent_tokens(con)
+  log_msg("Agent tokens -> POMA='", tokens$poma, "', ELOT='", tokens$elot,
+          "', PANO='", tokens$pano, "'. ", paste(tokens$notes, collapse = " "))
+
+  # Observation-window bounds (ELIG_COH_FINAL) so the raw-claim examples are
+  # scoped to [INDEX_DATE, OBS_END_DT] like the pipeline's S04/S12 pulls.
+  bounds <- vqs_obs_bounds_src(con)
+  if (!bounds$available)
+    log_msg("WARNING: ", wrk(cfg$input_cohort_table), " not readable - raw-claim ",
+            "examples will NOT be observation-window bounded, and 'CAR-T before ",
+            "LOT1' (Q6) cannot be computed (needs the raw, bounded SCT scan).")
+  # Cohort-wide raw CAR-T claim dates (observation-bounded) - the only way to
+  # answer 'CAR-T BEFORE LOT1', which LOT1_SCT cannot express.
+  cart_raw <- if (have_sct) vqs_build_raw_cart_dates(con, lot_long, bounds$sql) else NULL
+  if (have_sct && is.null(cart_raw))
+    log_msg("NOTE: raw CAR-T date scan unavailable - Q6 'before LOT1' reported as NA.")
+
+  # Definitions sidecar so every CSV batch travels with its operational
+  # definitions (counts alone are easy to misread).
+  defs <- data.frame(item = c(
+    "denominator_cohort", "steroid_signal", "steroid_at_lotn",
+    "before_after_windows", "cart_during_or_closing", "cart_before_lot1",
+    "agent_tokens", "raw_claims_window"),
+    definition = c(
+      "Parent (Overall) LOT_LONG cohort.",
+      "MAP_STACKED segment with MAP_MED_CLASS='STEROID' (codelist class the LOT engine excludes from regimens).",
+      sprintf("Steroid MAP starting inside the induction window [LOT_START, LOT_START+W-1], W=%d (LOT1) / %d (LOT2).", VQS_W1, VQS_W2),
+      "Cumulative (<=N days) from a steroid MAP start; before=[start-N,start-1], after=[ind_end+1,ind_end+N].",
+      "FIRST_CART_DT in [LOT1_START, LOT_BASE_END_DT], extended by +1 day ONLY when LOT_BASE_END_REASON in (SCT_CART, CART_INIT) - the engine sets the LOT end to CAR-T date - 1 only for a CAR-T-ending line, so the closing CAR-T lands one day past the end; for other end reasons a CAR-T at end+1 is post-LOT1 and excluded.",
+      "Raw SCT CAR-T claim with service date < LOT1_START (LOT1_SCT.FIRST_CART_DT cannot express this).",
+      sprintf("POMA=%s, ELOT=%s, PANO=%s (best-effort from cl_mma_codelist.csv).", tokens$poma, tokens$elot, tokens$pano),
+      if (bounds$available) "Raw-claim examples bounded to [INDEX_DATE, OBS_END_DT] from ELIG_COH_FINAL."
+      else "ELIG_COH_FINAL unavailable: raw-claim examples show full PATID history (NOT observation-bounded)."),
+    stringsAsFactors = FALSE)
+  write_out(defs, "definitions")
+
+  # ---- Q1 ----
+  log_msg(DASH); log_msg("Q1: LOT1 regimens with pomalidomide / elotuzumab / panobinostat")
+  q1 <- vqs_q1_exclusion_agents(con, lot_long, tokens)
+  write_out(q1, "q1_exclusion_agents_lot1")
+  log_msg(sprintf("  LOT1 patients = %s. Any of the three: %s (mono %s / combo %s).",
+                  attr(q1, "lot1_patients"),
+                  q1$n_lot1_with_agent[q1$agent == "Any of the three"],
+                  q1$n_as_monotherapy[q1$agent == "Any of the three"],
+                  q1$n_in_combination[q1$agent == "Any of the three"]))
+
+  # ---- Q2 ----
+  log_msg(DASH); log_msg("Q2: raw-claim examples for pomalidomide-at-LOT1 patients")
+  if (have_map) {
+    q2 <- vqs_q2_poma_examples(con, lot_long, map_tbl, tokens, n = 5L, bounds = bounds$sql)
+    if (!is.null(q2$note)) log_msg("  ", q2$note)
+    if (length(q2$patids)) log_msg("  example PATIDs: ", paste(q2$patids, collapse = ", "))
+    write_out(q2$journey, "q2_poma_examples_map_journey")
+    write_out(q2$raw,     "q2_poma_examples_raw_claims")
+  } else log_msg("  skipped (MAP_STACKED unavailable).")
+
+  # ---- Q3 / Q4 ----
+  if (have_map) {
+    log_msg(DASH); log_msg("Q3: steroid timing for LOT1 patients with no steroid at LOT1")
+    q3 <- vqs_steroid_windows(con, lot_long, map_tbl, lot_num = 1L, w = VQS_W1)
+    write_out(q3, "q3_lot1_steroid_windows")
+    log_msg(sprintf("  LOT1: %s patients, %s with steroid at LOT1, %s without (denominator).",
+                    attr(q3, "line_patients"), attr(q3, "line_with_steroid"),
+                    attr(q3, "line_without_steroid")))
+    # "who" (patient-level): the actual no-steroid-at-LOT1 patients + windows.
+    write_out(vqs_steroid_windows_patients(con, lot_long, map_tbl, lot_num = 1L, w = VQS_W1),
+              "q3_lot1_steroid_window_patients")
+
+    log_msg(DASH); log_msg("Q4: steroid timing for LOT2 patients with no steroid at LOT2")
+    q4 <- vqs_steroid_windows(con, lot_long, map_tbl, lot_num = 2L, w = VQS_W2)
+    write_out(q4, "q4_lot2_steroid_windows")
+    log_msg(sprintf("  LOT2: %s patients, %s with steroid at LOT2, %s without (denominator).",
+                    attr(q4, "line_patients"), attr(q4, "line_with_steroid"),
+                    attr(q4, "line_without_steroid")))
+    write_out(vqs_steroid_windows_patients(con, lot_long, map_tbl, lot_num = 2L, w = VQS_W2),
+              "q4_lot2_steroid_window_patients")
+
+    # ---- Q5 ----
+    log_msg(DASH); log_msg("Q5: LOT2 pre-start steroid attribution to LOT1")
+    q5 <- vqs_q5_lot2_attribution(con, lot_long, map_tbl, w1 = VQS_W1, w2 = VQS_W2)
+    write_out(q5, "q5_lot2_steroid_attribution")
+    log_msg("  denominator (no LOT2 steroid + steroid in 30d before LOT2): ", q5$n_patients[1],
+            "; pre-LOT2 steroid ITSELF within LOT1 span (attributable): ", q5$n_patients[2],
+            "; NOT within LOT1 span: ", q5$n_patients[3], ".")
+  }
+
+  # ---- Q6 ----
+  if (have_sct) {
+    log_msg(DASH); log_msg("Q6: CAR-T prior to or during LOT1")
+    q6 <- vqs_q6_cart(con, lot_long, sct_tbl, w1 = VQS_W1, cart_raw_tbl = cart_raw)
+    write_out(q6, "q6_cart_prior_or_during_lot1")
+    log_msg("  CAR-T prior to OR during LOT1: ",
+            q6$n_patients[q6$metric == "CAR-T prior to OR during LOT1 (the ask)"],
+            " patients (of ", q6$n_patients[1], " LOT1).",
+            if (is.null(cart_raw)) " ('before LOT1' = NA: raw CAR-T scan unavailable.)" else "")
+
+    log_msg(DASH); log_msg("Q6: raw-claim journey examples for CAR-T prior-to/during-LOT1 patients")
+    ex <- vqs_q6_cart_examples(con, lot_long, sct_tbl, map_tbl, n = 5L,
+                               bounds = bounds$sql, cart_raw_tbl = cart_raw)
+    if (!is.null(ex$note)) log_msg("  ", ex$note)
+    if (length(ex$patids)) log_msg("  example PATIDs: ", paste(ex$patids, collapse = ", "))
+    write_out(ex$sct_raw, "q6_cart_examples_raw_sct_claims")
+    write_out(ex$mma_raw, "q6_cart_examples_raw_mma_claims")
+    write_out(ex$journey, "q6_cart_examples_map_journey")
+  } else log_msg("Q6 skipped (LOT1_SCT unavailable).")
+
+  log_msg(SEP)
+  log_msg("Validation questions complete. CSVs in ", out_dir)
+  log_msg(SEP)
+}
+
+if (!interactive()) main()
+
+
+apr_30_2026/R/validation_qs_jun29.R
+# ---------------------------------------------------------------------------
+# Shared analysis module: "MM LOT Validation next steps" study-team questions
+# (Julia Moore, forwarded 24-Jun-2026 / "June 29 2026" question set).
+#
+# This module holds ONLY data logic (SQL -> data.frame). It is consumed by:
+#   - validation_qs_jun29.R          (standalone CSV/log program)
+#   - 07_combined_dashboard.R        (Exploratory objective tables)
+# so the two deliverables can never drift apart.
+#
+# It builds nothing persistent and is safe to run any time. It reads the
+# persisted work-schema tables (LOT_LONG, MAP_STACKED, LOT1_SCT) and, for the
+# raw-claim patient examples (Q2, Q6), the raw CDM via cdm_src(). The
+# raw-claim pulls are GUARDED: if the CDM / codelist CSVs are not reachable
+# they degrade to NULL and the caller falls back to the MAP-derived view.
+#
+# ---- The six questions -----------------------------------------------------
+#   Q1  Breakdown of LOT1 patients whose regimen includes pomalidomide,
+#       elotuzumab and/or panobinostat (mono- vs combination-therapy).
+#   Q2  Raw-claim patient examples (before MAPs were derived) for patients
+#       with pomalidomide in their LOT1 regimen.
+#   Q3  Among LOT1 patients with NO steroid at LOT1, how many received a
+#       steroid within 7/14/30 days before LOT1 start, and within 7/14/30
+#       days after the end of the 60-day induction window.
+#   Q4  Same as Q3 for LOT2 (30-day induction window).
+#   Q5  Patients with no steroid at LOT2 but a steroid in the 30 days before
+#       LOT2 start: did they have a steroid at LOT1 (attribution check)?
+#   Q6  Patients with CAR-T prior to or during LOT1 (the LOT rules do not
+#       allow CAR-T during LOT1), with raw-claim journey examples.
+#
+# ---- Operational definitions (documented, single source of truth) ----------
+#  * "Receives a steroid at LOTn"  -> a STEROID-class MAP (MAP_STACKED,
+#    MAP_MED_CLASS = 'STEROID') whose MAP_START_DT falls inside the LOTn
+#    induction window [LOT_START_DT, LOT_START_DT + W - 1], W = 60 for LOT1,
+#    30 for LOT2. This mirrors the LOT engine's own induction-membership rule
+#    (02_lot1.R S09, which selects induction meds by MAP_START_DT in-window
+#    and explicitly EXCLUDES MAP_MED_CLASS = 'STEROID' from the regimen). The
+#    same STEROID-class MAP rows are the steroid signal used throughout.
+#  * "Received a steroid within N days prior / after" -> a STEROID-class MAP
+#    that STARTS in the respective window. The 7/14/30 windows are cumulative
+#    (<= N days), exactly as phrased in the ask.
+#  * Steroid signal source: MAP_STACKED STEROID-class segments (derived from
+#    cl_mma_codelist.csv). This is self-contained from persisted tables and is
+#    identical in the standalone program and the dashboard. NOTE: it is the
+#    codelist's STEROID class, which can differ slightly from the dashboard's
+#    optional steroid_codes.csv augmentation (LOT_BASE_MEDS_AUG) when that CSV
+#    is populated; the definition used here is stated on every output.
+# ---------------------------------------------------------------------------
+
+# Default medication abbreviations (overridable via env). Panobinostat in
+# particular may not appear in this cohort at all (a 0 count is a valid
+# answer); the token is also best-effort refined from the codelist below.
+VQS_POMA_TOKEN <- toupper(Sys.getenv("POMA_MED_ABBR", unset = "POMA"))
+VQS_ELOT_TOKEN <- toupper(Sys.getenv("ELOT_MED_ABBR", unset = "ELOT"))
+VQS_PANO_TOKEN <- toupper(Sys.getenv("PANO_MED_ABBR", unset = "PANO"))
+
+# Induction windows (config-driven; fall back to study defaults).
+VQS_W1 <- tryCatch(as.integer(cfg$induction_window_days),       error = function(e) 60L)
+VQS_W2 <- tryCatch(as.integer(cfg$lot_n_induction_window_days), error = function(e) 30L)
+if (is.na(VQS_W1) || VQS_W1 < 1) VQS_W1 <- 60L
+if (is.na(VQS_W2) || VQS_W2 < 1) VQS_W2 <- 30L
+
+# Quote a vector of ids for an IN (...) list; '' when empty so SQL stays valid.
+vqs_in_list <- function(ids) {
+  ids <- unique(as.character(ids))
+  ids <- ids[!is.na(ids) & nzchar(ids)]
+  if (length(ids) == 0) return("''")
+  paste(sprintf("'%s'", gsub("'", "''", ids)), collapse = ", ")
+}
+
+vqs_readable <- function(con, tbl) isTRUE(tryCatch(
+  nrow(db_q(con, glue("SELECT 1 FROM {tbl} LIMIT 1"))) >= 0,
+  error = function(e) FALSE))
+
+# Steroid-claim relation (sub-select string) over MAP_STACKED STEROID class.
+vqs_steroid_src <- function(map_tbl) glue(
+  "(SELECT cast(PATID as string) AS PATID, MAP_START_DT AS STER_DT
+      FROM {map_tbl}
+     WHERE upper(MAP_MED_CLASS) = 'STEROID' AND MAP_START_DT IS NOT NULL)")
+
+# Observation-window bounds, reconstructed from the persisted Part-1 cohort
+# (ELIG_COH_FINAL) exactly as 02_lot1.R S03 builds lot_patient_input:
+# OBS_END_DT = cast(ENDDATE as date) (primary) or coalesce(ENDDATE_CE, ENDDATE)
+# under the disenrollment-censoring sensitivity flag. Used to scope the raw
+# claim pulls to [INDEX_DATE, OBS_END_DT], so the "raw claims before MAPs"
+# examples match the pipeline's analytic window rather than a patient's whole
+# claim history. Returns list(sql = <subquery or NULL>, available = <bool>).
+vqs_obs_bounds_src <- function(con) {
+  tbl <- wrk(cfg$input_cohort_table)
+  obs_end <- if (isTRUE(cfg$censor_at_disenrollment))
+    "coalesce(cast(ENDDATE_CE AS date), cast(ENDDATE AS date))"
+  else "cast(ENDDATE AS date)"
+  ok <- vqs_readable(con, tbl) && isTRUE(tryCatch({
+    db_q(con, glue("SELECT INDEX_DATE, ENDDATE FROM {tbl} LIMIT 1")); TRUE
+  }, error = function(e) FALSE))
+  if (!ok) return(list(sql = NULL, available = FALSE))
+  list(available = TRUE, sql = glue(
+    "(SELECT cast(PATID as string) AS PATID,
+             cast(INDEX_DATE AS date) AS INDEX_DATE,
+             {obs_end}               AS OBS_END_DT
+        FROM {tbl})"))
+}
+
+# ---- Token resolution ------------------------------------------------------
+# Best-effort: build the (tiny, CSV-backed) mma_codelist view and resolve the
+# three agents by medication-full-name LIKE, so a codelist abbreviation change
+# does not silently zero out the answer. Falls back to the env/default tokens.
+# Returns a named list(poma=, elot=, pano=, resolved=<character notes>).
+vqs_resolve_agent_tokens <- function(con) {
+  out <- list(poma = VQS_POMA_TOKEN, elot = VQS_ELOT_TOKEN,
+              pano = VQS_PANO_TOKEN, notes = character(0))
+  ok <- tryCatch({ vqs_build_mma_codelist(con); TRUE }, error = function(e) FALSE)
+  if (!ok) {
+    out$notes <- "mma_codelist unavailable; using default/env tokens."
+    return(out)
+  }
+  pick <- function(like, dflt) {
+    df <- tryCatch(db_q(con, glue("
+      SELECT CL_MED_ABBR, count(*) AS n
+      FROM mma_codelist
+      WHERE lower(CL_MEDICATION_FULL) LIKE '%{like}%'
+      GROUP BY CL_MED_ABBR ORDER BY n DESC")), error = function(e) NULL)
+    if (is.null(df) || nrow(df) == 0) return(dflt)
+    toupper(trimws(df$CL_MED_ABBR[1]))
+  }
+  out$poma <- pick("pomalidomide", VQS_POMA_TOKEN)
+  out$elot <- pick("elotuzumab",   VQS_ELOT_TOKEN)
+  out$pano <- pick("panobinostat", VQS_PANO_TOKEN)
+  out$notes <- sprintf("Resolved tokens from cl_mma_codelist.csv: POMA=%s, ELOT=%s, PANO=%s.",
+                       out$poma, out$elot, out$pano)
+  out
+}
+
+# ===========================================================================
+# Q1 - LOT1 regimens including pomalidomide / elotuzumab / panobinostat
+# ===========================================================================
+vqs_q1_exclusion_agents <- function(con, lot_long, tokens) {
+  p <- tokens$poma; e <- tokens$elot; a <- tokens$pano
+  has <- function(tok) glue("array_contains(meds, '{tok}')")
+  any3 <- glue("({has(p)} OR {has(e)} OR {has(a)})")
+  r <- db_q(con, glue("
+    WITH l1 AS (
+      SELECT split(LOT_BASE_MEDS, ' ') AS meds,
+             size(filter(split(LOT_BASE_MEDS, ' '), x -> length(x) > 0)) AS n_agents
+      FROM {lot_long}
+      WHERE LOT_NUM = 1 AND LOT_BASE_MEDS IS NOT NULL AND trim(LOT_BASE_MEDS) <> ''
+    )
+    SELECT
+      count(*)                                                         AS lot1_patients,
+      sum(CASE WHEN {has(p)} THEN 1 ELSE 0 END)                        AS poma_any,
+      sum(CASE WHEN {has(p)} AND n_agents = 1 THEN 1 ELSE 0 END)       AS poma_mono,
+      sum(CASE WHEN {has(p)} AND n_agents > 1 THEN 1 ELSE 0 END)       AS poma_combo,
+      sum(CASE WHEN {has(e)} THEN 1 ELSE 0 END)                        AS elot_any,
+      sum(CASE WHEN {has(e)} AND n_agents = 1 THEN 1 ELSE 0 END)       AS elot_mono,
+      sum(CASE WHEN {has(e)} AND n_agents > 1 THEN 1 ELSE 0 END)       AS elot_combo,
+      sum(CASE WHEN {has(a)} THEN 1 ELSE 0 END)                        AS pano_any,
+      sum(CASE WHEN {has(a)} AND n_agents = 1 THEN 1 ELSE 0 END)       AS pano_mono,
+      sum(CASE WHEN {has(a)} AND n_agents > 1 THEN 1 ELSE 0 END)       AS pano_combo,
+      sum(CASE WHEN {any3} THEN 1 ELSE 0 END)                          AS any_any,
+      sum(CASE WHEN {any3} AND n_agents = 1 THEN 1 ELSE 0 END)         AS any_mono,
+      sum(CASE WHEN {any3} AND n_agents > 1 THEN 1 ELSE 0 END)         AS any_combo
+    FROM l1
+  "))
+  n_lot1 <- as.numeric(r$lot1_patients[1])
+  mk <- function(label, tok, any, mono, combo) data.frame(
+    agent             = label,
+    token             = tok,
+    n_lot1_with_agent = as.integer(any),
+    n_as_monotherapy  = as.integer(mono),
+    n_in_combination  = as.integer(combo),
+    pct_of_lot1       = if (isTRUE(n_lot1 > 0)) round(100 * as.numeric(any) / n_lot1, 2) else NA_real_,
+    stringsAsFactors  = FALSE)
+  df <- rbind(
+    mk("Pomalidomide",     p, r$poma_any, r$poma_mono, r$poma_combo),
+    mk("Elotuzumab",       e, r$elot_any, r$elot_mono, r$elot_combo),
+    mk("Panobinostat",     a, r$pano_any, r$pano_mono, r$pano_combo),
+    mk("Any of the three", paste(p, e, a), r$any_any, r$any_mono, r$any_combo))
+  attr(df, "lot1_patients") <- n_lot1
+  df
+}
+
+# ===========================================================================
+# Q3 / Q4 - steroid timing for patients with NO steroid at the line
+# Returns a tidy table: one row per (window). Reused for LOT1 (W=60) and
+# LOT2 (W=30).
+# ===========================================================================
+vqs_steroid_windows <- function(con, lot_long, map_tbl, lot_num, w) {
+  ster <- vqs_steroid_src(map_tbl)
+  r <- db_q(con, glue("
+    WITH lot AS (
+      SELECT cast(PATID as string) AS PATID, cast(LOT_START_DT as date) AS LS
+      FROM {lot_long}
+      WHERE LOT_NUM = {lot_num} AND LOT_START_DT IS NOT NULL
+    ),
+    ster AS {ster},
+    at_line AS (
+      SELECT DISTINCT l.PATID
+      FROM lot l JOIN ster s ON s.PATID = l.PATID
+       AND s.STER_DT BETWEEN l.LS AND date_add(l.LS, {w} - 1)
+    ),
+    no_ster AS (
+      SELECT l.* FROM lot l
+      LEFT JOIN at_line a ON a.PATID = l.PATID
+      WHERE a.PATID IS NULL
+    ),
+    flags AS (
+      SELECT n.PATID,
+        max(CASE WHEN s.STER_DT BETWEEN date_sub(n.LS, 7)  AND date_sub(n.LS, 1) THEN 1 ELSE 0 END) AS p7,
+        max(CASE WHEN s.STER_DT BETWEEN date_sub(n.LS, 14) AND date_sub(n.LS, 1) THEN 1 ELSE 0 END) AS p14,
+        max(CASE WHEN s.STER_DT BETWEEN date_sub(n.LS, 30) AND date_sub(n.LS, 1) THEN 1 ELSE 0 END) AS p30,
+        max(CASE WHEN s.STER_DT BETWEEN date_add(n.LS, {w}) AND date_add(n.LS, {w} - 1 + 7)  THEN 1 ELSE 0 END) AS a7,
+        max(CASE WHEN s.STER_DT BETWEEN date_add(n.LS, {w}) AND date_add(n.LS, {w} - 1 + 14) THEN 1 ELSE 0 END) AS a14,
+        max(CASE WHEN s.STER_DT BETWEEN date_add(n.LS, {w}) AND date_add(n.LS, {w} - 1 + 30) THEN 1 ELSE 0 END) AS a30
+      FROM no_ster n LEFT JOIN ster s ON s.PATID = n.PATID
+      GROUP BY n.PATID
+    )
+    SELECT lp.n_lp AS line_patients,
+           ls.n_ls AS line_with_steroid,
+           f.n_no  AS line_without_steroid,
+           f.prior_7d, f.prior_14d, f.prior_30d,
+           f.after_7d, f.after_14d, f.after_30d
+    FROM      (SELECT count(*) AS n_lp FROM lot)     lp
+    CROSS JOIN (SELECT count(*) AS n_ls FROM at_line) ls
+    CROSS JOIN (
+      SELECT count(*) AS n_no,
+             coalesce(sum(p7),  0) AS prior_7d, coalesce(sum(p14), 0) AS prior_14d,
+             coalesce(sum(p30), 0) AS prior_30d,
+             coalesce(sum(a7),  0) AS after_7d, coalesce(sum(a14), 0) AS after_14d,
+             coalesce(sum(a30), 0) AS after_30d
+      FROM flags
+    ) f
+  "))
+  denom <- as.numeric(r$line_without_steroid[1])
+  pct <- function(x) if (isTRUE(denom > 0)) round(100 * as.numeric(x) / denom, 2) else NA_real_
+  nums <- as.numeric(c(r$prior_7d[1], r$prior_14d[1], r$prior_30d[1],
+                       r$after_7d[1], r$after_14d[1], r$after_30d[1]))
+  df <- data.frame(
+    window = c(sprintf("Within %dd BEFORE LOT%d start", c(7, 14, 30), lot_num),
+               sprintf("Within %dd AFTER end of %dd induction window", c(7, 14, 30), w)),
+    n_patients = as.integer(nums),
+    stringsAsFactors = FALSE)
+  df$pct_of_no_steroid <- vapply(df$n_patients, pct, numeric(1))
+  attr(df, "line_patients")        <- as.numeric(r$line_patients[1])
+  attr(df, "line_with_steroid")    <- as.numeric(r$line_with_steroid[1])
+  attr(df, "line_without_steroid") <- denom
+  df
+}
+
+# Patient-level companion to vqs_steroid_windows() - answers Julia's "can we
+# see WHO of these patients received a steroid within ..." (Q3/Q4). One row per
+# no-steroid-at-line patient who received a steroid in at least one prior/after
+# window, with per-window flags and the nearest steroid dates. `limit` caps the
+# rows for the dashboard (NULL = all, for the standalone CSV).
+vqs_steroid_windows_patients <- function(con, lot_long, map_tbl, lot_num, w, limit = NULL) {
+  ster <- vqs_steroid_src(map_tbl)
+  lim  <- if (!is.null(limit)) glue("LIMIT {as.integer(limit)}") else ""
+  db_q(con, glue("
+    WITH lot AS (
+      SELECT cast(PATID as string) AS PATID, cast(LOT_START_DT as date) AS LS
+      FROM {lot_long}
+      WHERE LOT_NUM = {lot_num} AND LOT_START_DT IS NOT NULL
+    ),
+    ster AS {ster},
+    at_line AS (
+      SELECT DISTINCT l.PATID FROM lot l JOIN ster s ON s.PATID = l.PATID
+       AND s.STER_DT BETWEEN l.LS AND date_add(l.LS, {w} - 1)
+    ),
+    no_ster AS (
+      SELECT l.* FROM lot l LEFT JOIN at_line a ON a.PATID = l.PATID
+      WHERE a.PATID IS NULL
+    ),
+    flags AS (
+      SELECT n.PATID, n.LS,
+        max(CASE WHEN s.STER_DT BETWEEN date_sub(n.LS, 7)  AND date_sub(n.LS, 1) THEN 1 ELSE 0 END) AS prior_7d,
+        max(CASE WHEN s.STER_DT BETWEEN date_sub(n.LS, 14) AND date_sub(n.LS, 1) THEN 1 ELSE 0 END) AS prior_14d,
+        max(CASE WHEN s.STER_DT BETWEEN date_sub(n.LS, 30) AND date_sub(n.LS, 1) THEN 1 ELSE 0 END) AS prior_30d,
+        max(CASE WHEN s.STER_DT BETWEEN date_add(n.LS, {w}) AND date_add(n.LS, {w} - 1 + 7)  THEN 1 ELSE 0 END) AS after_7d,
+        max(CASE WHEN s.STER_DT BETWEEN date_add(n.LS, {w}) AND date_add(n.LS, {w} - 1 + 14) THEN 1 ELSE 0 END) AS after_14d,
+        max(CASE WHEN s.STER_DT BETWEEN date_add(n.LS, {w}) AND date_add(n.LS, {w} - 1 + 30) THEN 1 ELSE 0 END) AS after_30d,
+        max(CASE WHEN s.STER_DT BETWEEN date_sub(n.LS, 30) AND date_sub(n.LS, 1) THEN s.STER_DT END) AS nearest_prior_ster_dt,
+        min(CASE WHEN s.STER_DT BETWEEN date_add(n.LS, {w}) AND date_add(n.LS, {w} - 1 + 30) THEN s.STER_DT END) AS first_after_ster_dt
+      FROM no_ster n LEFT JOIN ster s ON s.PATID = n.PATID
+      GROUP BY n.PATID, n.LS
+    )
+    SELECT PATID, cast(LS as string) AS lot_start,
+           prior_7d, prior_14d, prior_30d, after_7d, after_14d, after_30d,
+           cast(nearest_prior_ster_dt as string) AS nearest_prior_ster_dt,
+           cast(first_after_ster_dt   as string) AS first_after_ster_dt
+    FROM flags
+    WHERE prior_30d = 1 OR after_30d = 1
+    ORDER BY PATID
+    {lim}
+  "))
+}
+
+# ===========================================================================
+# Q5 - attribution check. Julia: for patients with NO steroid classified at
+# LOT2 but a steroid in the month before LOT2, is that pre-LOT2 steroid
+# actually attributable to the LOT1 regimen?
+#
+# The DIRECT test (headline) preserves the actual pre-LOT2 steroid date(s) and
+# asks whether one of them falls INSIDE LOT1's active span [L1_START,
+# L1_BASE_END_DT] - that is the steroid being "the LOT1 regimen's". Two
+# weaker "had ANY steroid during LOT1" rows are kept as supporting context;
+# they can be 1 for a patient whose pre-LOT2 steroid is actually AFTER LOT1
+# ended (a different, earlier steroid was in LOT1), which is exactly why they
+# are not the headline.
+# ===========================================================================
+vqs_q5_lot2_attribution <- function(con, lot_long, map_tbl, w1, w2) {
+  ster <- vqs_steroid_src(map_tbl)
+  r <- db_q(con, glue("
+    WITH lot2 AS (
+      SELECT cast(PATID as string) AS PATID, cast(LOT_START_DT as date) AS L2
+      FROM {lot_long} WHERE LOT_NUM = 2 AND LOT_START_DT IS NOT NULL
+    ),
+    lot1 AS (
+      SELECT cast(PATID as string) AS PATID,
+             cast(LOT_START_DT as date)    AS L1,
+             cast(LOT_BASE_END_DT as date) AS L1_END
+      FROM {lot_long} WHERE LOT_NUM = 1
+    ),
+    ster AS {ster},
+    at_lot2 AS (
+      SELECT DISTINCT l.PATID FROM lot2 l JOIN ster s ON s.PATID = l.PATID
+       AND s.STER_DT BETWEEN l.L2 AND date_add(l.L2, {w2} - 1)
+    ),
+    no_l2 AS (   -- LOT2 patients with NO steroid at LOT2 induction
+      SELECT l.PATID, l.L2
+      FROM lot2 l LEFT JOIN at_lot2 a ON a.PATID = l.PATID
+      WHERE a.PATID IS NULL
+    ),
+    -- The actual pre-LOT2 steroid claim dates (one row per such claim),
+    -- carried alongside the patient's LOT1 span so we can test the SAME
+    -- steroid against LOT1.
+    prior_ster AS (
+      SELECT n.PATID, n.L2, l1.L1, l1.L1_END, s.STER_DT
+      FROM no_l2 n
+      JOIN ster s ON s.PATID = n.PATID
+        AND s.STER_DT BETWEEN date_sub(n.L2, 30) AND date_sub(n.L2, 1)
+      LEFT JOIN lot1 l1 ON l1.PATID = n.PATID
+    ),
+    denom AS (SELECT DISTINCT PATID FROM prior_ster),
+    -- DIRECT attribution: the pre-LOT2 steroid itself lands inside LOT1 span.
+    attrib AS (
+      SELECT DISTINCT PATID FROM prior_ster
+      WHERE L1_END IS NOT NULL AND STER_DT BETWEEN L1 AND L1_END
+    ),
+    -- Supporting context (any steroid, not necessarily the pre-LOT2 one).
+    at_lot1_ind AS (
+      SELECT DISTINCT d.PATID FROM denom d
+      JOIN lot1 l ON l.PATID = d.PATID
+      JOIN ster s ON s.PATID = d.PATID
+        AND s.STER_DT BETWEEN l.L1 AND date_add(l.L1, {w1} - 1)
+    ),
+    during_lot1 AS (
+      SELECT DISTINCT d.PATID FROM denom d
+      JOIN lot1 l ON l.PATID = d.PATID
+      JOIN ster s ON s.PATID = d.PATID
+        AND l.L1_END IS NOT NULL AND s.STER_DT BETWEEN l.L1 AND l.L1_END
+    )
+    SELECT a.n_denom, b.n_attrib, c.n_ind, e.n_dur
+    FROM      (SELECT count(*) AS n_denom  FROM denom)       a
+    CROSS JOIN (SELECT count(*) AS n_attrib FROM attrib)      b
+    CROSS JOIN (SELECT count(*) AS n_ind    FROM at_lot1_ind) c
+    CROSS JOIN (SELECT count(*) AS n_dur    FROM during_lot1) e
+  "))
+  denom    <- as.numeric(r$n_denom[1])
+  n_attrib <- as.numeric(r$n_attrib[1])
+  n_ind    <- as.numeric(r$n_ind[1])
+  n_dur    <- as.numeric(r$n_dur[1])
+  n_notattr <- denom - n_attrib
+  pct <- function(x) if (isTRUE(denom > 0)) round(100 * x / denom, 2) else NA_real_
+  data.frame(
+    metric = c(
+      "No-steroid-at-LOT2 patients with a steroid in the 30d before LOT2 (denominator)",
+      "  HEADLINE: the pre-LOT2 steroid ITSELF falls within LOT1 span [start, base end] (attributable to LOT1)",
+      "  ... pre-LOT2 steroid NOT within LOT1 span (not attributable to LOT1 by the direct test)",
+      "  context: had ANY steroid at LOT1 induction (within 60d window)",
+      "  context: had ANY steroid any time during LOT1 [start, base end]"),
+    n_patients = as.integer(c(denom, n_attrib, n_notattr, n_ind, n_dur)),
+    pct_of_denominator = c(NA_real_, pct(n_attrib), pct(n_notattr), pct(n_ind), pct(n_dur)),
+    stringsAsFactors = FALSE)
+}
+
+# ===========================================================================
+# Q6 - CAR-T prior to or during LOT1
+#
+# Two date sources, by necessity:
+#   * "DURING / closing LOT1" uses LOT1_SCT.FIRST_CART_DT (the engine's own
+#     derived value). The window is [L1_START, L1_END], extended to L1_END + 1
+#     ONLY when END_REASON in (SCT_CART, CART_INIT): a CAR-T-ending LOT1 sets
+#     LOT1_BASE_END_DT = FIRST_CART_DT - 1 (02_lot1.R LOT1_TX_ENDDATE), so the
+#     closing CAR-T lands one day past L1_END. For any other end reason a CAR-T
+#     at L1_END + 1 is post-LOT1 and is NOT counted. (FIRST_CART_DT is itself
+#     >= LOT1_START_DT by construction.)
+#   * "BEFORE LOT1" cannot come from LOT1_SCT at all (first_cart filters
+#     TX_DT >= LOT1_START_DT). It is taken from the raw CAR-T claim dates
+#     (cart_raw_tbl, observation-window-bounded). When that scan is
+#     unavailable the before-LOT1 rows are reported as NA with a note.
+# ===========================================================================
+vqs_q6_cart <- function(con, lot_long, sct_tbl, w1, cart_raw_tbl = NULL) {
+  have_raw <- !is.null(cart_raw_tbl)
+  # "During or closing LOT1" upper bound: the engine sets the LOT end to the
+  # CAR-T date - 1 ONLY when CAR-T closes LOT1 (END_REASON SCT_CART/CART_INIT),
+  # so the +1 (to recover the closing CAR-T) applies in that case only. For any
+  # other end reason a CAR-T at L1_END + 1 is genuinely post-LOT1, so the upper
+  # bound stays at L1_END.
+  during_ub <- "CASE WHEN END_REASON IN ('SCT_CART','CART_INIT') THEN date_add(L1_END, 1) ELSE L1_END END"
+  during_expr <- glue("sum(CASE WHEN CART_DT IS NOT NULL
+              AND CART_DT BETWEEN L1 AND ({during_ub}) THEN 1 ELSE 0 END)")
+  # before-LOT1 raw flag (only meaningful when have_raw). Expressions below
+  # read from the outer query's FROM j, where the raw flag is column has_before.
+  before_expr <- if (have_raw)
+    "sum(CASE WHEN has_before = 1 THEN 1 ELSE 0 END)" else "cast(NULL as bigint)"
+  prior_or_during_expr <- if (have_raw)
+    glue("sum(CASE WHEN has_before = 1 OR (CART_DT IS NOT NULL
+              AND CART_DT BETWEEN L1 AND ({during_ub})) THEN 1 ELSE 0 END)")
+  else "cast(NULL as bigint)"
+  raw_cte <- if (have_raw) glue("
+    rb AS (
+      SELECT l.PATID,
+             max(CASE WHEN c.CART_DT < l.L1 THEN 1 ELSE 0 END) AS has_before
+      FROM l1 l JOIN {cart_raw_tbl} c ON c.PATID = l.PATID
+      GROUP BY l.PATID
+    ),") else ""
+  rb_join <- if (have_raw) "LEFT JOIN rb ON rb.PATID = l.PATID" else ""
+
+  r <- db_q(con, glue("
+    WITH l1 AS (
+      SELECT cast(PATID as string) AS PATID,
+             cast(LOT_START_DT as date)    AS L1,
+             cast(LOT_BASE_END_DT as date) AS L1_END,
+             LOT_BASE_END_REASON           AS END_REASON,
+             coalesce(LOT_CART_LOT_FLG, 0) AS CART_FLG
+      FROM {lot_long} WHERE LOT_NUM = 1
+    ),
+    sct AS (
+      SELECT cast(PATID as string) AS PATID, min(cast(FIRST_CART_DT as date)) AS CART_DT
+      FROM {sct_tbl} WHERE FIRST_CART_DT IS NOT NULL
+      GROUP BY cast(PATID as string)
+    ),
+    {raw_cte}
+    j AS (
+      SELECT l.PATID, l.L1, l.L1_END, l.END_REASON, l.CART_FLG, s.CART_DT
+             {if (have_raw) ', coalesce(rb.has_before, 0) AS has_before' else ''}
+      FROM l1 l
+      LEFT JOIN sct s ON s.PATID = l.PATID
+      {rb_join}
+    )
+    SELECT
+      count(*) AS lot1_patients,
+      {before_expr}                                                                          AS n_cart_before_lot1_start,
+      sum(CASE WHEN CART_DT BETWEEN L1 AND date_add(L1, {w1} - 1) THEN 1 ELSE 0 END)         AS n_cart_in_lot1_induction,
+      {during_expr}                                                                          AS n_cart_during_or_closing_lot1,
+      {prior_or_during_expr}                                                                 AS n_cart_prior_or_during_lot1,
+      sum(CASE WHEN END_REASON IN ('SCT_CART','CART_INIT') THEN 1 ELSE 0 END)                AS n_lot1_ended_by_cart,
+      sum(CASE WHEN CART_DT IS NOT NULL THEN 1 ELSE 0 END)                                   AS n_with_cart_on_after_lot1_start,
+      sum(CASE WHEN CART_FLG = 1 THEN 1 ELSE 0 END)                                          AS n_lot1_flagged_cart_line
+    FROM j
+  "))
+  n <- as.numeric(r$lot1_patients[1])
+  pct <- function(x) if (isTRUE(n > 0) && !is.na(x)) round(100 * x / n, 2) else NA_real_
+  na_or <- function(x) { v <- suppressWarnings(as.numeric(x)); if (length(v) == 0) NA_real_ else v }
+  labels <- c(
+    "LOT1 patients (denominator)",
+    "CAR-T BEFORE LOT1 start (raw SCT claims)",
+    "CAR-T within 60d after LOT1 start (start-relative; not LOT-end capped)",
+    "CAR-T during or closing LOT1 [start, base end; +1d iff CAR-T closed LOT1]",
+    "CAR-T prior to OR during LOT1 (the ask)",
+    "LOT1 ended by CAR-T (end reason SCT_CART/CART_INIT)",
+    "Any CAR-T on/after LOT1 start (incl. later-line, informational)",
+    "LOT1 flagged as a CAR-T line (LOT_CART_LOT_FLG)")
+  vals <- c(na_or(r$lot1_patients[1]), na_or(r$n_cart_before_lot1_start[1]),
+            na_or(r$n_cart_in_lot1_induction[1]), na_or(r$n_cart_during_or_closing_lot1[1]),
+            na_or(r$n_cart_prior_or_during_lot1[1]), na_or(r$n_lot1_ended_by_cart[1]),
+            na_or(r$n_with_cart_on_after_lot1_start[1]), na_or(r$n_lot1_flagged_cart_line[1]))
+  df <- data.frame(
+    metric      = labels,
+    n_patients  = ifelse(is.na(vals), NA_integer_, as.integer(vals)),
+    pct_of_lot1 = c(NA_real_, vapply(vals[-1], pct, numeric(1))),
+    stringsAsFactors = FALSE)
+  attr(df, "have_raw_before") <- have_raw
+  df
+}
+
+# ===========================================================================
+# Codelist views for the raw-claim examples (guarded; built only when needed).
+# Mirrors 02_lot1.R S01 (mma_codelist) and S11 (sct_codelist).
+# ===========================================================================
+.vqs_codelist_built <- new.env(parent = emptyenv())
+
+vqs_build_mma_codelist <- function(con) {
+  if (isTRUE(.vqs_codelist_built$mma)) return(invisible(TRUE))
+  if (!exists("load_codelist_csv")) stop("load_codelist_csv not available")
+  src <- load_codelist_csv("cl_mma_codelist.csv",
+    c("CL_CODE_TYPE", "CL_CODE", "CL_MEDICATION_FULL", "CL_MED_CLASS", "CL_MED_ABBR"))
+  db_exec(con, glue("
+    CREATE OR REPLACE TEMPORARY VIEW mma_codelist AS
+    SELECT
+      upper(trim(CL_CODE_TYPE)) AS CL_CODE_TYPE,
+      upper(regexp_replace(trim(CL_CODE), '[^A-Za-z0-9]', '')) AS CL_CODE,
+      lower(trim(CL_MEDICATION_FULL)) AS CL_MEDICATION_FULL,
+      upper(trim(CL_MED_CLASS))       AS CL_MED_CLASS,
+      upper(trim(CL_MED_ABBR))        AS CL_MED_ABBR
+    FROM {src}
+    WHERE CL_CODE IS NOT NULL AND trim(CL_CODE) <> ''
+      AND CL_CODE_TYPE IS NOT NULL AND trim(CL_CODE_TYPE) <> ''"))
+  .vqs_codelist_built$mma <- TRUE
+  invisible(TRUE)
+}
+
+vqs_build_sct_codelist <- function(con) {
+  if (isTRUE(.vqs_codelist_built$sct)) return(invisible(TRUE))
+  if (!exists("load_codelist_csv")) stop("load_codelist_csv not available")
+  src <- load_codelist_csv("cl_sct_codelist.csv",
+    c("CL_CODE_TYPE", "CL_CODE", "SCT_TYPE"))
+  db_exec(con, glue("
+    CREATE OR REPLACE TEMPORARY VIEW sct_codelist AS
+    SELECT
+      CASE
+        WHEN upper(trim(CL_CODE_TYPE)) IN ('ICD10PROC','ICD10PCS') THEN 'ICD10PROC'
+        WHEN upper(trim(CL_CODE_TYPE)) = 'ICD9PROC' THEN 'ICD9PROC'
+        WHEN upper(trim(CL_CODE_TYPE)) LIKE '%PROC%' OR upper(trim(CL_CODE_TYPE)) = 'ICD' THEN 'ICD10PROC'
+        WHEN upper(trim(CL_CODE_TYPE)) IN ('ICD10DIAG','ICD10DX','DIAG10')
+          OR upper(trim(CL_CODE_TYPE)) LIKE 'ICD%10%DIAG%' THEN 'ICD10DIAG'
+        WHEN upper(trim(CL_CODE_TYPE)) IN ('ICD9DIAG','ICD9DX','ICD9','DIAG9')
+          OR upper(trim(CL_CODE_TYPE)) LIKE 'ICD%9%DIAG%' THEN 'ICD9DIAG'
+        WHEN upper(trim(CL_CODE_TYPE)) IN ('DIAG','DX','DIAGNOSIS') THEN 'ICD10DIAG'
+        WHEN upper(trim(CL_CODE_TYPE)) IN ('CPT','CPT4') THEN 'HCPCS'
+        ELSE upper(trim(CL_CODE_TYPE))
+      END AS CL_CODE_TYPE,
+      upper(regexp_replace(trim(CL_CODE), '[^A-Za-z0-9]', '')) AS CL_CODE,
+      CASE
+        WHEN upper(trim(SCT_TYPE)) LIKE 'ALLO%' THEN 'ALLO'
+        WHEN upper(trim(SCT_TYPE)) LIKE 'AUTO%' THEN 'AUTO'
+        WHEN upper(trim(SCT_TYPE)) IN ('CAR-T','CART','CAR_T') THEN 'CART'
+        ELSE upper(trim(SCT_TYPE))
+      END AS SCT_TYPE
+    FROM {src}
+    WHERE CL_CODE IS NOT NULL AND trim(CL_CODE) <> ''
+      AND SCT_TYPE IS NOT NULL AND trim(SCT_TYPE) <> ''"))
+  .vqs_codelist_built$sct <- TRUE
+  invisible(TRUE)
+}
+
+# Raw MM/steroid claims (before MAP derivation) for a set of patients, joined
+# to mma_codelist exactly as 02_lot1.R S04 does. When `bounds` (the
+# vqs_obs_bounds_src() subquery) is supplied, claims are restricted to
+# [INDEX_DATE, OBS_END_DT] as the pipeline does; otherwise the pull falls back
+# to PATID-only (a wider "journey" window the caller should label as such).
+# Returns one row per claim.
+vqs_raw_mma_claims <- function(con, patids, bounds = NULL) {
+  vqs_build_mma_codelist(con)
+  ids <- vqs_in_list(patids)
+  med <- cdm_src(cfg$tbl_medical); rxt <- cdm_src(cfg$tbl_rx)
+  bjoin  <- if (!is.null(bounds)) glue("JOIN {bounds} b ON b.PATID = u.PATID") else ""
+  bwhere <- if (!is.null(bounds)) "WHERE u.DATE_SERVICE BETWEEN b.INDEX_DATE AND b.OBS_END_DT" else ""
+  db_q(con, glue("
+    WITH cl AS (SELECT /*+ BROADCAST */ * FROM mma_codelist),
+    med_proc_cd AS (
+      SELECT cast(m.PATID as string) AS PATID, cast(m.FST_DT AS date) AS DATE_SERVICE,
+             'medical' AS CLAIM_TYPE, 'med_proc_cd' AS CLAIM_SOURCE,
+             c.CL_CODE AS CODE, c.CL_CODE_TYPE AS CODE_TYPE,
+             c.CL_MED_ABBR AS MED_ABBR, c.CL_MED_CLASS AS MED_CLASS
+      FROM {med} m JOIN cl c ON c.CL_CODE_TYPE = 'HCPCS'
+       AND upper(regexp_replace(coalesce(cast(m.PROC_CD as string),''), '[^A-Za-z0-9]', '')) = c.CL_CODE
+      WHERE cast(m.PATID as string) IN ({ids})
+    ),
+    med_bill_proc_cd AS (
+      SELECT cast(m.PATID as string) AS PATID, cast(m.FST_DT AS date) AS DATE_SERVICE,
+             'medical' AS CLAIM_TYPE, 'med_bill_proc' AS CLAIM_SOURCE,
+             c.CL_CODE AS CODE, c.CL_CODE_TYPE AS CODE_TYPE,
+             c.CL_MED_ABBR AS MED_ABBR, c.CL_MED_CLASS AS MED_CLASS
+      FROM {med} m JOIN cl c ON c.CL_CODE_TYPE = 'HCPCS'
+       AND upper(regexp_replace(coalesce(cast(m.BILL_PROC_CD as string),''), '[^A-Za-z0-9]', '')) = c.CL_CODE
+      WHERE cast(m.PATID as string) IN ({ids})
+    ),
+    med_ndc AS (
+      SELECT cast(m.PATID as string) AS PATID, cast(m.FST_DT AS date) AS DATE_SERVICE,
+             'medical' AS CLAIM_TYPE, 'med_ndc' AS CLAIM_SOURCE,
+             c.CL_CODE AS CODE, c.CL_CODE_TYPE AS CODE_TYPE,
+             c.CL_MED_ABBR AS MED_ABBR, c.CL_MED_CLASS AS MED_CLASS
+      FROM {med} m JOIN cl c ON c.CL_CODE_TYPE = 'NDC'
+       AND lpad(regexp_replace(coalesce(cast(m.NDC as string),''), '[^0-9]', ''), 11, '0')
+         = lpad(regexp_replace(c.CL_CODE, '[^0-9]', ''), 11, '0')
+      WHERE cast(m.PATID as string) IN ({ids})
+        AND cast(m.NDC as string) IS NOT NULL AND trim(cast(m.NDC as string)) <> ''
+    ),
+    rx_claims AS (
+      SELECT cast(r.PATID as string) AS PATID, cast(r.FILL_DT AS date) AS DATE_SERVICE,
+             'pharmacy' AS CLAIM_TYPE, 'rx_ndc' AS CLAIM_SOURCE,
+             c.CL_CODE AS CODE, c.CL_CODE_TYPE AS CODE_TYPE,
+             c.CL_MED_ABBR AS MED_ABBR, c.CL_MED_CLASS AS MED_CLASS
+      FROM {rxt} r JOIN cl c ON c.CL_CODE_TYPE = 'NDC'
+       AND lpad(regexp_replace(coalesce(cast(r.NDC as string),''), '[^0-9]', ''), 11, '0')
+         = lpad(regexp_replace(c.CL_CODE, '[^0-9]', ''), 11, '0')
+      WHERE cast(r.PATID as string) IN ({ids})
+    ),
+    u AS (
+      SELECT * FROM med_proc_cd
+      UNION ALL SELECT * FROM med_bill_proc_cd
+      UNION ALL SELECT * FROM med_ndc
+      UNION ALL SELECT * FROM rx_claims
+    )
+    SELECT u.PATID, cast(u.DATE_SERVICE as string) AS DATE_SERVICE, u.CLAIM_TYPE,
+           u.CLAIM_SOURCE, u.CODE, u.CODE_TYPE, u.MED_ABBR, u.MED_CLASS
+    FROM u {bjoin}
+    {bwhere}
+    ORDER BY u.PATID, u.DATE_SERVICE, u.MED_ABBR
+  "))
+}
+
+# Raw SCT claims (before AUTO/ALLO/CART date processing) for given patients,
+# mirroring 02_lot1.R S12 (medical PROC_CD/BILL_PROC_CD + med_procedure +
+# med_diagnosis). When `bounds` is supplied, restricts to [INDEX_DATE,
+# OBS_END_DT] as S12 does. Returns one row per (PATID, DATE_SERVICE, SCT_TYPE).
+vqs_raw_sct_claims <- function(con, patids, bounds = NULL) {
+  vqs_build_sct_codelist(con)
+  ids <- vqs_in_list(patids)
+  med <- cdm_src(cfg$tbl_medical); mproc <- cdm_src(cfg$tbl_med_proc)
+  dx  <- cdm_src(cfg$tbl_med_diag)
+  bjoin  <- if (!is.null(bounds)) glue("JOIN {bounds} b ON b.PATID = c.PATID") else ""
+  bwhere <- if (!is.null(bounds)) "WHERE c.DATE_SERVICE BETWEEN b.INDEX_DATE AND b.OBS_END_DT" else ""
+  db_q(con, glue("
+    WITH s AS (SELECT /*+ BROADCAST */ * FROM sct_codelist),
+    med_proc AS (
+      SELECT cast(m.PATID as string) AS PATID, cast(m.FST_DT AS date) AS DATE_SERVICE,
+             s.SCT_TYPE, s.CL_CODE AS CODE, 'med_proc_cd' AS SRC
+      FROM {med} m JOIN s ON s.CL_CODE_TYPE = 'HCPCS'
+       AND upper(regexp_replace(coalesce(cast(m.PROC_CD as string),''), '[^A-Za-z0-9]', '')) = s.CL_CODE
+      WHERE cast(m.PATID as string) IN ({ids})
+    ),
+    med_bill AS (
+      SELECT cast(m.PATID as string) AS PATID, cast(m.FST_DT AS date) AS DATE_SERVICE,
+             s.SCT_TYPE, s.CL_CODE AS CODE, 'med_bill_proc' AS SRC
+      FROM {med} m JOIN s ON s.CL_CODE_TYPE = 'HCPCS'
+       AND upper(regexp_replace(coalesce(cast(m.BILL_PROC_CD as string),''), '[^A-Za-z0-9]', '')) = s.CL_CODE
+      WHERE cast(m.PATID as string) IN ({ids})
+    ),
+    medproc AS (
+      SELECT cast(mp.PATID as string) AS PATID, cast(mp.FST_DT AS date) AS DATE_SERVICE,
+             s.SCT_TYPE, s.CL_CODE AS CODE, 'med_procedure' AS SRC
+      FROM {mproc} mp JOIN s
+        ON (  (s.CL_CODE_TYPE = 'ICD10PROC' AND coalesce(upper(mp.ICD_FLAG),'') NOT IN ('9','ICD9','ICD-9'))
+           OR (s.CL_CODE_TYPE = 'ICD9PROC'  AND upper(mp.ICD_FLAG) IN ('9','ICD9','ICD-9'))
+           OR  s.CL_CODE_TYPE = 'HCPCS')
+       AND upper(regexp_replace(coalesce(cast(mp.PROC as string),''), '[^A-Za-z0-9]', '')) = s.CL_CODE
+      WHERE cast(mp.PATID as string) IN ({ids})
+    ),
+    med_diag AS (
+      SELECT cast(d.PATID as string) AS PATID, cast(d.FST_DT AS date) AS DATE_SERVICE,
+             s.SCT_TYPE, s.CL_CODE AS CODE, 'med_diagnosis' AS SRC
+      FROM {dx} d JOIN s
+        ON (  (s.CL_CODE_TYPE = 'ICD10DIAG' AND coalesce(upper(d.ICD_FLAG),'') NOT IN ('9','ICD9','ICD-9'))
+           OR (s.CL_CODE_TYPE = 'ICD9DIAG'  AND upper(d.ICD_FLAG) IN ('9','ICD9','ICD-9')))
+       AND upper(regexp_replace(coalesce(cast(d.DIAG as string),''), '[^A-Za-z0-9]', '')) = s.CL_CODE
+      WHERE cast(d.PATID as string) IN ({ids})
+    ),
+    c AS (
+      SELECT * FROM med_proc UNION ALL SELECT * FROM med_bill
+      UNION ALL SELECT * FROM medproc UNION ALL SELECT * FROM med_diag
+    )
+    SELECT c.PATID, cast(c.DATE_SERVICE as string) AS DATE_SERVICE, c.SCT_TYPE,
+           min(c.CODE) AS CODE
+    FROM c {bjoin}
+    {bwhere}
+    GROUP BY c.PATID, c.DATE_SERVICE, c.SCT_TYPE
+    ORDER BY c.PATID, c.DATE_SERVICE
+  "))
+}
+
+# All raw CAR-T claim dates for the LOT1 cohort, observation-window-bounded
+# (needs ELIG_COH_FINAL bounds). This is what makes "CAR-T BEFORE LOT1 start"
+# answerable: LOT1_SCT.FIRST_CART_DT only captures CAR-T on/after LOT1 start
+# (02_lot1.R first_cart CTE filters TX_DT >= LOT1_START_DT), so pre-LOT1 CAR-T
+# must come from the raw SCT claims. Creates/returns a temp view name, or NULL
+# when the codelist / bounds / CDM are unreachable.
+vqs_build_raw_cart_dates <- function(con, lot_long, bounds) {
+  if (is.null(bounds)) return(NULL)
+  view <- "vqs_cart_dates_raw"
+  ok <- tryCatch({
+    vqs_build_sct_codelist(con)
+    med <- cdm_src(cfg$tbl_medical); mproc <- cdm_src(cfg$tbl_med_proc)
+    dx  <- cdm_src(cfg$tbl_med_diag)
+    db_exec(con, glue("
+      CREATE OR REPLACE TEMPORARY VIEW {view} AS
+      WITH s AS (SELECT /*+ BROADCAST */ * FROM sct_codelist WHERE SCT_TYPE = 'CART'),
+      l1 AS (SELECT DISTINCT cast(PATID as string) AS PATID FROM {lot_long} WHERE LOT_NUM = 1),
+      bnd AS {bounds},
+      raw AS (
+        SELECT cast(m.PATID as string) AS PATID, cast(m.FST_DT AS date) AS DATE_SERVICE
+        FROM {med} m JOIN s ON s.CL_CODE_TYPE = 'HCPCS'
+         AND upper(regexp_replace(coalesce(cast(m.PROC_CD as string),''), '[^A-Za-z0-9]', '')) = s.CL_CODE
+        UNION ALL
+        SELECT cast(m.PATID as string) AS PATID, cast(m.FST_DT AS date) AS DATE_SERVICE
+        FROM {med} m JOIN s ON s.CL_CODE_TYPE = 'HCPCS'
+         AND upper(regexp_replace(coalesce(cast(m.BILL_PROC_CD as string),''), '[^A-Za-z0-9]', '')) = s.CL_CODE
+        UNION ALL
+        SELECT cast(mp.PATID as string) AS PATID, cast(mp.FST_DT AS date) AS DATE_SERVICE
+        FROM {mproc} mp JOIN s
+          ON (  (s.CL_CODE_TYPE = 'ICD10PROC' AND coalesce(upper(mp.ICD_FLAG),'') NOT IN ('9','ICD9','ICD-9'))
+             OR (s.CL_CODE_TYPE = 'ICD9PROC'  AND upper(mp.ICD_FLAG) IN ('9','ICD9','ICD-9'))
+             OR  s.CL_CODE_TYPE = 'HCPCS')
+         AND upper(regexp_replace(coalesce(cast(mp.PROC as string),''), '[^A-Za-z0-9]', '')) = s.CL_CODE
+        UNION ALL
+        SELECT cast(d.PATID as string) AS PATID, cast(d.FST_DT AS date) AS DATE_SERVICE
+        FROM {dx} d JOIN s
+          ON (  (s.CL_CODE_TYPE = 'ICD10DIAG' AND coalesce(upper(d.ICD_FLAG),'') NOT IN ('9','ICD9','ICD-9'))
+             OR (s.CL_CODE_TYPE = 'ICD9DIAG'  AND upper(d.ICD_FLAG) IN ('9','ICD9','ICD-9')))
+         AND upper(regexp_replace(coalesce(cast(d.DIAG as string),''), '[^A-Za-z0-9]', '')) = s.CL_CODE
+      )
+      SELECT DISTINCT r.PATID, r.DATE_SERVICE AS CART_DT
+      FROM raw r
+      JOIN l1  ON l1.PATID = r.PATID
+      JOIN bnd b ON b.PATID = r.PATID
+      WHERE r.DATE_SERVICE BETWEEN b.INDEX_DATE AND b.OBS_END_DT"))
+    TRUE
+  }, error = function(e) { log_msg("  [vqs] raw CAR-T date scan unavailable: ",
+                                   conditionMessage(e)); FALSE })
+  if (isTRUE(ok)) view else NULL
+}
+
+# MAP-derived journey (always available) for a set of patients: their
+# MAP_STACKED segments tagged relative to LOT1, so the "after MAPs" picture
+# sits next to the raw claims.
+vqs_map_journey <- function(con, map_tbl, lot_long, patids) {
+  ids <- vqs_in_list(patids)
+  db_q(con, glue("
+    WITH l1 AS (
+      SELECT cast(PATID as string) AS PATID, cast(LOT_START_DT as date) AS L1,
+             cast(LOT_BASE_END_DT as date) AS L1_END
+      FROM {lot_long} WHERE LOT_NUM = 1
+    )
+    SELECT cast(m.PATID as string) AS PATID,
+           m.MAP_MED_TYPE  AS MED_ABBR,
+           m.MAP_MED_CLASS AS MED_CLASS,
+           cast(m.MAP_START_DT as string) AS MAP_START_DT,
+           cast(m.MAP_END_DT   as string) AS MAP_END_DT,
+           CASE WHEN m.MAP_START_DT BETWEEN l.L1 AND date_add(l.L1, {VQS_W1} - 1)
+                THEN 1 ELSE 0 END AS in_lot1_induction
+    FROM {map_tbl} m JOIN l1 l ON l.PATID = cast(m.PATID as string)
+    WHERE cast(m.PATID as string) IN ({ids})
+    ORDER BY PATID, MAP_START_DT, MED_ABBR
+  "))
+}
+
+# Q2 example patients: a few patients with POMA in their LOT1 regimen, with the
+# MAP-derived journey (reliable) + raw MM claims (guarded). n controls how many.
+vqs_q2_poma_examples <- function(con, lot_long, map_tbl, tokens, n = 5L, bounds = NULL) {
+  poma <- tokens$poma
+  ids <- db_q(con, glue("
+    SELECT cast(PATID as string) AS PATID
+    FROM {lot_long}
+    WHERE LOT_NUM = 1 AND LOT_BASE_MEDS IS NOT NULL
+      AND array_contains(split(LOT_BASE_MEDS, ' '), '{poma}')
+    ORDER BY PATID
+    LIMIT {as.integer(n)}"))$PATID
+  out <- list(patids = ids, journey = NULL, raw = NULL, note = NULL,
+              windowed = !is.null(bounds))
+  if (length(ids) == 0) {
+    out$note <- sprintf("No LOT1 patients with token '%s'.", poma)
+    return(out)
+  }
+  out$journey <- tryCatch(vqs_map_journey(con, map_tbl, lot_long, ids),
+                          error = function(e) NULL)
+  out$raw <- tryCatch(vqs_raw_mma_claims(con, ids, bounds = bounds), error = function(e) {
+    out$note <<- paste("Raw-claim pull unavailable:", conditionMessage(e))
+    NULL
+  })
+  if (is.null(bounds) && !is.null(out$raw))
+    out$note <- paste(c(out$note, paste0(
+      "Raw claims NOT observation-window bounded (ELIG_COH_FINAL unavailable); ",
+      "shows full claim history for these PATIDs.")), collapse = " ")
+  out
+}
+
+# Q6 example patients: a few with CAR-T prior to/during LOT1, with raw SCT
+# claims (guarded) + the surrounding raw MM claims + MAP journey. "During or
+# closing LOT1" uses [L1_START, L1_END], extended to L1_END + 1 only when
+# END_REASON in (SCT_CART, CART_INIT) (the engine sets L1_END to the CAR-T
+# date - 1 only for a CAR-T-ending line); "before LOT1" patients are added
+# from the raw CAR-T date view when available.
+vqs_q6_cart_examples <- function(con, lot_long, sct_tbl, map_tbl, n = 5L,
+                                 bounds = NULL, cart_raw_tbl = NULL) {
+  before_union <- if (!is.null(cart_raw_tbl)) glue("
+    UNION
+    SELECT DISTINCT cast(l.PATID as string) AS PATID
+    FROM (SELECT cast(PATID as string) AS PATID, cast(LOT_START_DT as date) AS L1
+          FROM {lot_long} WHERE LOT_NUM = 1) l
+    JOIN {cart_raw_tbl} c ON c.PATID = l.PATID AND c.CART_DT < l.L1")
+  else ""
+  ids <- db_q(con, glue("
+    WITH l1 AS (
+      SELECT cast(PATID as string) AS PATID, cast(LOT_START_DT as date) AS L1,
+             cast(LOT_BASE_END_DT as date) AS L1_END,
+             LOT_BASE_END_REASON AS END_REASON
+      FROM {lot_long} WHERE LOT_NUM = 1
+    ),
+    sct AS (
+      SELECT cast(PATID as string) AS PATID, min(cast(FIRST_CART_DT as date)) AS CART_DT
+      FROM {sct_tbl} WHERE FIRST_CART_DT IS NOT NULL
+      GROUP BY cast(PATID as string)
+    ),
+    pick AS (
+      -- 'during or closing LOT1': +1 only when CAR-T itself closed LOT1.
+      SELECT l.PATID FROM l1 l JOIN sct s ON s.PATID = l.PATID
+      WHERE s.CART_DT BETWEEN l.L1 AND
+            (CASE WHEN l.END_REASON IN ('SCT_CART','CART_INIT')
+                  THEN date_add(l.L1_END, 1) ELSE l.L1_END END)
+      {before_union}
+    )
+    SELECT PATID FROM pick ORDER BY PATID LIMIT {as.integer(n)}"))$PATID
+  out <- list(patids = ids, sct_raw = NULL, mma_raw = NULL, journey = NULL,
+              note = NULL, windowed = !is.null(bounds))
+  if (length(ids) == 0) {
+    out$note <- if (is.null(cart_raw_tbl))
+      paste("No patients with CAR-T during or closing LOT1.",
+            "(Before-LOT1 CAR-T was NOT assessed for examples - the raw CAR-T",
+            "scan was unavailable.)")
+    else "No patients with CAR-T prior to or during LOT1."
+    return(out)
+  }
+  out$journey <- tryCatch(vqs_map_journey(con, map_tbl, lot_long, ids),
+                          error = function(e) NULL)
+  out$sct_raw <- tryCatch(vqs_raw_sct_claims(con, ids, bounds = bounds), error = function(e) {
+    out$note <<- paste("Raw SCT-claim pull unavailable:", conditionMessage(e)); NULL })
+  out$mma_raw <- tryCatch(vqs_raw_mma_claims(con, ids, bounds = bounds), error = function(e) NULL)
+  if (is.null(bounds) && (!is.null(out$sct_raw) || !is.null(out$mma_raw)))
+    out$note <- paste(c(out$note, paste0(
+      "Raw claims NOT observation-window bounded (ELIG_COH_FINAL unavailable); ",
+      "shows full claim history for these PATIDs.")), collapse = " ")
+  out
+}
