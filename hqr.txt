@@ -57,7 +57,7 @@ SOC_CASE <- "
 SOC_CTE  <- paste0("soc AS (SELECT cast(PATID as string) AS PATID, LOT_NUM,",
                    SOC_CASE, " AS soc_category FROM ", T_lot, ")")
 ROLL_CTE <- paste0("roll AS (SELECT cast(PATID as string) AS PATID, max(LOT_NUM) AS n_lines,",
-                   " max(CASE WHEN LOT_NUM=2 THEN LOT_START_DT END) AS lot2_start FROM ",
+                   " min(CASE WHEN LOT_NUM>1 THEN LOT_START_DT END) AS next_line_start FROM ",
                    T_lot, " GROUP BY cast(PATID as string))")
 
 # ---- PATIENT-LEVEL (57 columns). ENDDATE_CE = disenroll/study-end horizon;
@@ -85,16 +85,16 @@ SELECT
   1.0 AS baseline_py,
   0 AS ip_hosp_count, 0 AS er_visit_count, 0.0 AS ip_los_days,
   coalesce(s1.soc_category,'Other') AS soc_category,
-  coalesce(r.n_lines,1) AS n_lines,
-  coalesce(lb.LOT1_BASE_LENGTH, 1) AS lot1_length,
+  greatest(1, coalesce(r.n_lines,1)) AS n_lines,
+  greatest(1, coalesce(lb.LOT1_BASE_LENGTH, 1)) AS lot1_length,
   greatest(0, round(datediff(least(coalesce(ec.DEATH_DT, cast(ec.ENDDATE_CE as date)), cast(ec.ENDDATE_CE as date)), lb.LOT1_START_DT)/30.44, 1)) AS os_time,
   CASE WHEN ec.DEATH_DT IS NOT NULL AND ec.DEATH_DT <= cast(ec.ENDDATE_CE as date) THEN 1 ELSE 0 END AS os_event,
   greatest(0, round(datediff(least(coalesce(lb.LOT1_BASE_END_DT, cast(ec.ENDDATE_CE as date)), cast(ec.ENDDATE_CE as date)), lb.LOT1_START_DT)/30.44, 1)) AS ttd_time,
   CASE WHEN lb.LOT1_BASE_END_DT IS NOT NULL AND lb.LOT1_BASE_END_DT <= cast(ec.ENDDATE_CE as date)
         AND upper(coalesce(lb.LOT1_BASE_END_REASON,'')) NOT LIKE '%STUDY%'
         AND upper(coalesce(lb.LOT1_BASE_END_REASON,'')) NOT LIKE '%DISENROLL%' THEN 1 ELSE 0 END AS ttd_event,
-  greatest(0, round(datediff(least(coalesce(r.lot2_start, ec.DEATH_DT, cast(ec.ENDDATE_CE as date)), cast(ec.ENDDATE_CE as date)), lb.LOT1_START_DT)/30.44, 1)) AS ttnt_time,
-  CASE WHEN r.lot2_start IS NOT NULL AND r.lot2_start <= cast(ec.ENDDATE_CE as date) THEN 1 ELSE 0 END AS ttnt_event,
+  greatest(0, round(datediff(least(coalesce(r.next_line_start, ec.DEATH_DT, cast(ec.ENDDATE_CE as date)), cast(ec.ENDDATE_CE as date)), lb.LOT1_START_DT)/30.44, 1)) AS ttnt_time,
+  CASE WHEN greatest(1, coalesce(r.n_lines,1)) > 1 THEN 1 ELSE 0 END AS ttnt_event,
   greatest(0, round(datediff(least(coalesce(lb.LOT1_BASE_END_DT, cast(ec.ENDDATE_CE as date)), cast(ec.ENDDATE_CE as date)), lb.LOT1_START_DT)/30.44, 1)) AS pfs_time,
   CASE WHEN lb.LOT1_BASE_END_DT IS NOT NULL AND lb.LOT1_BASE_END_DT <= cast(ec.ENDDATE_CE as date)
         AND upper(coalesce(lb.LOT1_BASE_END_REASON,'')) NOT LIKE '%STUDY%'
