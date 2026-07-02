@@ -6,43 +6,44 @@
 #   analytic_cohort.csv    (patient level, 57-col contract)
 #   analytic_lot_long.csv  (per line, 13-col contract)
 #
-# Run (set the token as an env var / Domino secret, NOT in code):
+# Run (token as an env var / Domino secret, NOT in code):
 #   export WAREHOUSE_PWD='<your NEW databricks token>'
-#   export OUT_DIR=/domino/datasets/local/cohort_data     # or any writable dir
+#   export OUT_DIR=/tmp/cohort_data        # or the dataset mount /mnt/data/cohort_data
 #   Rscript make_analytic_csv.R
+#
+# NOTE: uses WITH sub-queries (no CREATE TEMPORARY VIEW), so it works on
+# Databricks SQL Warehouse endpoints where temp views are unavailable.
 #
 # Real:   cohort, gender, age, all 12 IE flags, LOT structure, SOC category,
 #         OS/TTD/TTNT (disenrollment-capped so validators pass).
 # Placeholder (no source table): race/region/payer/ethnicity='Unknown',
-#         cci=0, baseline safety flags/counts=0, HCRU=0, baseline_py=1.
-# Each such column is tagged [PLACEHOLDER] below.
+#         cci=0, safety flags/counts=0, HCRU=0, baseline_py=1.
 # =============================================================================
 
 library(DBI)
 
-cat <- base::cat   # guard: some tables have a column literally named 'cat'
-dsn     <- Sys.getenv("WAREHOUSE_DSN", "RWDE")
 pwd     <- Sys.getenv("WAREHOUSE_PWD", "")
+dsn     <- Sys.getenv("WAREHOUSE_DSN", "RWDE")
 catalog <- Sys.getenv("WAREHOUSE_CATALOG", "hive_metastore")
 schema  <- Sys.getenv("WAREHOUSE_SCHEMA", "osk02156")
-out_dir <- Sys.getenv("OUT_DIR", "/domino/datasets/local/cohort_data")
+out_dir <- Sys.getenv("OUT_DIR", "/tmp/cohort_data")
 lot1_from <- Sys.getenv("NDMM_LOT1_FROM", "2017-01-01")
 
 if (!nzchar(pwd)) stop("Set WAREHOUSE_PWD (your databricks token).", call. = FALSE)
 if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
 
 q <- function(t) sprintf("`%s`.`%s`.`%s`", catalog, schema, t)
+T_lot   <- q("lot_long")
+T_elig  <- q("elig_coh_final")
+T_lb    <- q("lot1_base_end")
+T_flags <- q("ndmm_flags_all")
+
 con <- dbConnect(odbc::odbc(), dsn = dsn, pwd = pwd, timeout = 120)
 on.exit(try(dbDisconnect(con), silent = TRUE), add = TRUE)
-ex <- function(sql) dbExecute(con, sql)
-gq <- function(sql) dbGetQuery(con, sql)
+message("Connected. Querying (no temp views) ...")
 
-message("Connected. Building helper views ...")
-
-# ---- SOC category per (PATID, LOT_NUM) from lot_long class/count flags -------
-ex(sprintf("
-  CREATE OR REPLACE TEMPORARY VIEW _soc AS
-  SELECT cast(PATID as string) AS PATID, LOT_NUM,
+# ---- reusable SQL fragments (inlined as WITH sub-queries) --------------------
+SOC_CASE <- "
     CASE
       WHEN coalesce(LOT_CART_LOT_FLG,0)=1 THEN 'CAR-T'
       WHEN coalesce(LOT_ALLO_LOT_FLG,0)=1 THEN 'Transplant'
@@ -51,115 +52,104 @@ ex(sprintf("
       WHEN coalesce(LOT_MED_CNT,0)=3 THEN 'Other triplet (non-anti-CD38)'
       WHEN coalesce(LOT_MED_CNT,0)=2 THEN 'Doublet'
       WHEN coalesce(LOT_MED_CNT,0)=1 THEN 'Monotherapy'
-      ELSE 'Other'
-    END AS soc_category
-  FROM %s", q("lot_long")))
+      ELSE 'Other' END"
 
-# ---- per-patient LOT rollup (line count + 2L start) --------------------------
-ex(sprintf("
-  CREATE OR REPLACE TEMPORARY VIEW _roll AS
-  SELECT cast(PATID as string) AS PATID,
-         max(LOT_NUM) AS n_lines,
-         max(CASE WHEN LOT_NUM=2 THEN LOT_START_DT END) AS lot2_start
-  FROM %s GROUP BY cast(PATID as string)", q("lot_long")))
+SOC_CTE  <- paste0("soc AS (SELECT cast(PATID as string) AS PATID, LOT_NUM,",
+                   SOC_CASE, " AS soc_category FROM ", T_lot, ")")
+ROLL_CTE <- paste0("roll AS (SELECT cast(PATID as string) AS PATID, max(LOT_NUM) AS n_lines,",
+                   " max(CASE WHEN LOT_NUM=2 THEN LOT_START_DT END) AS lot2_start FROM ",
+                   T_lot, " GROUP BY cast(PATID as string))")
+
+# ---- PATIENT-LEVEL (57 columns). ENDDATE_CE = disenroll/study-end horizon;
+#      all TTE capped at ENDDATE_CE so time <= fu_potential_months. ------------
+sql_pat <- paste0("
+WITH ", SOC_CTE, ", ", ROLL_CTE, "
+SELECT
+  cast(ec.PATID as string) AS patient_id,
+  ec.AGE_INDEX_YR AS age_index,
+  CASE upper(ec.GDR_CD) WHEN 'M' THEN 'Male' WHEN 'F' THEN 'Female' ELSE 'Unknown' END AS gender,
+  'Unknown' AS region, 'Unknown' AS race, 'Unknown' AS ethnicity, 'Unknown' AS payer_type,
+  cast(ec.INDEX_DATE as date) AS index_date,
+  cast(lb.LOT1_START_DT as date) AS lot1_start_dt,
+  cast(ec.DEATH_DT as date) AS death_dt,
+  coalesce(ec.INDEX_YR, year(ec.INDEX_DATE)) AS dx_year,
+  year(lb.LOT1_START_DT) AS lot_init_year,
+  round(datediff(lb.LOT1_START_DT, ec.INDEX_DATE)/30.44, 1) AS dx_to_1l_months,
+  round(coalesce(ec.FU_DAYS, datediff(ec.ENDDATE, ec.INDEX_DATE))/30.44, 1) AS fu_from_dx_months,
+  greatest(0, round(datediff(cast(ec.ENDDATE_CE as date), lb.LOT1_START_DT)/30.44, 1)) AS fu_potential_months,
+  greatest(0, round(datediff(ec.INDEX_DATE, cast(ec.baseline_start as date))/30.44, 1)) AS baseline_ce_months,
+  greatest(0, round(datediff(cast(ec.ENDDATE_CE as date), ec.INDEX_DATE)/30.44, 1)) AS followup_ce_months,
+  cast(0 as int) AS cci,
+  0 AS bl_hepatic,0 AS bl_renal,0 AS bl_infection,0 AS bl_ocular,0 AS bl_cv,0 AS bl_neuro,
+  0 AS n_hepatic,0 AS n_renal,0 AS n_infection,0 AS n_ocular,0 AS n_cv,0 AS n_neuro,
+  1.0 AS baseline_py,
+  0 AS ip_hosp_count, 0 AS er_visit_count, 0.0 AS ip_los_days,
+  coalesce(s1.soc_category,'Other') AS soc_category,
+  coalesce(r.n_lines,1) AS n_lines,
+  coalesce(lb.LOT1_BASE_LENGTH, 1) AS lot1_length,
+  greatest(0, round(datediff(least(coalesce(ec.DEATH_DT, cast(ec.ENDDATE_CE as date)), cast(ec.ENDDATE_CE as date)), lb.LOT1_START_DT)/30.44, 1)) AS os_time,
+  CASE WHEN ec.DEATH_DT IS NOT NULL AND ec.DEATH_DT <= cast(ec.ENDDATE_CE as date) THEN 1 ELSE 0 END AS os_event,
+  greatest(0, round(datediff(least(coalesce(lb.LOT1_BASE_END_DT, cast(ec.ENDDATE_CE as date)), cast(ec.ENDDATE_CE as date)), lb.LOT1_START_DT)/30.44, 1)) AS ttd_time,
+  CASE WHEN lb.LOT1_BASE_END_DT IS NOT NULL AND lb.LOT1_BASE_END_DT <= cast(ec.ENDDATE_CE as date)
+        AND upper(coalesce(lb.LOT1_BASE_END_REASON,'')) NOT LIKE '%STUDY%'
+        AND upper(coalesce(lb.LOT1_BASE_END_REASON,'')) NOT LIKE '%DISENROLL%' THEN 1 ELSE 0 END AS ttd_event,
+  greatest(0, round(datediff(least(coalesce(r.lot2_start, ec.DEATH_DT, cast(ec.ENDDATE_CE as date)), cast(ec.ENDDATE_CE as date)), lb.LOT1_START_DT)/30.44, 1)) AS ttnt_time,
+  CASE WHEN r.lot2_start IS NOT NULL AND r.lot2_start <= cast(ec.ENDDATE_CE as date) THEN 1 ELSE 0 END AS ttnt_event,
+  greatest(0, round(datediff(least(coalesce(lb.LOT1_BASE_END_DT, cast(ec.ENDDATE_CE as date)), cast(ec.ENDDATE_CE as date)), lb.LOT1_START_DT)/30.44, 1)) AS pfs_time,
+  CASE WHEN lb.LOT1_BASE_END_DT IS NOT NULL AND lb.LOT1_BASE_END_DT <= cast(ec.ENDDATE_CE as date)
+        AND upper(coalesce(lb.LOT1_BASE_END_REASON,'')) NOT LIKE '%STUDY%'
+        AND upper(coalesce(lb.LOT1_BASE_END_REASON,'')) NOT LIKE '%DISENROLL%' THEN 1 ELSE 0 END AS pfs_event,
+  CASE WHEN coalesce(ec.inpt_qual,0)=1 OR coalesce(ec.outpt_qual,0)=1 THEN 1 ELSE 0 END AS incl_qualifying_mm,
+  CASE WHEN lb.LOT1_START_DT >= date('", lot1_from, "') THEN 1 ELSE 0 END AS incl_eligible_1l_tx,
+  CASE WHEN ec.AGE_INDEX_YR >= 18 THEN 1 ELSE 0 END AS incl_adult,
+  greatest(coalesce(ec.CE_b,0), coalesce(f.CE_pre_lot1_12mo,0)) AS incl_baseline_ce_6m,
+  coalesce(f.CE_pre_lot1_12mo,0) AS incl_baseline_ce_12m,
+  coalesce(f.CE_lot1_3mo_fu, ec.CE_3mosf, 0) AS incl_fu_ce_3m,
+  CASE WHEN coalesce(ec.MM_bl_agents,0)=0 THEN 1 ELSE 0 END AS incl_new_user,
+  CASE WHEN coalesce(ec.MM_FU_agents,0)>=1 THEN 1 ELSE 0 END AS incl_fu_mm_agents,
+  coalesce(f.NO_PRIOR_MM_TX,0) AS excl_prior_mm_tx,
+  coalesce(f.NO_OTHER_CANCER_PRE_LOT1, 1 - coalesce(ec.OTHER_MALIGN_FLAG,0)) AS excl_other_cancer,
+  coalesce(f.NO_BELANTAMAB,0) AS excl_belantamab,
+  coalesce(f.NO_PREGNANCY, 1 - coalesce(ec.PREGNANT_FLAG,0)) AS excl_pregnancy
+FROM ", T_elig, " ec
+INNER JOIN ", T_lb, " lb ON cast(ec.PATID as string)=cast(lb.PATID as string)
+LEFT  JOIN ", T_flags, " f ON cast(ec.PATID as string)=cast(f.PATID as string)
+LEFT  JOIN roll r ON cast(ec.PATID as string)=r.PATID
+LEFT  JOIN soc  s1 ON cast(ec.PATID as string)=s1.PATID AND s1.LOT_NUM=1")
 
 message("Querying patient-level cohort ...")
-
-# ---- PATIENT-LEVEL (57-col contract) ----------------------------------------
-# ENDDATE_CE = disenrollment/study-end horizon (death-independent). All TTE are
-# capped at ENDDATE_CE so time <= fu_potential_months always holds.
-ac <- gq(sprintf("
-  SELECT
-    cast(ec.PATID as string)                                   AS patient_id,
-    ec.AGE_INDEX_YR                                            AS age_index,
-    CASE upper(ec.GDR_CD) WHEN 'M' THEN 'Male' WHEN 'F' THEN 'Female' ELSE 'Unknown' END AS gender,
-    'Unknown' AS region, 'Unknown' AS race, 'Unknown' AS ethnicity, 'Unknown' AS payer_type,  -- [PLACEHOLDER]
-    cast(ec.INDEX_DATE as date)                                AS index_date,
-    cast(lb.LOT1_START_DT as date)                             AS lot1_start_dt,
-    cast(ec.DEATH_DT as date)                                  AS death_dt,
-    coalesce(ec.INDEX_YR, year(ec.INDEX_DATE))                 AS dx_year,
-    year(lb.LOT1_START_DT)                                     AS lot_init_year,
-    round(datediff(lb.LOT1_START_DT, ec.INDEX_DATE)/30.44, 1)  AS dx_to_1l_months,
-    round(coalesce(ec.FU_DAYS, datediff(ec.ENDDATE, ec.INDEX_DATE))/30.44, 1) AS fu_from_dx_months,
-    greatest(0, round(datediff(cast(ec.ENDDATE_CE as date), lb.LOT1_START_DT)/30.44, 1)) AS fu_potential_months,
-    round(datediff(ec.INDEX_DATE, cast(ec.baseline_start as date))/30.44, 1)  AS baseline_ce_months,
-    greatest(0, round(datediff(cast(ec.ENDDATE_CE as date), ec.INDEX_DATE)/30.44, 1)) AS followup_ce_months,
-    cast(0 as int) AS cci,                                                              -- [PLACEHOLDER]
-    0 AS bl_hepatic,0 AS bl_renal,0 AS bl_infection,0 AS bl_ocular,0 AS bl_cv,0 AS bl_neuro,   -- [PLACEHOLDER]
-    0 AS n_hepatic,0 AS n_renal,0 AS n_infection,0 AS n_ocular,0 AS n_cv,0 AS n_neuro,         -- [PLACEHOLDER]
-    1.0 AS baseline_py,                                                                 -- [PLACEHOLDER]
-    0 AS ip_hosp_count, 0 AS er_visit_count, 0.0 AS ip_los_days,                        -- [PLACEHOLDER]
-    coalesce(s1.soc_category,'Other')                          AS soc_category,
-    coalesce(r.n_lines,1)                                      AS n_lines,
-    coalesce(lb.LOT1_BASE_LENGTH, 1)                           AS lot1_length,
-    -- OS: capped at ENDDATE_CE
-    greatest(0, round(datediff(least(coalesce(ec.DEATH_DT, cast(ec.ENDDATE_CE as date)), cast(ec.ENDDATE_CE as date)), lb.LOT1_START_DT)/30.44, 1)) AS os_time,
-    CASE WHEN ec.DEATH_DT IS NOT NULL AND ec.DEATH_DT <= cast(ec.ENDDATE_CE as date) THEN 1 ELSE 0 END AS os_event,
-    -- TTD: LOT1 discontinuation
-    greatest(0, round(datediff(least(coalesce(lb.LOT1_BASE_END_DT, cast(ec.ENDDATE_CE as date)), cast(ec.ENDDATE_CE as date)), lb.LOT1_START_DT)/30.44, 1)) AS ttd_time,
-    CASE WHEN lb.LOT1_BASE_END_DT IS NOT NULL AND lb.LOT1_BASE_END_DT <= cast(ec.ENDDATE_CE as date)
-          AND upper(coalesce(lb.LOT1_BASE_END_REASON,'')) NOT LIKE '%STUDY%'
-          AND upper(coalesce(lb.LOT1_BASE_END_REASON,'')) NOT LIKE '%DISENROLL%' THEN 1 ELSE 0 END AS ttd_event,
-    -- TTNT: start of 2L
-    greatest(0, round(datediff(least(coalesce(r.lot2_start, ec.DEATH_DT, cast(ec.ENDDATE_CE as date)), cast(ec.ENDDATE_CE as date)), lb.LOT1_START_DT)/30.44, 1)) AS ttnt_time,
-    CASE WHEN r.lot2_start IS NOT NULL AND r.lot2_start <= cast(ec.ENDDATE_CE as date) THEN 1 ELSE 0 END AS ttnt_event,
-    -- PFS (exploratory) = TTD proxy
-    greatest(0, round(datediff(least(coalesce(lb.LOT1_BASE_END_DT, cast(ec.ENDDATE_CE as date)), cast(ec.ENDDATE_CE as date)), lb.LOT1_START_DT)/30.44, 1)) AS pfs_time,
-    CASE WHEN lb.LOT1_BASE_END_DT IS NOT NULL AND lb.LOT1_BASE_END_DT <= cast(ec.ENDDATE_CE as date)
-          AND upper(coalesce(lb.LOT1_BASE_END_REASON,'')) NOT LIKE '%STUDY%'
-          AND upper(coalesce(lb.LOT1_BASE_END_REASON,'')) NOT LIKE '%DISENROLL%' THEN 1 ELSE 0 END AS pfs_event,
-    -- ---- IE flags (real) ----
-    CASE WHEN coalesce(ec.inpt_qual,0)=1 OR coalesce(ec.outpt_qual,0)=1 THEN 1 ELSE 0 END AS incl_qualifying_mm,
-    CASE WHEN lb.LOT1_START_DT >= date('%s') THEN 1 ELSE 0 END              AS incl_eligible_1l_tx,
-    CASE WHEN ec.AGE_INDEX_YR >= 18 THEN 1 ELSE 0 END                       AS incl_adult,
-    greatest(coalesce(ec.CE_b,0), coalesce(f.CE_pre_lot1_12mo,0))           AS incl_baseline_ce_6m,
-    coalesce(f.CE_pre_lot1_12mo,0)                                          AS incl_baseline_ce_12m,
-    coalesce(f.CE_lot1_3mo_fu, ec.CE_3mosf, 0)                              AS incl_fu_ce_3m,
-    CASE WHEN coalesce(ec.MM_bl_agents,0)=0 THEN 1 ELSE 0 END               AS incl_new_user,
-    CASE WHEN coalesce(ec.MM_FU_agents,0)>=1 THEN 1 ELSE 0 END              AS incl_fu_mm_agents,
-    coalesce(f.NO_PRIOR_MM_TX,0)                                            AS excl_prior_mm_tx,
-    coalesce(f.NO_OTHER_CANCER_PRE_LOT1, 1 - coalesce(ec.OTHER_MALIGN_FLAG,0)) AS excl_other_cancer,
-    coalesce(f.NO_BELANTAMAB,0)                                             AS excl_belantamab,
-    coalesce(f.NO_PREGNANCY, 1 - coalesce(ec.PREGNANT_FLAG,0))              AS excl_pregnancy
-  FROM %s ec
-  INNER JOIN %s lb ON cast(ec.PATID as string)=cast(lb.PATID as string)
-  LEFT  JOIN %s f  ON cast(ec.PATID as string)=cast(f.PATID as string)
-  LEFT  JOIN _roll r ON cast(ec.PATID as string)=r.PATID
-  LEFT  JOIN _soc  s1 ON cast(ec.PATID as string)=s1.PATID AND s1.LOT_NUM=1",
-  lot1_from, q("elig_coh_final"), q("lot1_base_end"), q("ndmm_flags_all")))
-
+ac <- dbGetQuery(con, sql_pat)
 message(sprintf("  patient-level rows: %s", format(nrow(ac), big.mark=",")))
 
+# ---- PER-LINE (13 columns) --------------------------------------------------
+sql_ll <- paste0("
+WITH ", SOC_CTE, "
+SELECT
+  cast(ll.PATID as string) AS patient_id,
+  ll.LOT_NUM AS lot_num,
+  cast(ll.LOT_START_DT as date) AS lot_start_dt,
+  coalesce(s.soc_category,'Other') AS lot_soc,
+  ns.soc_category AS next_soc,
+  'Unknown' AS payer_type,
+  greatest(0, round(datediff(least(coalesce(ec.DEATH_DT, cast(ec.ENDDATE_CE as date)), cast(ec.ENDDATE_CE as date)), ll.LOT_START_DT)/30.44, 1)) AS os_time,
+  CASE WHEN ec.DEATH_DT IS NOT NULL AND ec.DEATH_DT <= cast(ec.ENDDATE_CE as date) THEN 1 ELSE 0 END AS os_event,
+  greatest(0, round(datediff(least(coalesce(ll.LOT_BASE_END_DT, cast(ec.ENDDATE_CE as date)), cast(ec.ENDDATE_CE as date)), ll.LOT_START_DT)/30.44, 1)) AS ttd_time,
+  CASE WHEN ll.LOT_BASE_END_DT IS NOT NULL AND ll.LOT_BASE_END_DT <= cast(ec.ENDDATE_CE as date)
+        AND upper(coalesce(ll.LOT_BASE_END_REASON,'')) NOT LIKE '%STUDY%'
+        AND upper(coalesce(ll.LOT_BASE_END_REASON,'')) NOT LIKE '%DISENROLL%' THEN 1 ELSE 0 END AS ttd_event,
+  greatest(0, round(datediff(least(coalesce(nx.LOT_START_DT, ec.DEATH_DT, cast(ec.ENDDATE_CE as date)), cast(ec.ENDDATE_CE as date)), ll.LOT_START_DT)/30.44, 1)) AS ttnt_time,
+  CASE WHEN nx.LOT_START_DT IS NOT NULL AND nx.LOT_START_DT <= cast(ec.ENDDATE_CE as date) THEN 1 ELSE 0 END AS ttnt_event,
+  greatest(0, round(datediff(cast(ec.ENDDATE_CE as date), ll.LOT_START_DT)/30.44, 1)) AS fu_potential_months
+FROM ", T_lot, " ll
+INNER JOIN ", T_elig, " ec ON cast(ll.PATID as string)=cast(ec.PATID as string)
+LEFT  JOIN soc s  ON cast(ll.PATID as string)=s.PATID  AND s.LOT_NUM = ll.LOT_NUM
+LEFT  JOIN soc ns ON cast(ll.PATID as string)=ns.PATID AND ns.LOT_NUM = ll.LOT_NUM + 1
+LEFT  JOIN ", T_lot, " nx ON cast(ll.PATID as string)=cast(nx.PATID as string) AND nx.LOT_NUM = ll.LOT_NUM + 1")
+
 message("Querying per-line LOT-long ...")
-
-# ---- PER-LINE (13-col contract) ---------------------------------------------
-ll <- gq(sprintf("
-  SELECT
-    cast(ll.PATID as string)                                   AS patient_id,
-    ll.LOT_NUM                                                 AS lot_num,
-    cast(ll.LOT_START_DT as date)                              AS lot_start_dt,
-    coalesce(s.soc_category,'Other')                           AS lot_soc,
-    ns.soc_category                                            AS next_soc,
-    'Unknown'                                                  AS payer_type,   -- [PLACEHOLDER]
-    greatest(0, round(datediff(least(coalesce(ec.DEATH_DT, cast(ec.ENDDATE_CE as date)), cast(ec.ENDDATE_CE as date)), ll.LOT_START_DT)/30.44, 1)) AS os_time,
-    CASE WHEN ec.DEATH_DT IS NOT NULL AND ec.DEATH_DT <= cast(ec.ENDDATE_CE as date) THEN 1 ELSE 0 END AS os_event,
-    greatest(0, round(datediff(least(coalesce(ll.LOT_BASE_END_DT, cast(ec.ENDDATE_CE as date)), cast(ec.ENDDATE_CE as date)), ll.LOT_START_DT)/30.44, 1)) AS ttd_time,
-    CASE WHEN ll.LOT_BASE_END_DT IS NOT NULL AND ll.LOT_BASE_END_DT <= cast(ec.ENDDATE_CE as date)
-          AND upper(coalesce(ll.LOT_BASE_END_REASON,'')) NOT LIKE '%STUDY%'
-          AND upper(coalesce(ll.LOT_BASE_END_REASON,'')) NOT LIKE '%DISENROLL%' THEN 1 ELSE 0 END AS ttd_event,
-    greatest(0, round(datediff(least(coalesce(nx.LOT_START_DT, ec.DEATH_DT, cast(ec.ENDDATE_CE as date)), cast(ec.ENDDATE_CE as date)), ll.LOT_START_DT)/30.44, 1)) AS ttnt_time,
-    CASE WHEN nx.LOT_START_DT IS NOT NULL AND nx.LOT_START_DT <= cast(ec.ENDDATE_CE as date) THEN 1 ELSE 0 END AS ttnt_event,
-    greatest(0, round(datediff(cast(ec.ENDDATE_CE as date), ll.LOT_START_DT)/30.44, 1)) AS fu_potential_months
-  FROM %s ll
-  INNER JOIN %s ec ON cast(ll.PATID as string)=cast(ec.PATID as string)
-  LEFT  JOIN _soc s  ON cast(ll.PATID as string)=s.PATID  AND s.LOT_NUM = ll.LOT_NUM
-  LEFT  JOIN _soc ns ON cast(ll.PATID as string)=ns.PATID AND ns.LOT_NUM = ll.LOT_NUM + 1
-  LEFT  JOIN %s nx ON cast(ll.PATID as string)=cast(nx.PATID as string) AND nx.LOT_NUM = ll.LOT_NUM + 1",
-  q("lot_long"), q("elig_coh_final"), q("lot_long")))
-
+ll <- dbGetQuery(con, sql_ll)
 message(sprintf("  LOT-long rows: %s", format(nrow(ll), big.mark=",")))
 
-# keep only LOT-long rows for patients in the patient-level cohort (coverage)
 ll <- ll[ll$patient_id %in% ac$patient_id, , drop = FALSE]
 
 ap <- file.path(out_dir, "analytic_cohort.csv")
