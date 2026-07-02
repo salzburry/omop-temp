@@ -129,7 +129,7 @@ SELECT
   ll.LOT_NUM AS lot_num,
   cast(ll.LOT_START_DT as date) AS lot_start_dt,
   coalesce(s.soc_category,'Other') AS lot_soc,
-  ns.soc_category AS next_soc,
+  lead(coalesce(s.soc_category,'Other')) OVER (PARTITION BY cast(ll.PATID as string) ORDER BY ll.LOT_NUM) AS next_soc,
   'Unknown' AS payer_type,
   greatest(0, round(datediff(least(coalesce(ec.DEATH_DT, cast(ec.ENDDATE_CE as date)), cast(ec.ENDDATE_CE as date)), ll.LOT_START_DT)/30.44, 1)) AS os_time,
   CASE WHEN ec.DEATH_DT IS NOT NULL AND ec.DEATH_DT <= cast(ec.ENDDATE_CE as date) THEN 1 ELSE 0 END AS os_event,
@@ -143,7 +143,6 @@ SELECT
 FROM ", T_lot, " ll
 INNER JOIN ", T_elig, " ec ON cast(ll.PATID as string)=cast(ec.PATID as string)
 LEFT  JOIN soc s  ON cast(ll.PATID as string)=s.PATID  AND s.LOT_NUM = ll.LOT_NUM
-LEFT  JOIN soc ns ON cast(ll.PATID as string)=ns.PATID AND ns.LOT_NUM = ll.LOT_NUM + 1
 LEFT  JOIN ", T_lot, " nx ON cast(ll.PATID as string)=cast(nx.PATID as string) AND nx.LOT_NUM = ll.LOT_NUM + 1")
 
 message("Querying per-line LOT-long ...")
@@ -154,8 +153,8 @@ ll <- ll[ll$patient_id %in% ac$patient_id, , drop = FALSE]
 
 ap <- file.path(out_dir, "analytic_cohort.csv")
 lp <- file.path(out_dir, "analytic_lot_long.csv")
-write.csv(ac, ap, row.names = FALSE, na = "")
-write.csv(ll, lp, row.names = FALSE, na = "")
+write.csv(ac, ap, row.names = FALSE, na = "NA")
+write.csv(ll, lp, row.names = FALSE, na = "NA")
 
 message("\nDONE")
 message(sprintf("  %s  (%s patients)", ap, format(nrow(ac), big.mark=",")))
