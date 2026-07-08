@@ -1,1974 +1,372 @@
-# RDQ-1 transfer bundle (UTF-8, LF line endings). 9 files.
-# Each file's content is between a '>>>>> FILE: <path>' line and the next marker;
-# the last file ends at the '>>>>> END' line. Content is CRLF/LF/CR tolerant.
-#
-# EXTRACT — option A: use the bundled helper (if you also copied rdq1_extract.py):
-#     python rdq1_extract.py rdq1_transfer.txt [output_dir]
-# EXTRACT — option B (SELF-CONTAINED, no other file needed): save the block below as
-# extract.py (strip the leading "# "), then run:  python extract.py rdq1_transfer.txt [out_dir]
-# ---8<--- extract.py ---------------------------------------------------------
-# import sys, os
-# MARK = ">>>>> FILE: "; END = ">>>>> END"
-# bundle = sys.argv[1] if len(sys.argv) > 1 else "rdq1_transfer.txt"
-# out    = sys.argv[2] if len(sys.argv) > 2 else "."
-# lines  = open(bundle, encoding="utf-8").read().splitlines()   # tolerates LF / CRLF / CR
-# path, buf = None, []
-# def flush():
-#     if path is None: return
-#     parts = [p for p in path.replace("\\", "/").split("/") if p not in ("", ".")]
-#     if os.path.isabs(path) or ".." in parts or not parts: return   # reject unsafe paths
-#     target = os.path.join(out, *parts); parent = os.path.dirname(target)
-#     if parent: os.makedirs(parent, exist_ok=True)
-#     open(target, "wb").write(("\n".join(buf) + "\n").encode("utf-8"))   # LF, no CRLF translation
-#     print("wrote", target)
-# for ln in lines:
-#     if ln.startswith(MARK): flush(); path = ln[len(MARK):].strip(); buf = []
-#     elif ln.strip() == END: flush(); path = None
-#     elif path is not None:  buf.append(ln)
-# flush()
-# ---8<-------------------------------------------------------------------------
->>>>> FILE: R/connect.R
-# ============================================================================
-# connect.R — Domino -> Databricks connection + helpers (dplyr/dbplyr over ODBC)
-#
-# No Spark. We open a DBI/odbc connection to the Databricks SQL warehouse from the
-# Domino R environment and drive it with dplyr/dbplyr (dplyr verbs -> Databricks SQL).
-#
-# STATUS: scaffolded — NOT run here. Wire the connection for your Domino workspace and
-# validate the dbplyr translations on a slice before trusting any number (see R/README.md).
-# ============================================================================
+-- Databricks notebook source
+-- MAGIC %md
+-- MAGIC # Patient LOT journey drill-down (raw claims -> MAP -> assigned LOT)
+-- MAGIC
+-- MAGIC Reproduces the `LOT1_Base_exmpls.xlsx` view in SQL: for a set of example
+-- MAGIC patients, trace them through the three layers the pipeline builds.
+-- MAGIC
+-- MAGIC | Layer | Cell | Work table | What it shows |
+-- MAGIC |------|------|-----------|----------------|
+-- MAGIC | 0 (optional) | 5 | CDM `t_medical` / `t_rx` | The absolutely-raw claim rows (pre-dedup) |
+-- MAGIC | 1 RAW | 4 | `MMA_MED_PROCESSED` | Each mapped med claim (code -> MED_ABBR) that feeds MAP-building |
+-- MAGIC | 2 MAP | 3 | `MAP_STACKED` | How claims are grouped into coverage episodes (MAP start/end, +90d runout) |
+-- MAGIC | 3 LOT | 2 | `LOT_LONG` | How the grouped MAPs roll up into assigned lines (the color-coded table) |
+-- MAGIC
+-- MAGIC Cell 2 is the headline: it re-creates the color-coded sheet and adds a
+-- MAGIC transparent `ROW_ROLE` / `COLOR` derived from the engine's own `LOT_LONG`.
+-- MAGIC
+-- MAGIC **How to run:** set the widgets (Cell 0), run Cell 1 to pick example
+-- MAGIC patients, then run any layer. Each layer cell is independent once Cell 1
+-- MAGIC has run. Nothing is written; all cells are read-only SELECTs.
 
-suppressPackageStartupMessages({
-  library(DBI)
-  library(odbc)
-  library(dplyr)
-  library(dbplyr)
-  library(stringr)
-})
+-- COMMAND ----------
 
-# Deployed location -----------------------------------------------------------
-MC_CATALOG <- "hive_metastore"
-MC_SCHEMA  <- "clnprw_optum_mc_full_use"
-MC_CUT     <- "2025q4"                 # tables are t_<name>_<CUT>
-MIN_CELL   <- 11L                      # small-cell suppression
+-- MAGIC %md
+-- MAGIC ## Cell 0 - parameters
+-- MAGIC Fully-qualified schemas are pre-filled with the pipeline defaults
+-- MAGIC (`hive_metastore` catalog, Optum CDM `clnprw_optum`, work schema
+-- MAGIC `gsk_mm_lot_work`, quarter `2025q2` from STUDY_END 2025-06-30). Change
+-- MAGIC `work` if your Domino work schema is your username. Set `lot_table` to
+-- MAGIC `NDMM_LOT_LONG_FILT` for the NDMM cohort. Leave `patids` empty to
+-- MAGIC auto-select example patients, or paste a comma-separated list.
 
-# Open a connection — the established Domino/Databricks ODBC pattern:
-# a configured DSN (default "RWDE"), token supplied as `pwd` via env var, an explicit
-# timeout, and bigint = "numeric" so SQL COUNT/aggregate results don't come back as
-# integer64 (which breaks arithmetic/masking downstream). Never hard-code the token.
-mc_connect <- function(dsn     = Sys.getenv("DATABRICKS_DSN", "RWDE"),
-                       pwd     = Sys.getenv("DATABRICKS_PWD", ""),
-                       timeout = 120,
-                       bigint  = "numeric",
-                       ...) {
-  if (!nzchar(pwd)) stop("DATABRICKS_PWD is not set (Domino env var / project secret).")
-  DBI::dbConnect(odbc::odbc(), dsn = dsn, pwd = pwd, timeout = timeout, bigint = bigint, ...)
-}
+-- COMMAND ----------
 
-# Lazy handle to a deployed table: mc_tbl(con, "diagnosis") -> t_diagnosis_2025q4
-# rename_with(tolower): Databricks reports columns UPPERCASE and dbplyr's R-side name
-# check is case-sensitive, so we lowercase them here to match the lowercase field
-# references used throughout the pipeline (else every filter errors "object not found").
-mc_tbl <- function(con, name) {
-  dplyr::tbl(con, dbplyr::in_catalog(MC_CATALOG, MC_SCHEMA, paste0("t_", name, "_", MC_CUT))) |>
-    dplyr::rename_with(tolower)
-}
+CREATE WIDGET TEXT work      DEFAULT 'hive_metastore.gsk_mm_lot_work';
+CREATE WIDGET TEXT cdm       DEFAULT 'hive_metastore.clnprw_optum';
+CREATE WIDGET TEXT quarter   DEFAULT '2025q2';
+CREATE WIDGET TEXT lot_table DEFAULT 'LOT_LONG';       -- or NDMM_LOT_LONG_FILT
+CREATE WIDGET TEXT patids    DEFAULT '';               -- e.g. 'A0001,A0002' ; empty = auto-select
 
-# Small-cell masking for display (true 0 kept; 1..MIN_CELL-1 -> "<MIN_CELL"; NA -> "n/a")
-mc_mask <- function(n) {
-  dplyr::case_when(
-    is.na(n)                 ~ "n/a",
-    n > 0 & n < MIN_CELL     ~ paste0("<", MIN_CELL),
-    TRUE                     ~ as.character(as.integer(n))
-  )
-}
+-- COMMAND ----------
 
-# Count distinct ptid in a lazy tbl (materialise-free scalar pull)
-n_ptid <- function(tb) {
-  tb |> dplyr::summarise(n = dplyr::n_distinct(ptid)) |> dplyr::pull(n) |> as.integer()
-}
->>>>> FILE: R/rdq1_code_lists.R
-# ============================================================================
-# rdq1_code_lists.R — RDQ-1 (Colon EO / AZUR-2) value sets.
-# ============================================================================
+-- MAGIC %md
+-- MAGIC ## Cell 1 - choose example patients (`journey_patids`)
+-- MAGIC Uses the `patids` widget if set; otherwise auto-selects the patients with
+-- MAGIC the longest journeys (most lines / most meds) so the examples show real
+-- MAGIC line switches, like the workbook. Deterministic (ties broken by PATID).
 
-# 1) Colon dx: ENUMERATED C18 subcodes only (C18, C18.0,
-#    C18.2..C18.9). C18.1 (appendix) is NOT listed; C19/C20 (rectosigmoid/rectum)
-#    are out of scope. Use the RLIKE anchor (dotted or undotted) that EXCLUDES C18.1.
-#    Do NOT weaken to "^C18" (that would silently re-add C18.1).
-RDQ1_COLON_ICD_REGEX <- "^C18($|[.]?[02-9])"
+-- COMMAND ----------
 
-# ── STUDY PERIOD — documented 01-Jan-2020 → 31-Dec-2025 ─────────────────────
-# Applied to the SELECTED surgery/index date (togglable; set either to NULL to disable).
-# ⚠️ Whether the period ALSO restricts lookback / other criteria — vs. anchoring only the
-# surgery/index date and allowing pre-2020 baseline/history — is an OPEN requestor decision.
-# This default anchors the INDEX date only, leaving pre-2020 lookback (dx washout / prior IO)
-# usable — the non-truncating reading. Confirm the agreed lookback rule before trusting counts.
-RDQ1_STUDY_START <- "2020-01-01"
-RDQ1_STUDY_END   <- "2025-12-31"
-
-# 2) Surgery — the surgery code list.
-#   * OPERATIVE (colectomy/resection): CPT rows + the ICD-10-PCS 0DT* resection
-#     codes (prefix). This is the surgery-only (sensitivity) definition.
-RDQ1_SURG_CPT <- c(
-  "44139","44140","44141","44143","44144","44145","44146","44147","44150","44151",
-  "44155","44156","44157","44158","44160","45399",
-  "44204","44205","44206","44207","44208","44210","44211","44212","44213","44238"
+CREATE OR REPLACE TEMP VIEW journey_patids AS
+WITH manual AS (
+  SELECT trim(p) AS PATID
+  FROM (SELECT explode(split('${patids}', ',')) AS p) s
+  WHERE trim(p) <> ''
+),
+ranked AS (
+  SELECT
+    cast(ll.PATID as string) AS PATID,
+    count(*)                 AS n_lots,
+    sum(ll.LOT_MED_CNT)      AS n_base_meds,
+    max(ll.LOT_NUM)          AS max_lot
+  FROM ${work}.${lot_table} ll
+  GROUP BY cast(ll.PATID as string)
+  HAVING count(*) >= 2                       -- at least one line switch to be illustrative
+),
+auto AS (
+  SELECT PATID
+  FROM ranked
+  ORDER BY n_lots DESC, n_base_meds DESC, PATID
+  LIMIT 8
 )
-RDQ1_SURG_PCS_REGEX <- "^0DT[E-Q]"   # colon resection segments (asc/trans/desc/sigmoid)
+SELECT PATID FROM manual
+UNION
+SELECT PATID FROM auto
+WHERE NOT EXISTS (SELECT 1 FROM manual);       -- auto only when no manual list given
 
-#   * NON-OPERATIVE HCPCS in the surgery code list's HCPCS block — by their
-#     descriptions these are screening colonoscopy, disease-status/demonstration,
-#     device/endoscopic-repair, and history/registry codes. NOT operative events.
-#     Included only in the RDQ "as-requested" run (include_nonop_hcpcs=TRUE); excluded
-#     for the surgery-only sensitivity. Do NOT silently drop.
-RDQ1_SURG_HCPCS_NONOP <- c(
-  "C1749","C9779","C9796","C9901",                                  # device / endoscopic
-  "G0105","G0120","G0121",                                          # screening colonoscopy
-  "G2204","G9084","G9085","G9086","G9087","G9088","G9089",          # disease-status (demo)
-  "G9659","G9660","G9661","G9862","G9998","G9999","S0285",          # status / consult
-  "G9711","M1295"                                                   # history of colectomy / CRC
+-- COMMAND ----------
+
+SELECT * FROM journey_patids ORDER BY PATID;   -- inspect the chosen patients
+
+-- COMMAND ----------
+
+-- MAGIC %md
+-- MAGIC ## Cell 2 - LAYER 3: how LOT is assigned  (reproduces the color-coded sheet)
+-- MAGIC One row per MAP episode, attached to the line in effect at the MAP start,
+-- MAGIC classified against the engine's own `LOT_LONG`. Steroids are excluded here
+-- MAGIC because the LOT engine ignores them (they never sit in a base regimen);
+-- MAGIC remove the `<> 'STEROID'` filter to see them.
+-- MAGIC
+-- MAGIC **LOT Base Logic key (from the workbook):**
+-- MAGIC - GREEN  = LOT start / continuation of therapy (med is in the line's base regimen)
+-- MAGIC - ORANGE = new drug, different class OR the same med > 90 days later (starts / ends a line)
+-- MAGIC - Exception: LENA -> POMA (same class) ends the LOT
+-- MAGIC
+-- MAGIC `ROW_ROLE` / `COLOR` are derived transparently from `LOT_LONG` (not a
+-- MAGIC re-implementation of the engine). `LOT_BASE_END_REASON` is the engine's
+-- MAGIC OWN reason the active line ended - the authoritative "why".
+
+-- COMMAND ----------
+
+WITH pats AS (SELECT PATID FROM journey_patids),
+lots AS (
+  SELECT
+    cast(PATID as string)               AS PATID,
+    LOT_NUM,
+    cast(LOT_START_DT   as date)        AS LOT_START_DT,
+    cast(LOT_BASE_END_DT as date)       AS LOT_BASE_END_DT,
+    upper(LOT_BASE_MEDS)                AS LOT_BASE_MEDS,
+    LOT_MED_CNT,
+    LOT_START_TYPE,
+    LOT_BASE_END_REASON,
+    LOT_BASE_1ST_ADD_MED,
+    cast(LOT_BASE_1ST_ADD_MED_DT as date) AS LOT_BASE_1ST_ADD_MED_DT
+  FROM ${work}.${lot_table}
+  WHERE cast(PATID as string) IN (SELECT PATID FROM pats)
+),
+-- patient med -> class lookup (from the MAP layer), used to test "different class"
+pmc AS (
+  SELECT DISTINCT cast(PATID as string) AS PATID,
+         upper(MAP_MED_TYPE)  AS MED,
+         upper(MAP_MED_CLASS) AS CLS
+  FROM ${work}.MAP_STACKED
+  WHERE cast(PATID as string) IN (SELECT PATID FROM pats)
+),
+-- the set of drug classes represented in each line's base regimen
+base_classes AS (
+  SELECT l.PATID, l.LOT_NUM, collect_set(pmc.CLS) AS BASE_CLASSES
+  FROM lots l
+  JOIN pmc
+    ON pmc.PATID = l.PATID
+   AND array_contains(split(l.LOT_BASE_MEDS, ' '), pmc.MED)
+  GROUP BY l.PATID, l.LOT_NUM
+),
+maps AS (
+  SELECT
+    cast(PATID as string)          AS PATID,
+    MAP_CNT,
+    upper(MAP_MED_TYPE)            AS MED,
+    upper(MAP_MED_CLASS)           AS MED_CLASS,
+    cast(MAP_START_DT as date)     AS MAP_START_DT,
+    cast(MAP_END_DT   as date)     AS MAP_END_DT,
+    date_add(cast(MAP_END_DT as date), 90) AS MAP_END_PLUS_90,
+    -- gap (days) from the previous episode of the SAME med -> the ">90 days" rule
+    datediff(
+      cast(MAP_START_DT as date),
+      lag(cast(MAP_END_DT as date)) OVER (
+        PARTITION BY cast(PATID as string), upper(MAP_MED_TYPE)
+        ORDER BY cast(MAP_START_DT as date)
+      )
+    ) AS GAP_DAYS_PREV_SAME_MED
+  FROM ${work}.MAP_STACKED
+  WHERE cast(PATID as string) IN (SELECT PATID FROM pats)
+    AND upper(MAP_MED_CLASS) <> 'STEROID'      -- engine ignores steroids; remove to include
+),
+-- attach the line in effect at the MAP start = latest line started on/before it
+map_lot AS (
+  SELECT m.*, l.LOT_NUM AS ACTIVE_LOT, l.LOT_BASE_MEDS AS ACTIVE_BASE,
+         l.LOT_BASE_END_REASON, l.LOT_START_TYPE,
+         l.LOT_BASE_1ST_ADD_MED, l.LOT_BASE_1ST_ADD_MED_DT
+  FROM maps m
+  JOIN lots l
+    ON l.PATID = m.PATID
+   AND l.LOT_START_DT <= m.MAP_START_DT
+  QUALIFY row_number() OVER (
+    PARTITION BY m.PATID, m.MED, m.MAP_START_DT, m.MAP_CNT
+    ORDER BY l.LOT_START_DT DESC
+  ) = 1
+),
+-- does this MAP start fall exactly on a line's start date?
+starts AS (
+  SELECT DISTINCT PATID, LOT_START_DT, LOT_NUM FROM lots
+),
+enriched AS (
+  SELECT
+    ml.PATID,
+    ml.ACTIVE_LOT,
+    ml.ACTIVE_BASE                                                   AS LOT_BASE_MEDS,
+    ml.LOT_BASE_1ST_ADD_MED                                          AS EARLIEST_ADDED_MED,
+    ml.LOT_BASE_1ST_ADD_MED_DT                                       AS EARLIEST_ADDED_MED_DT,
+    ml.MED                                                           AS MEDICATION,
+    ml.MED_CLASS                                                     AS MEDICATION_CLASS,
+    ml.MAP_START_DT,
+    ml.MAP_END_DT,
+    ml.MAP_END_PLUS_90,
+    ml.GAP_DAYS_PREV_SAME_MED,
+    ml.LOT_BASE_END_REASON,
+    ml.LOT_START_TYPE,
+    array_contains(split(ml.ACTIVE_BASE, ' '), ml.MED)              AS IS_IN_BASE,
+    st.LOT_NUM                                                       AS STARTS_LOT_NUM,
+    coalesce(array_contains(bc.BASE_CLASSES, ml.MED_CLASS), false)  AS SAME_CLASS_AS_BASE,
+    (ml.MED = 'POMA' AND array_contains(split(ml.ACTIVE_BASE, ' '), 'LENA')) AS LEN_POM_SWITCH
+  FROM map_lot ml
+  LEFT JOIN starts st
+    ON st.PATID = ml.PATID AND st.LOT_START_DT = ml.MAP_START_DT
+  LEFT JOIN base_classes bc
+    ON bc.PATID = ml.PATID AND bc.LOT_NUM = ml.ACTIVE_LOT
 )
+SELECT
+  PATID,
+  ACTIVE_LOT,
+  LOT_BASE_MEDS,
+  EARLIEST_ADDED_MED,
+  EARLIEST_ADDED_MED_DT,
+  MEDICATION,
+  MEDICATION_CLASS,
+  MAP_START_DT,
+  MAP_END_DT,
+  MAP_END_PLUS_90,
+  -- transparent classification (mirrors the workbook Key) -----------------
+  CASE
+    WHEN IS_IN_BASE AND STARTS_LOT_NUM IS NOT NULL THEN concat('LOT', STARTS_LOT_NUM, ' START')
+    WHEN IS_IN_BASE                                THEN 'CONTINUATION'
+    ELSE                                                'NEW DRUG (outside base)'
+  END AS ROW_ROLE,
+  CASE WHEN IS_IN_BASE THEN 'GREEN' ELSE 'ORANGE' END AS COLOR,
+  CASE
+    WHEN IS_IN_BASE                       THEN NULL
+    WHEN LEN_POM_SWITCH                   THEN 'Len -> Pom (same class) - ends the LOT (exception)'
+    WHEN NOT SAME_CLASS_AS_BASE           THEN 'New drug, different class'
+    WHEN GAP_DAYS_PREV_SAME_MED >= 90     THEN 'Same class but > 90-day gap'
+    ELSE                                       'Not part of the base regimen'
+  END AS NEW_DRUG_REASON,
+  -- supporting facts (what the analyst colored by) ------------------------
+  IS_IN_BASE,
+  SAME_CLASS_AS_BASE,
+  LEN_POM_SWITCH,
+  GAP_DAYS_PREV_SAME_MED,
+  LOT_BASE_END_REASON,      -- engine's OWN reason the active line ended
+  LOT_START_TYPE
+FROM enriched
+ORDER BY PATID, MAP_START_DT, MEDICATION;
 
-# 3) IO — the IO agent list: all 11 checkpoint agents (generic name match). NDC/J-code
-#    reference kept for the NDC/HCPCS match arm (needs an ndc/hcpcs field on the med
-#    source — TODO). ipilimumab is CTLA-4; RDQ lists it -> included.
-RDQ1_IO <- c(
-  "ATEZOLIZUMAB","AVELUMAB","CEMIPLIMAB","DURVALUMAB","NIVOLUMAB","PEMBROLIZUMAB",
-  "IPILIMUMAB","DOSTARLIMAB","TORIPALIMAB","TISLELIZUMAB","COSIBELIMAB"
+-- COMMAND ----------
+
+-- MAGIC %md
+-- MAGIC ## Cell 3 - LAYER 2: how MAPs are created and grouped  (`MAP_STACKED`)
+-- MAGIC One row per coverage episode: consecutive claims of the same drug are
+-- MAGIC merged into a MAP that runs from the first claim (`MAP_START_DT`) to the
+-- MAGIC last day of coverage (`MAP_END_DT`); a new episode opens when a claim
+-- MAGIC lands beyond both runout dates. `MAP_END_DT + 90` is the discontinuation
+-- MAGIC horizon (`MAP_DISCON_FLG = 1` when the next same-drug MAP or the
+-- MAGIC observation end is >= 90 days out). Steroids kept here (flagged) so you
+-- MAGIC can see them; they are dropped from the LOT layer.
+
+-- COMMAND ----------
+
+SELECT
+  cast(PATID as string)              AS PATID,
+  MAP_MED_TYPE                       AS MEDICATION,
+  MAP_MED_CLASS                      AS MEDICATION_CLASS,
+  MAP_CNT                            AS EPISODE_NUM,
+  cast(MAP_START_DT as date)         AS MAP_START_DT,
+  cast(MAP_END_DT   as date)         AS MAP_END_DT,
+  date_add(cast(MAP_END_DT as date), 90) AS MAP_END_PLUS_90,
+  cast(MAP_RX_RUNOUT_DT  as date)    AS MAP_RX_RUNOUT_DT,
+  cast(MAP_MED_RUNOUT_DT as date)    AS MAP_MED_RUNOUT_DT,
+  datediff(cast(MAP_END_DT as date), cast(MAP_START_DT as date)) + 1 AS MAP_LEN_DAYS,
+  MAP_DISCON_FLG,
+  CASE WHEN upper(MAP_MED_CLASS) = 'STEROID' THEN 'yes' ELSE 'no' END AS IS_STEROID
+FROM ${work}.MAP_STACKED
+WHERE cast(PATID as string) IN (SELECT PATID FROM journey_patids)
+ORDER BY PATID, MAP_START_DT, MEDICATION, EPISODE_NUM;
+
+-- COMMAND ----------
+
+-- MAGIC %md
+-- MAGIC ## Cell 4 - LAYER 1: mapped raw claims  (`MMA_MED_PROCESSED`)
+-- MAGIC The per-claim medication layer that FEEDS the MAP algorithm: each row is a
+-- MAGIC claim (one code, one date, one claim type) already mapped to a MM med via
+-- MAGIC the codelist, deduped to one row per (patient, med, date, claim type).
+-- MAGIC This is the "even more raw than the workbook" layer - sort by date to see
+-- MAGIC exactly what claims grouped into each MAP above.
+
+-- COMMAND ----------
+
+SELECT
+  cast(PATID as string)  AS PATID,
+  DATE_SERVICE,
+  CLAIM_TYPE,            -- pharmacy (rx NDC) or medical (HCPCS / bill-proc / med NDC)
+  MED_ABBR              AS MEDICATION,
+  MED_CLASS             AS MEDICATION_CLASS,
+  CODE,
+  CODE_TYPE,            -- NDC or HCPCS
+  DAY_SUPPLY,
+  date_add(cast(DATE_SERVICE as date), cast(DAY_SUPPLY as int) - 1) AS COVERAGE_THROUGH
+FROM ${work}.MMA_MED_PROCESSED
+WHERE cast(PATID as string) IN (SELECT PATID FROM journey_patids)
+ORDER BY PATID, DATE_SERVICE, MEDICATION, CLAIM_TYPE;
+
+-- COMMAND ----------
+
+-- MAGIC %md
+-- MAGIC ## Cell 5 (optional) - LAYER 0: the absolutely-raw CDM claims (pre-dedup)
+-- MAGIC The individual `medical` / `rx` rows before de-duplication, for the target
+-- MAGIC patients, restricted to the codes the pipeline already identified for them
+-- MAGIC (from `MMA_MED_PROCESSED`) and to each patient's observation window. Shows
+-- MAGIC same-day / duplicate raw claims that collapse into one row in Layer 1.
+-- MAGIC Uses the quarterly CDM tables (`t_<table>_${quarter}`).
+
+-- COMMAND ----------
+
+WITH pats AS (SELECT PATID FROM journey_patids),
+win AS (   -- observation window per patient (bounds the raw pull like the pipeline)
+  SELECT cast(PATID as string) AS PATID,
+         cast(INDEX_DATE as date) AS INDEX_DATE,
+         cast(OBS_END_DT as date) AS OBS_END_DT
+  FROM ${work}.ELIG_COH_FINAL
+  WHERE cast(PATID as string) IN (SELECT PATID FROM pats)
+),
+codes AS (   -- codes the pipeline mapped for these patients (NDC padded to 11)
+  SELECT DISTINCT
+    cast(PATID as string) AS PATID,
+    CODE_TYPE,
+    CASE WHEN CODE_TYPE = 'NDC'
+         THEN lpad(regexp_replace(CODE, '[^0-9]', ''), 11, '0')
+         ELSE upper(regexp_replace(CODE, '[^A-Za-z0-9]', '')) END AS CODE_N,
+    MED_ABBR, MED_CLASS
+  FROM ${work}.MMA_MED_PROCESSED
+  WHERE cast(PATID as string) IN (SELECT PATID FROM pats)
+),
+-- one row per (claim, code-field), mirroring the pipeline's three medical
+-- sources (PROC_CD / BILL_PROC_CD as HCPCS, NDC as NDC) so each code can match
+med_raw AS (
+  SELECT cast(m.PATID as string) AS PATID, cast(m.FST_DT as date) AS CLAIM_DT,
+         'medical' AS CLAIM_TYPE, cast(m.PROC_CD as string) AS RAW_CODE_RAW,
+         upper(regexp_replace(cast(m.PROC_CD as string), '[^A-Za-z0-9]', '')) AS CODE_N,
+         'HCPCS' AS CODE_TYPE
+  FROM ${cdm}.t_medical_${quarter} m
+  WHERE cast(m.PATID as string) IN (SELECT PATID FROM pats)
+    AND m.PROC_CD IS NOT NULL AND trim(cast(m.PROC_CD as string)) <> ''
+  UNION ALL
+  SELECT cast(m.PATID as string), cast(m.FST_DT as date),
+         'medical', cast(m.BILL_PROC_CD as string),
+         upper(regexp_replace(cast(m.BILL_PROC_CD as string), '[^A-Za-z0-9]', '')),
+         'HCPCS'
+  FROM ${cdm}.t_medical_${quarter} m
+  WHERE cast(m.PATID as string) IN (SELECT PATID FROM pats)
+    AND m.BILL_PROC_CD IS NOT NULL AND trim(cast(m.BILL_PROC_CD as string)) <> ''
+  UNION ALL
+  SELECT cast(m.PATID as string), cast(m.FST_DT as date),
+         'medical', cast(m.NDC as string),
+         lpad(regexp_replace(cast(m.NDC as string), '[^0-9]', ''), 11, '0'),
+         'NDC'
+  FROM ${cdm}.t_medical_${quarter} m
+  WHERE cast(m.PATID as string) IN (SELECT PATID FROM pats)
+    AND m.NDC IS NOT NULL AND trim(cast(m.NDC as string)) <> ''
+),
+rx_raw AS (
+  SELECT cast(r.PATID as string) AS PATID, cast(r.FILL_DT as date) AS CLAIM_DT,
+         'pharmacy' AS CLAIM_TYPE,
+         cast(r.NDC as string) AS RAW_CODE_RAW,
+         lpad(regexp_replace(coalesce(cast(r.NDC as string), ''), '[^0-9]', ''), 11, '0') AS CODE_N,
+         'NDC' AS CODE_TYPE,
+         cast(r.DAYS_SUP as int) AS DAYS_SUP
+  FROM ${cdm}.t_rx_${quarter} r
+  WHERE cast(r.PATID as string) IN (SELECT PATID FROM pats)
 )
-# generic -> primary HCPCS J-code(s) (reference; nivolumab also billed J9289)
-RDQ1_IO_JCODES <- list(
-  ATEZOLIZUMAB = "J9022", AVELUMAB = "J9023", CEMIPLIMAB = "J9119", DURVALUMAB = "J9173",
-  NIVOLUMAB = c("J9299","J9289"), PEMBROLIZUMAB = "J9271", IPILIMUMAB = "J9228",
-  DOSTARLIMAB = "J9272", TORIPALIMAB = "J3263", TISLELIZUMAB = "J9329", COSIBELIMAB = "J9275"
-)
-# generic -> RDQ appendix (Table 3) NDCs, digit-only. TORIPALIMAB/TISLELIZUMAB/COSIBELIMAB are listed 5-3-2
-# (10-digit) in the RDQ; both the 10-digit and zero-padded 11-digit forms are kept (claims NDC match strips
-# non-digits, so both forms are covered). Consumed by rdq1_full.R's claims IO arm (IO_NDC).
-RDQ1_IO_NDC <- list(
-  ATEZOLIZUMAB = c("50242091701","50242091801"), AVELUMAB = "44087353501", CEMIPLIMAB = "61755000801",
-  DURVALUMAB = c("00310450012","00310461150"),
-  NIVOLUMAB = c("00003373413","00003375614","00003377211","00003377412"),
-  PEMBROLIZUMAB = c("00006302601","00006302602","00006302604"), IPILIMUMAB = c("00003232711","00003232822"),
-  DOSTARLIMAB = "00173089803",
-  # 5-3-2 agents: 10-digit + both 11-digit paddings (standard product-pad + sql/code_lists.sql's form)
-  TORIPALIMAB = c("7011434001","70114034001","70114340001"),
-  TISLELIZUMAB = c("7257912101","72579012101","72579121001"),
-  COSIBELIMAB = c("7009513001","70095013001","70095130001")
-)
-
-# 4) Metastatic exclusion — RDQ-1 criterion 4 lists C77.x, C78.x, C79.x. include_c77=TRUE
-#    is the RDQ default (assumption; can drop N+ regional patients — flagged).
-#    Toggle to FALSE for the clinically-cautious distant-only (C78-C79) run.
-rdq1_mets_regex <- function(include_c77 = TRUE) if (isTRUE(include_c77)) "^C7[789]" else "^C7[89]"
-
-# Confirmed-exposure onc_medications.ACTION values. Documented values:
-# administered/filled/is_on/prescribed/started/stopped/suspended — NOTE 'is_on' has an UNDERSCORE.
-# ⚠️ which actions count as "use" (exposure vs intent) is OUR inference — NOT documented.
-RDQ1_IO_ACTIONS <- c("administered","filled","started","is_on")
-
-# EO neoplasm_type for the colon concept (Step 3/4 keying). RDQ-1 is colon proper (C18),
-# so restrict to COLON. If the instance codes some colon tumours generically as
-# 'colorectal', confirm with the analyst before widening.
-RDQ1_COLON_NEO <- c("COLON")
->>>>> FILE: R/rdq1_colon_attrition.R
-# ============================================================================
-# rdq1_colon_attrition.R — RDQ-1 colon-cancer EO cohort, 6-step attrition, in R
-# (dplyr/dbplyr over an ODBC connection from Domino to Databricks; NO Spark).
-#
-# ⚠️ STATUS: SCAFFOLDED — NOT run here. Every number is pending a Domino run. dbplyr
-#    translates these verbs to Databricks SQL; VALIDATE the translation on a slice
-#    (str_trim->TRIM, to_date/datediff/regexp_* passthrough, the sql() fragments) with
-#    R/smoke_test.R before trusting output. Regex matching does NOT use str_detect() — it
-#    emits native RLIKE via rl(), so it doesn't depend on dbplyr backend recognition. See R/README.md.
-#
-# BAKED-IN ASSUMPTIONS (flagged; togglable):
-#   * index_date = surgery_date (form blank).
-#   * include_c77 = TRUE  (RDQ criterion 4; can drop N+ regional patients).
-#   * include_nonop_hcpcs = TRUE (RDQ "as-requested"; FALSE = surgery-only).
-#   * >=2-confirmed-dx entry + peri-op staging window [first_dx-30, surgery+90] kept.
-# ============================================================================
-
-# Robust sourcing of the helper files (works for Rscript, source(), interactive) ----
-.rdq1_dir <- (function() {
-  a <- commandArgs(FALSE); m <- grepl("^--file=", a)
-  if (any(m)) return(dirname(normalizePath(sub("^--file=", "", a[m][1]))))
-  for (i in seq_len(sys.nframe())) { of <- sys.frame(i)$ofile; if (!is.null(of)) return(dirname(normalizePath(of))) }
-  if (dir.exists("R")) return(normalizePath("R"))
-  getwd()
-})()
-source(file.path(.rdq1_dir, "connect.R"))
-source(file.path(.rdq1_dir, "rdq1_code_lists.R"))
-
-# Databricks-native regex match. dbplyr only maps str_detect()->RLIKE when it recognises the connection as a
-# Spark/Databricks backend; on an unrecognised ODBC/DSN connection it errors "Only fixed patterns are supported
-# on database backends". rl() emits RLIKE directly so regex filters work regardless. col_sql is a raw SQL expr.
-rl <- function(col_sql, pattern) dplyr::sql(paste0("(", col_sql, ") RLIKE '", pattern, "'"))
-
-# ── source layers (Table 1a) ────────────────────────────────────────────────
-# Only cohort 1 (structured EHR + EO) is sourced in R. Cohort 2 (+Optum claims), 3 (third-party) and
-# 4 (Market Clarity IHD) need claims/IHD source unions that are NOT wired here (this helper ignores
-# `cohort`), so rdq1_attrition_column returns n/a for them — do NOT emit cohort-1 EHR data under a 2/4
-# label.
-rdq1_sources <- function(con, cohort, use_onc) {
-  list(
-    dx   = mc_tbl(con, "diagnosis"),                 # TODO cohort 2: union_all(clm_med_diagnosis)
-    proc = mc_tbl(con, "procedure"),                 # TODO cohort 2: union_all(clm_med_procedure)
-    med  = rdq1_src_med(con)                          # EHR-source meds only (Table 1a) — see below
-  )
-}
-
-# Step-6 med source (Table 1a = coded meds). CONFIRMED deployed column: `data_source` (values
-# proc/provider_notes/rx_adm/rx_presc). EHR arm = proc/rx_presc/rx_adm; the NLP 'provider_notes' arm
-# belongs to Table 1b and is excluded. ⚠️ still to confirm: (1) the exact stored VALUES of data_source
-# (SELECT DISTINCT); (2) cohort-2a claims meds (Clm_rx/Clm_med_serv) are a TODO (R cohort 2 = n/a).
-RDQ1_MED_SRC_EHR <- c("proc", "rx_presc", "rx_adm")
-rdq1_src_med <- function(con) {
-  mc_tbl(con, "onc_medications") |>
-    filter(str_trim(tolower(data_source)) %in% RDQ1_MED_SRC_EHR)   # deployed col: data_source (not source)
-}
-
-# ── cohort entry: >=2 confirmed colon (C18) dx dates; first_dx = earliest ───
-rdq1_cohort_dx <- function(src) {
-  src$dx |>
-    filter(str_trim(tolower(diagnosis_status)) == "diagnosis of",              # value-casing robust (matches rdq1_full.R)
-           rl("upper(diagnosis_cd_type)", "^ICD"),                             # ICD-9/10 only (lib parity)
-           rl("upper(diagnosis_cd)", RDQ1_COLON_ICD_REGEX)) |>          # RLIKE (backend-robust); upper() case-safe
-    mutate(dxd = to_date(diag_date)) |>
-    group_by(ptid) |>
-    summarise(first_dx = min(dxd, na.rm = TRUE),
-              n_dx     = n_distinct(dxd), .groups = "drop") |>
-    filter(n_dx >= 2) |>
-    select(ptid, first_dx)
-}
-
-# ── STEP 1: colon-cancer surgery (the surgery code list) ────────────────────
-# Match on the NORMALIZED proc_cd VALUE (upper + strip non-alnum) against the authoritative surgery
-# code list. The patient-side proc_cd_type is NOT required — its value spellings are UNCONFIRMED
-# ('CPT'/'HCPCS'/'ICD10PCS' vs 'CPT4'/'ICD-10-PCS'/NULL) — so requiring a specific one could silently
-# drop rows. ⚠️ FLAGS: (1) the `procedure` table is documented
-# as CPT/HCPCS; ICD-10-PCS may not be captured there, so the `0DT*` PCS arm may match
-# nothing (confirm). (2) proc_cd_type is available for a STRICTER match once its spelling is confirmed.
-rdq1_step1_surgery <- function(src, fdx, include_nonop_hcpcs = TRUE,
-                               study_start = RDQ1_STUDY_START, study_end = RDQ1_STUDY_END) {
-  surg_codes <- if (isTRUE(include_nonop_hcpcs)) c(RDQ1_SURG_CPT, RDQ1_SURG_HCPCS_NONOP) else RDQ1_SURG_CPT
-  out <- src$proc |>
-    mutate(px  = regexp_replace(upper(proc_code), "[^0-9A-Z]", ""),   # deployed col: proc_code (not proc_cd)
-           pdt = to_date(proc_date)) |>
-    filter(px %in% surg_codes | rl("px", RDQ1_SURG_PCS_REGEX)) |>
-    semi_join(fdx, by = "ptid") |>
-    transmute(ptid, surgery_date = pdt) |>
-    distinct()
-  # STUDY-PERIOD anchor on the surgery/index date (documented window; togglable via study_start/end;
-  # NULL disables). Pre-2020 lookback stays usable — only the selected index date is constrained.
-  if (!is.null(study_start)) out <- out |> filter(surgery_date >= to_date(study_start))
-  if (!is.null(study_end))   out <- out |> filter(surgery_date <= to_date(study_end))
-  out
-}
-
-# ── STEP 2: earliest surgery whose [-183d, 0] window contains first_dx ───────
-# first_dx is the GLOBAL-min confirmed colon dx, so "first_dx within [sdt-183, sdt]" already
-# enforces the pre-window washout (no earlier colon dx).
-rdq1_step2_newdx <- function(surg, fdx) {
-  surg |>
-    inner_join(fdx, by = "ptid") |>
-    filter(datediff(surgery_date, first_dx) >= 0,
-           datediff(surgery_date, first_dx) <= 183) |>
-    group_by(ptid, first_dx) |>
-    summarise(surgery_date = min(surgery_date), .groups = "drop")
-}
-
-# ── STEP 3: stage T1-4 N1-2 or T4N0 (EO TNM; N-missing -> positive nodes) ────
-# EO-only -> populates for use_onc cohorts. Peri-op window [first_dx-30, surgery+90].
-rdq1_step3_stage <- function(con, base) {
-  # colon concept keys. Stage-window anchor = the NEOPLASM-histology diagnosis date. "Stage at
-  # diagnosis" links via onc_neoplasm_histology `neoplasm_dx_date`, and if that is missing the
-  # neoplasm `note_date` near structured first-dx — so the anchor is coalesce(neoplasm_dx_date,
-  # note_date), NOT the onc_tnm row's own note_date.
-  keys <- mc_tbl(con, "onc_neoplasm_histology") |>
-    semi_join(base, by = "ptid") |>
-    filter(str_trim(tolower(neoplasm_qualifier)) == "actual",
-           upper(str_trim(neoplasm_type)) %in% RDQ1_COLON_NEO) |>
-    transmute(ptid, neoplasm_histology_key,
-              neo_anchor_date = coalesce(to_date(neoplasm_dx_date), to_date(note_date))) |>
-    inner_join(base, by = "ptid")                      # brings surgery_date, first_dx
-
-  # positive-node fallback (stand-alone onc_lymph_node), peri-op window.
-  # ⚠️ DATA-DICT: lymph_numeric is "# positive/NEGATIVE nodes OR nodes biopsied" — ambiguous
-  # ALONE; lymph_narrative (documented value 'positive lymph node') disambiguates. So require a positive
-  # narrative AND count > 0.
-  posnodes <- mc_tbl(con, "onc_lymph_node") |>
-    inner_join(base, by = "ptid") |>
-    mutate(nd = to_date(note_date)) |>
-    filter(str_trim(tolower(lymph_narrative)) == "positive lymph node",
-           lymph_numeric > 0,
-           datediff(nd, first_dx) >= -30,
-           datediff(nd, surgery_date) <= 90) |>
-    distinct(ptid) |>
-    mutate(has_posnode = 1L)
-
-  # select only the TNM columns we need (avoids onc_tnm.ptid / .note_date colliding with keys)
-  # CONFIRMED deployed columns: onc_tnm has `t`, `n` (grade) and the FK `neoplasm_histology_key`
-  # (also t_prefix/t_suffix, n_prefix/n_suffix, m/m_prefix/m_suffix, stage_prefix). Verified via DESCRIBE.
-  mc_tbl(con, "onc_tnm") |>
-    select(neoplasm_histology_key, t, n) |>
-    inner_join(keys, by = "neoplasm_histology_key") |>
-    mutate(tnum = sql("try_cast(regexp_extract(t,'[1-4]',0) as int)"),
-           nnum = sql("try_cast(regexp_extract(n,'[0-9]',0) as int)"),
-           nraw = sql("regexp_extract(n,'[0-9]',0)")) |>
-    left_join(posnodes, by = "ptid") |>
-    mutate(has_posnode = coalesce(has_posnode, 0L)) |>
-    filter(tnum >= 1, tnum <= 4,
-           (nnum > 0) |
-             (tnum == 4 & nnum == 0) |
-             ((nraw == "" | is.na(nnum)) & has_posnode == 1L),
-           datediff(neo_anchor_date, first_dx) >= -30,       # stage window on coalesce(neoplasm_dx_date,note_date)
-           datediff(neo_anchor_date, surgery_date) <= 90) |>
-    distinct(ptid, surgery_date, first_dx)
-}
-
-# ── STEP 4: no metastatic dx prior to surgery (RDQ-1: C77+C78+C79) ───────────
-# Table 1a step 4 is tagged [from EHR] -> EHR-coded ICD ONLY (criterion 4 = C77/C78/C79 when
-# include_c77). The EO onc_metastatic_location overlay is a Table 1b / curated-sensitivity signal,
-# NOT part of the [from EHR] step — deliberately EXCLUDED here.
-rdq1_step4_nomets <- function(con, src, step3, include_c77 = TRUE) {
-  mets <- src$dx |>
-    filter(str_trim(tolower(diagnosis_status)) == "diagnosis of",              # value-casing robust (matches rdq1_full.R)
-           rl("upper(diagnosis_cd_type)", "^ICD"),
-           rl("upper(diagnosis_cd)", rdq1_mets_regex(include_c77))) |>
-    mutate(mdt = to_date(diag_date)) |>
-    group_by(ptid) |> summarise(mdt = min(mdt), .groups = "drop")
-  out <- step3 |> left_join(mets, by = "ptid") |>
-    filter(is.na(mdt) | datediff(mdt, surgery_date) >= 0)   # keep if no mets before surgery
-  list(step4 = out |> select(ptid, surgery_date, first_dx), mets = mets)
-}
-
-# ── STEP 5: dMMR+ or MSI-H ───────────────────────────────────────────────────
-# Single-primary restriction for the STAND-ALONE biomarker table (onc_biomarker has no
-# neoplasm_histology_key; links by PTID + note_date). Excludes patients with an 'actual'
-# neoplasm OUTSIDE the colon set. ⚠️ This is a SOUND INFERENCE (attribute a
-# biomarker only when no other primary/stand-alone marker is present) — NOT an explicit rule.
-rdq1_multiprimary <- function(con, cohort_tbl) {
-  mc_tbl(con, "onc_neoplasm_histology") |>
-    semi_join(cohort_tbl, by = "ptid") |>
-    filter(str_trim(tolower(neoplasm_qualifier)) == "actual",
-           !(upper(str_trim(neoplasm_type)) %in% RDQ1_COLON_NEO)) |>
-    distinct(ptid)
-}
-
-rdq1_step5_dmmr <- function(con, step4) {
-  # DOCUMENTED dMMR/MSI-H rule: "a MUTATION in any of MLH1, MSH2, MSH6, PMS2 -> dMMR/MSI-H".
-  # So the 4 HGNC genes ONLY — generic 'MMR' is NOT a stored biomarker value (removed).
-  # ⚠️ The RESULT-value strings below are OUR interpretation, NOT documented: narrative_result values live
-  # in the ONC_NARRATIVE_RESULT_LU lookup (not enumerated here), so 'high|unstable|positiv' (MSI-H) and
-  # 'loss|absent|deficien' + gene_characteristics 'mutat|loss|deletion' (mutation) are BEST-EFFORT proxies
-  # for the "a mutation" rule — CONFIRM against ONC_NARRATIVE_RESULT_LU on the instance. (An MSI biomarker
-  # row is likewise not enumerated.) biomarker/gene_characteristics/temporal_status ARE documented.
-  mp <- rdq1_multiprimary(con, step4)                              # single-primary restriction (inferred)
-  dmmr <- mc_tbl(con, "onc_biomarker") |>
-    semi_join(step4, by = "ptid") |>
-    anti_join(mp, by = "ptid") |>
-    # exclude PLANNED (not-yet-performed) tests. Documented status historical/contemporary/planned; stored
-    # code likely 'plan' (Character(7)) — exclude both spellings.
-    filter(!(str_trim(lower(coalesce(biomarker_temporal_status, ""))) %in% c("plan","planned"))) |>
-    filter(sql(paste0(                                                   # documented dMMR genes only; RLIKE (backend-robust)
-      "( (upper(biomarker) RLIKE 'MSI'",
-      " AND (lower(coalesce(narrative_result,'')) RLIKE 'high|unstable|positiv' OR upper(biomarker) RLIKE 'MSI-H'))",
-      " OR (upper(biomarker) RLIKE 'MLH1|MSH2|MSH6|PMS2'",
-      " AND (lower(coalesce(narrative_result,'')) RLIKE 'loss|lost|absent|deficien|mutat'",
-      " OR lower(coalesce(gene_characteristics,'')) RLIKE 'mutat|loss|deletion')) )"))
-    ) |>
-    transmute(ptid, bio_dt = to_date(note_date))
-  step4 |> inner_join(dmmr, by = "ptid") |>
-    filter(datediff(bio_dt, first_dx) >= 0) |>                      # biomarker on/after first dx
-    distinct(ptid, surgery_date, first_dx)
-}
-
-# ── STEP 6: IO use after dx, before any metastatic dx (11-agent list) ────────
-rdq1_step6_io <- function(src, step5, mets) {
-  io <- src$med |>
-    semi_join(step5, by = "ptid") |>
-    filter(upper(str_trim(generic_desc)) %in% RDQ1_IO,      # str_trim to normalize whitespace
-           str_trim(lower(action)) %in% RDQ1_IO_ACTIONS) |>
-    transmute(ptid, io_dt = to_date(action_date))
-  io |>
-    inner_join(step5, by = "ptid") |>
-    left_join(mets, by = "ptid") |>
-    filter(datediff(io_dt, first_dx) > 0,                    # io after first dx
-           is.na(mdt) | datediff(mdt, io_dt) > 0) |>          # io before any mets
-    distinct(ptid)
-}
-
-# ── one column: attrition Ns for a single {cohort, table_variant} ───────────
-rdq1_attrition_column <- function(con, cohort,
-                                  table_variant = "1a",
-                                  include_c77 = TRUE,
-                                  include_nonop_hcpcs = TRUE,
-                                  study_start = RDQ1_STUDY_START,
-                                  study_end = RDQ1_STUDY_END) {
-  steps <- c("1_surgery","2_newdx","3_stage","4_nomets","5_dmmr","6_io")
-  na_col <- tibble::tibble(step = steps, n = NA_integer_)
-
-  # R sources ONLY cohort 1 today (rdq1_sources ignores `cohort`). Every other label — 2/2a/2b (+Optum
-  # claims), 3/3a/3b (third-party) and 4 (Market Clarity IHD) — needs claims/IHD source unions NOT wired in
-  # R, so return n/a rather than emit cohort-1 EHR data under a different label. WHITELIST (not a 2/3/4
-  # blacklist): a label such as '2a' must NOT slip through and be computed+mislabeled. So R produces
-  # cohort 1 only; everything else = n/a.
-  if (cohort != "1") return(na_col)
-  if (table_variant != "1a")                           # 1b (all-EO) re-sourcing is the open delta
-    stop("table_variant '1b' (all-EO re-sourcing) is not implemented yet.")
-
-  use_onc <- TRUE                                       # cohort 1 always has EO (only cohort reachable here)
-  src <- rdq1_sources(con, cohort, use_onc)
-  fdx <- rdq1_cohort_dx(src) |> compute()
-
-  s1 <- rdq1_step1_surgery(src, fdx, include_nonop_hcpcs, study_start, study_end) |> compute()
-  s2 <- rdq1_step2_newdx(s1, fdx) |> compute()
-  n <- c(`1_surgery` = n_ptid(s1), `2_newdx` = n_ptid(s2))
-
-  if (use_onc) {
-    s3  <- rdq1_step3_stage(con, s2) |> compute()
-    s4l <- rdq1_step4_nomets(con, src, s3, include_c77)   # ICD-only mets (Table 1a [from EHR])
-    s4  <- s4l$step4 |> compute()
-    s5  <- rdq1_step5_dmmr(con, s4) |> compute()
-    s6  <- rdq1_step6_io(src, s5, s4l$mets) |> compute()
-    n <- c(n, `3_stage` = n_ptid(s3), `4_nomets` = n_ptid(s4),
-           `5_dmmr` = n_ptid(s5), `6_io` = n_ptid(s6))
-  } else {
-    n <- c(n, `3_stage` = 0L, `4_nomets` = 0L, `5_dmmr` = 0L, `6_io` = 0L)   # cohort 4 (IHD): no EO
-  }
-  tibble::tibble(step = steps, n = as.integer(n[steps]))
-}
-
-# ── full table: all cohorts x one variant, masked for display ───────────────
-# `cohorts` uses the RDQ column labels; the SQL wrapper maps column 2 -> lib '2a'.
-rdq1_attrition_table <- function(con,
-                                 cohorts = c("1","2","3","4"),
-                                 table_variant = "1a",
-                                 include_c77 = TRUE,
-                                 include_nonop_hcpcs = TRUE,
-                                 study_start = RDQ1_STUDY_START,
-                                 study_end = RDQ1_STUDY_END) {
-  cols <- lapply(cohorts, function(co) {
-    rdq1_attrition_column(con, co, table_variant, include_c77, include_nonop_hcpcs,
-                          study_start, study_end) |>
-      dplyr::rename(!!paste0("cohort_", co) := n)
-  })
-  out <- Reduce(function(a, b) dplyr::full_join(a, b, by = "step"), cols)
-  dplyr::mutate(out, dplyr::across(dplyr::starts_with("cohort_"), mc_mask))
-}
-
-# ── run (uncomment in Domino) ───────────────────────────────────────────────
-# con <- mc_connect()
-# tbl_1a <- rdq1_attrition_table(con, table_variant = "1a")   # Table 1a
-# print(tbl_1a); readr::write_csv(tbl_1a, "rdq1_table_1a.csv")
-# DBI::dbDisconnect(con)
->>>>> FILE: R/smoke_test.R
-# ============================================================================
-# smoke_test.R — validate the dbplyr -> Databricks SQL translation BEFORE the full run.
-# Prints the generated SQL for each step (show_query) and runs tiny LIMIT/count probes,
-# each wrapped so a translation failure is reported per-step instead of aborting silently.
-#
-# Run in Domino:  source("R/smoke_test.R")
-# Nothing here writes data; it only inspects SQL and pulls a handful of rows.
-# ============================================================================
-
-# robust script-dir resolution (Rscript, source(), interactive) — same pattern as the attrition script
-.smoke_dir <- (function() {
-  a <- commandArgs(FALSE); m <- grepl("^--file=", a)
-  if (any(m)) return(dirname(normalizePath(sub("^--file=", "", a[m][1]))))
-  for (i in seq_len(sys.nframe())) { of <- sys.frame(i)$ofile; if (!is.null(of)) return(dirname(normalizePath(of))) }
-  if (dir.exists("R")) return(normalizePath("R"))
-  getwd()
-})()
-source(file.path(.smoke_dir, "rdq1_colon_attrition.R"))
-
-# tb is an already-built lazy dbplyr table (or NULL if its construction failed upstream);
-# translation errors surface at render/collect and are reported here, never aborting the run.
-probe <- function(label, tb) {
-  cat("\n===", label, "===\n")
-  if (is.null(tb)) { cat("!! SKIPPED: upstream step did not build\n"); return(invisible()) }
-  tryCatch({
-    cat("-- generated SQL --\n"); print(dbplyr::sql_render(tb))
-    cat("-- probe (head 5) --\n"); print(dplyr::collect(utils::head(tb, 5)))
-    cat("-- distinct ptid --\n"); print(n_ptid(tb))
-  }, error = function(e) cat("!! FAILED:", conditionMessage(e), "\n"))
-}
-
-# build a lazy step, reporting (not aborting on) a construction-time error; returns NULL on failure
-build <- function(label, expr) {
-  tryCatch(force(expr),
-           error = function(e) { cat("!! build FAILED [", label, "]:", conditionMessage(e), "\n"); NULL })
-}
-
-con <- mc_connect()
-on.exit(try(DBI::dbDisconnect(con), silent = TRUE), add = TRUE)
-
-# Validate cohort 1 (EHR + EO) end to end, lazily (no compute()) — ALL SIX steps.
-# Each step is built inside build() and only feeds the next when non-NULL, so a construction-time
-# failure is reported for that step and the remaining probes still run (matching the header claim).
-src <- rdq1_sources(con, "1", use_onc = TRUE)
-fdx <- build("cohort_dx", rdq1_cohort_dx(src))
-s1  <- build("step1", if (!is.null(fdx)) rdq1_step1_surgery(src, fdx, include_nonop_hcpcs = TRUE) else NULL)
-s2  <- build("step2", if (!is.null(s1) && !is.null(fdx)) rdq1_step2_newdx(s1, fdx) else NULL)
-s3  <- build("step3", if (!is.null(s2)) rdq1_step3_stage(con, s2) else NULL)
-s4l <- build("step4", if (!is.null(s3)) rdq1_step4_nomets(con, src, s3, include_c77 = TRUE) else NULL)  # ICD-only mets
-s4  <- if (!is.null(s4l)) s4l$step4 else NULL
-s5  <- build("step5", if (!is.null(s4)) rdq1_step5_dmmr(con, s4) else NULL)                     # dMMR (biomarker)
-s6  <- build("step6", if (!is.null(s5) && !is.null(s4l)) rdq1_step6_io(src, s5, s4l$mets) else NULL)  # IO (EHR-source meds)
-
-probe("cohort_dx (>=2 C18 dx)", fdx)
-probe("step1 surgery",          s1)
-probe("step2 newly-dx",         s2)
-probe("step3 stage (EO)",       s3)   # also validates the (confirmed) onc_tnm columns t/n + FK neoplasm_histology_key
-probe("step4 no-mets (ICD)",    s4)
-probe("step5 dMMR/MSI-H",       s5)
-probe("step6 IO (EHR meds)",    s6)
-
-# Spot-check the translations the pipeline relies on. NOTE: regex matching does NOT use str_detect()
-# anymore — dbplyr only maps str_detect()->RLIKE when it recognises the backend as Spark/Databricks, and a
-# DSN/ODBC connection often isn't recognised (errors "Only fixed patterns are supported"). The pipeline now
-# emits native RLIKE directly via rl(), so there's nothing to translate for the regex. We just confirm the
-# handful of standard translations, each guarded so a quirk can't abort the probe.
-cat("\n=== translation spot-checks ===\n")
-chk <- function(label, expr) tryCatch({ cat(label, ""); print(expr) },
-                                       error = function(e) cat("!! FAILED:", conditionMessage(e), "\n"))
-chk("regex uses native RLIKE (no str_detect):", rl("upper(diagnosis_cd)", "^C18($|[.]?[02-9])"))
-chk("str_trim -> TRIM? ",  dbplyr::translate_sql(str_trim(x), con = con))
-chk("datediff passthrough?", dbplyr::translate_sql(datediff(a, b), con = con))
-
-cat("\nIf every block above shows SQL + a count (no !! FAILED), the translation is good;\n",
-    "then run rdq1_attrition_table(con) for the full Table 1a.\n")
->>>>> FILE: R/smoke_test_fast.R
-# ============================================================================
-# smoke_test_fast.R — QUICK validation on a SMALL patient sample.
-# Confirms the dbplyr -> Databricks SQL translates AND the referenced columns
-# exist, WITHOUT scanning the full ~5.1M-patient population. (That full scan is
-# why smoke_test.R is slow: it runs count(distinct ptid) over ALL patients, once
-# per step, cumulatively and uncached — so step 6 re-derives steps 1-5.)
-#
-# Here every source is first restricted to SAMPLE_N patients, so each step's
-# scans/joins are tiny and the whole 6-step chain runs in seconds.
-#
-# ⚠️ The counts printed here are on a SAMPLE — they are NOT real RDQ-1 numbers.
-# This is a translation / column-name check only. For real counts run:
-#     rdq1_attrition_table(con, cohorts = "1")
-#
-# Run in Domino:  source("R/smoke_test_fast.R")
-#   (optionally set SAMPLE_N <- 20000L first for a larger, still-fast sample)
-# ============================================================================
-
-# robust script-dir resolution (Rscript, source(), interactive) — same as the other scripts
-.sf_dir <- (function() {
-  a <- commandArgs(FALSE); m <- grepl("^--file=", a)
-  if (any(m)) return(dirname(normalizePath(sub("^--file=", "", a[m][1]))))
-  for (i in seq_len(sys.nframe())) { of <- sys.frame(i)$ofile; if (!is.null(of)) return(dirname(normalizePath(of))) }
-  if (dir.exists("R")) return(normalizePath("R"))
-  getwd()
-})()
-source(file.path(.sf_dir, "rdq1_colon_attrition.R"))
-
-if (!exists("SAMPLE_N")) SAMPLE_N <- 5000L   # patients to sample; raise for a bigger smoke
-
-con <- mc_connect()
-on.exit(try(DBI::dbDisconnect(con), silent = TRUE), add = TRUE)
-
-# A small patient sample. The `patient` table is one row per patient, so head()
-# is a trivial LIMIT (no shuffle). Every source is then semi-joined to it, which
-# lets Databricks broadcast-join and prune — keeping all six steps tiny/fast.
-samp <- mc_tbl(con, "patient") |> dplyr::select(ptid) |> utils::head(SAMPLE_N) |> compute()
-
-src <- rdq1_sources(con, "1", use_onc = TRUE)
-src$dx   <- dplyr::semi_join(src$dx,   samp, by = "ptid")
-src$proc <- dplyr::semi_join(src$proc, samp, by = "ptid")
-src$med  <- dplyr::semi_join(src$med,  samp, by = "ptid")
-
-# per-step: print the generated SQL, materialise on the sample, report the count.
-step <- function(label, tb) {
-  cat("\n===", label, "===\n")
-  tryCatch({
-    cat("-- generated SQL --\n"); print(dbplyr::sql_render(tb))
-    out <- tb |> compute()
-    cat("distinct ptid (sample):", n_ptid(out), "\n")
-    out
-  }, error = function(e) { cat("!! FAILED:", conditionMessage(e), "\n"); NULL })
-}
-
-# each step function is only CALLED when its input is non-NULL, so a caught upstream failure can't
-# abort the argument evaluation before step()'s tryCatch runs (per-step reporting stays true).
-fdx <- step("cohort_dx (>=2 C18 dx)", rdq1_cohort_dx(src))
-s1  <- step("step1 surgery",          if (!is.null(fdx)) rdq1_step1_surgery(src, fdx) else NULL)
-s2  <- step("step2 newly-dx",         if (!is.null(s1) && !is.null(fdx)) rdq1_step2_newdx(s1, fdx) else NULL)
-s3  <- step("step3 stage (EO)",       if (!is.null(s2)) rdq1_step3_stage(con, s2) else NULL)
-# guard: if an upstream step failed (NULL), don't let step-4 construction abort the whole probe
-s4l <- tryCatch(if (!is.null(s3)) rdq1_step4_nomets(con, src, s3, include_c77 = TRUE) else NULL,
-                error = function(e) { cat("!! step4 build FAILED:", conditionMessage(e), "\n"); NULL })
-s4  <- step("step4 no-mets (ICD)",    if (!is.null(s4l)) s4l$step4 else NULL)
-s5  <- step("step5 dMMR/MSI-H",       if (!is.null(s4))  rdq1_step5_dmmr(con, s4) else NULL)
-s6  <- step("step6 IO (EHR meds)",    if (!is.null(s5) && !is.null(s4l)) rdq1_step6_io(src, s5, s4l$mets) else NULL)
-
-cat("\nSample-based validation done (SAMPLE_N =", SAMPLE_N, "patients).\n",
-    "If no '!! FAILED' block appeared, the translation + columns are good — then run\n",
-    "  rdq1_attrition_table(con, cohorts = \"1\")  for the real full-population Table 1a.\n")
->>>>> FILE: rdq1.R
-#!/usr/bin/env Rscript
-# ============================================================================
-# rdq1.R - RDQ-1 colon-cancer cohort, Table 1a (cohort 1), ONE self-contained script.
-#
-# Run:   Rscript rdq1.R        (or in Domino:  source("rdq1.R"))
-# Needs: env vars DATABRICKS_DSN (default "RWDE") and DATABRICKS_PWD (token),
-#        an ODBC DSN "RWDE" -> the Databricks SQL warehouse,
-#        R packages: DBI, odbc, dplyr, dbplyr, stringr.
-#
-# It prints the 6-step attrition for cohort 1 and writes rdq1_table_1a.csv.
-# Each step is materialised once (compute()) so step 6 does NOT re-derive 1-5 -
-# that is what makes it fast. Toggle the knobs in the "SETTINGS" block below.
-# ============================================================================
-
-suppressPackageStartupMessages({
-  library(DBI); library(odbc); library(dplyr); library(dbplyr); library(stringr)
-})
-
-# ---- SETTINGS (togglable; documented assumptions) --------------------------
-STUDY_START <- "2020-01-01"; STUDY_END <- "2025-12-31"  # study period on the index date; NA to disable
-INCLUDE_C77 <- TRUE            # RDQ criterion 4 (C77+C78+C79). FALSE = distant-only C78-C79.
-INCLUDE_NONOP_HCPCS <- TRUE    # RDQ "as-requested" surgery codes. FALSE = surgery-only sensitivity.
-
-# ---- connection ------------------------------------------------------------
-if (!nzchar(Sys.getenv("DATABRICKS_PWD"))) stop("DATABRICKS_PWD is not set.")
-con <- dbConnect(odbc::odbc(),
-                 dsn = Sys.getenv("DATABRICKS_DSN", "RWDE"),
-                 pwd = Sys.getenv("DATABRICKS_PWD"),
-                 timeout = 120, bigint = "numeric")
-on.exit(try(dbDisconnect(con), silent = TRUE), add = TRUE)
-# case-robust handle: lowercase every deployed column name so the lowercase field
-# references below match regardless of how Databricks reports them (it usually
-# returns UPPERCASE, and dbplyr's name check is case-sensitive -> "not found").
-Tab <- function(name) {
-  h <- tbl(con, in_catalog("hive_metastore", "clnprw_optum_mc_full_use",
-                           paste0("t_", name, "_2025q4")))
-  dplyr::rename_with(h, tolower)
-}
-np  <- function(t) t |> summarise(n = n_distinct(ptid)) |> pull(n) |> as.integer()
-# Databricks-native regex match (see rdq1_full.R): dbplyr only maps str_detect()->RLIKE when it recognises
-# the backend; on an unrecognised ODBC/DSN connection it errors "Only fixed patterns are supported". rl()
-# emits RLIKE directly so regex filters work regardless. col_sql is a raw SQL column expression.
-rl <- function(col_sql, pattern) sql(paste0("(", col_sql, ") RLIKE '", pattern, "'"))
-
-# ---- value sets ------------------------------------------------------------
-COLON_ICD <- "^C18($|[.]?[02-9])"                 # enumerated C18 only (excludes C18.1, C19, C20)
-COLON_NEO <- c("COLON")                           # EO neoplasm_type for the colon concept
-SURG_CPT  <- c("44139","44140","44141","44143","44144","44145","44146","44147","44150","44151",
-               "44155","44156","44157","44158","44160","45399",
-               "44204","44205","44206","44207","44208","44210","44211","44212","44213","44238")
-SURG_PCS  <- "^0DT[E-Q]"                           # ICD-10-PCS colon resections
-SURG_HCPCS<- c("C1749","C9779","C9796","C9901","G0105","G0120","G0121","G2204","G9084","G9085",
-               "G9086","G9087","G9088","G9089","G9659","G9660","G9661","G9862","G9998","G9999",
-               "S0285","G9711","M1295")            # non-operative (RDQ "as-requested")
-SURG_CODES<- if (INCLUDE_NONOP_HCPCS) c(SURG_CPT, SURG_HCPCS) else SURG_CPT
-MED_SRC   <- c("proc","rx_presc","rx_adm")         # coded EHR med sources (excludes NLP provider_notes)
-IO        <- c("ATEZOLIZUMAB","AVELUMAB","CEMIPLIMAB","DURVALUMAB","NIVOLUMAB","PEMBROLIZUMAB",
-               "IPILIMUMAB","DOSTARLIMAB","TORIPALIMAB","TISLELIZUMAB","COSIBELIMAB")
-IO_ACT    <- c("administered","filled","started","is_on")
-METS_RE   <- if (INCLUDE_C77) "^C7[789]" else "^C7[89]"
-
-# ---- entry: >=2 distinct C18 dx dates; first_dx = earliest -----------------
-fdx <- Tab("diagnosis") |>
-  filter(str_trim(tolower(diagnosis_status)) == "diagnosis of",
-         rl("upper(diagnosis_cd_type)", "^ICD"),
-         rl("upper(diagnosis_cd)", COLON_ICD)) |>
-  group_by(ptid) |>
-  summarise(first_dx = min(to_date(diag_date), na.rm = TRUE),
-            n_dx = n_distinct(to_date(diag_date)), .groups = "drop") |>
-  filter(n_dx >= 2) |> select(ptid, first_dx) |> compute()
-
-# ---- shared: metastatic (C77/C78/C79) first date (used by steps 4 and 6) ---
-mets <- Tab("diagnosis") |>
-  filter(str_trim(tolower(diagnosis_status)) == "diagnosis of",
-         rl("upper(diagnosis_cd_type)", "^ICD"),
-         rl("upper(diagnosis_cd)", METS_RE)) |>
-  group_by(ptid) |> summarise(mdt = min(to_date(diag_date)), .groups = "drop") |> compute()
-
-res <- integer()
-
-# ---- step 1: colon surgery, index date inside the study window -------------
-s1 <- Tab("procedure") |>
-  mutate(px = regexp_replace(upper(proc_code), "[^0-9A-Z]", ""), pdt = to_date(proc_date)) |>  # deployed col: proc_code
-  filter(px %in% SURG_CODES | rl("px", SURG_PCS)) |>
-  semi_join(fdx, by = "ptid") |>
-  transmute(ptid, surgery_date = pdt) |> distinct()
-# accept either NA or NULL as "disabled" (README says NULL; the settings above default to a date or NA)
-if (!is.null(STUDY_START) && !is.na(STUDY_START)) s1 <- s1 |> filter(surgery_date >= to_date(STUDY_START))
-if (!is.null(STUDY_END)   && !is.na(STUDY_END))   s1 <- s1 |> filter(surgery_date <= to_date(STUDY_END))
-s1 <- compute(s1); res["1_surgery"] <- np(s1); cat("1 surgery      :", res["1_surgery"], "\n")
-
-# ---- step 2: earliest surgery with newly-dx colon cancer <=183 d prior -----
-s2 <- s1 |> inner_join(fdx, by = "ptid") |>
-  filter(datediff(surgery_date, first_dx) >= 0, datediff(surgery_date, first_dx) <= 183) |>
-  group_by(ptid, first_dx) |> summarise(surgery_date = min(surgery_date), .groups = "drop") |>
-  compute(); res["2_newdx"] <- np(s2); cat("2 newly-dx     :", res["2_newdx"], "\n")
-
-# ---- step 3: stage T1-4 N1-2 or T4N0 (EO TNM; N-missing -> positive nodes) --
-keys <- Tab("onc_neoplasm_histology") |> semi_join(s2, by = "ptid") |>
-  filter(str_trim(tolower(neoplasm_qualifier)) == "actual", upper(str_trim(neoplasm_type)) %in% COLON_NEO) |>
-  transmute(ptid, neoplasm_histology_key,
-            anchor = coalesce(to_date(neoplasm_dx_date), to_date(note_date))) |>
-  inner_join(s2, by = "ptid")
-posnodes <- Tab("onc_lymph_node") |> inner_join(s2, by = "ptid") |>
-  mutate(nd = to_date(note_date)) |>
-  filter(str_trim(tolower(lymph_narrative)) == "positive lymph node", lymph_numeric > 0,
-         datediff(nd, first_dx) >= -30, datediff(nd, surgery_date) <= 90) |>
-  distinct(ptid) |> mutate(has_pos = 1L)
-s3 <- Tab("onc_tnm") |> select(neoplasm_histology_key, t, n) |>
-  inner_join(keys, by = "neoplasm_histology_key") |>
-  mutate(tnum = sql("try_cast(regexp_extract(t,'[1-4]',0) as int)"),
-         nnum = sql("try_cast(regexp_extract(n,'[0-9]',0) as int)"),
-         nraw = sql("regexp_extract(n,'[0-9]',0)")) |>
-  left_join(posnodes, by = "ptid") |> mutate(has_pos = coalesce(has_pos, 0L)) |>
-  filter(tnum >= 1, tnum <= 4,
-         (nnum > 0) | (tnum == 4 & nnum == 0) | ((nraw == "" | is.na(nnum)) & has_pos == 1L),
-         datediff(anchor, first_dx) >= -30, datediff(anchor, surgery_date) <= 90) |>
-  distinct(ptid, surgery_date, first_dx) |>
-  compute(); res["3_stage"] <- np(s3); cat("3 stage        :", res["3_stage"], "\n")
-
-# ---- step 4: no metastatic dx before surgery (ICD C77/C78/C79) -------------
-s4 <- s3 |> left_join(mets, by = "ptid") |>
-  filter(is.na(mdt) | datediff(mdt, surgery_date) >= 0) |>
-  select(ptid, surgery_date, first_dx) |>
-  compute(); res["4_nomets"] <- np(s4); cat("4 no-mets      :", res["4_nomets"], "\n")
-
-# ---- step 5: dMMR+ or MSI-H (single-primary restriction) -------------------
-mp <- Tab("onc_neoplasm_histology") |> semi_join(s4, by = "ptid") |>
-  filter(str_trim(tolower(neoplasm_qualifier)) == "actual", !(upper(str_trim(neoplasm_type)) %in% COLON_NEO)) |>
-  distinct(ptid)
-dmmr <- Tab("onc_biomarker") |> semi_join(s4, by = "ptid") |> anti_join(mp, by = "ptid") |>
-  filter(!(str_trim(lower(coalesce(biomarker_temporal_status, ""))) %in% c("plan","planned"))) |>
-  filter(sql(paste0(
-    "( (upper(biomarker) RLIKE 'MSI'",
-    " AND (lower(coalesce(narrative_result,'')) RLIKE 'high|unstable|positiv' OR upper(biomarker) RLIKE 'MSI-H'))",
-    " OR (upper(biomarker) RLIKE 'MLH1|MSH2|MSH6|PMS2'",
-    " AND (lower(coalesce(narrative_result,'')) RLIKE 'loss|lost|absent|deficien|mutat'",
-    " OR lower(coalesce(gene_characteristics,'')) RLIKE 'mutat|loss|deletion')) )"))
-  ) |> transmute(ptid, bio_dt = to_date(note_date))
-s5 <- s4 |> inner_join(dmmr, by = "ptid") |> filter(datediff(bio_dt, first_dx) >= 0) |>
-  distinct(ptid, surgery_date, first_dx) |>
-  compute(); res["5_dmmr"] <- np(s5); cat("5 dMMR/MSI-H   :", res["5_dmmr"], "\n")
-
-# ---- step 6: IO use after first dx and before any metastatic dx ------------
-s6 <- Tab("onc_medications") |>
-  filter(str_trim(tolower(data_source)) %in% MED_SRC) |>   # deployed col: data_source (not source)
-  semi_join(s5, by = "ptid") |>
-  filter(upper(str_trim(generic_desc)) %in% IO, str_trim(lower(action)) %in% IO_ACT) |>
-  transmute(ptid, io_dt = to_date(action_date)) |>
-  inner_join(s5, by = "ptid") |> left_join(mets, by = "ptid") |>
-  filter(datediff(io_dt, first_dx) > 0, is.na(mdt) | datediff(mdt, io_dt) > 0) |>
-  distinct(ptid) |>
-  compute(); res["6_io"] <- np(s6); cat("6 IO use       :", res["6_io"], "\n")
-
-# ---- result ----------------------------------------------------------------
-steps  <- c("1_surgery","2_newdx","3_stage","4_nomets","5_dmmr","6_io")
-tbl_1a <- data.frame(step = steps, cohort_1 = as.integer(res[steps]))
-# small-cell suppression for reporting (<11 -> "<11"); keep raw for your own use
-tbl_1a$reported <- ifelse(tbl_1a$cohort_1 > 0 & tbl_1a$cohort_1 < 11, "<11", as.character(tbl_1a$cohort_1))
-cat("\n=== RDQ-1 Table 1a - cohort 1 ===\n"); print(tbl_1a, row.names = FALSE)
-write.csv(tbl_1a, "rdq1_table_1a.csv", row.names = FALSE)
-cat("\nwrote rdq1_table_1a.csv\n")
->>>>> FILE: rdq1_full.R
-#!/usr/bin/env Rscript
-# ============================================================================
-# rdq1_full.R - RDQ-1 attrition, FULL MATRIX: 2 tables (1a / 1b) x 4 cohorts (1 / 2a / 3 / 4).
-# One self-contained script. Cohort-1 columns are COLUMN-verified against the deployed 2025q4
-# schema (DESCRIBE/SHOW COLUMNS). Cohort 2a/3/4 add a CLAIMS layer whose columns are now
-# INSTANCE-CONFIRMED (live DESCRIBE dumps of the clm_* tables); a runtime PREFLIGHT (below) still
-# re-resolves them at run time and renders "pending (preflight)" if any required claims column is
-# absent - never a guessed number. Claims DATE encoding is CONFIRMED ISO date-typed; claims IO now matches
-# Rx generic + J-codes + the RDQ appendix NDCs (clm_rx.ndc / clm_med_services.ndc, see cl_io / IO_NDC). The
-# remaining gate before relying on 2a/3/4 counts is the Cohort-3/4 definitions (Optum sign-off, questions #4/#7).
-#
-# Run:   Rscript rdq1_full.R      (or in RStudio: source("rdq1_full.R"))
-# Needs: DATABRICKS_DSN (default "RWDE"), DATABRICKS_PWD (token); packages
-#        DBI, odbc, dplyr, dbplyr, stringr.
-#
-# ---------------------------------------------------------------------------
-# RDQ-1 MATRIX (faithful to the request form: cohorts differ by DATA BREADTH, not by whether EO is on)
-#   Cohort 1  = EHR + physician notes + Enriched Oncology, AGNOSTIC to claims        -> no patient-flag scope, no claims
-#   Cohort 2a = Cohort 1 + linked Optum **closed/adjudicated** Medical & Rx claims   -> patient.integrated='Y', + Optum claims
-#   Cohort 3  = Cohort 1 + linked **Third Party** Medical & Rx claims (CANDIDATE)     -> market_clarity='Y' & integrated='N'
-#   Cohort 4  = Market Clarity IHD (integrated delivery network)                      -> patient.idn_indicator
-#   Table 1a  = coded-EHR-led criteria (steps 1/2/4/6 from structured codes; 3/5 from EO)
-#   Table 1b  = Enriched-Oncology-led criteria (dx/mets/IO re-sourced from EO; surgery stays structured Procedure)
-# Steps 3 (stage) and 5 (dMMR/MSI-H) are EO-derived for ALL cohorts (staging/biomarker are NOT in claims;
-# the RDQ itself notes staging is "not confirmable in claims"). Cohorts 2a/3/4 add the claims layer to the
-# CODED steps (surgery / colon dx / mets exclusion / IO), and restrict to the cohort's patient population.
-# BASE vs CLAIMS-ENHANCED 1b (feasibility-answer §5.5): the RDQ's base Table 1b is EO-only. Here the `cohort1`
-# column IS that base EO-only 1b (EO-pure - no claims). The 1b cohort2a/3/4 columns add the claims overlay, so
-# they are the "claims-ENHANCED / curated-sensitivity 1b" variant, NOT the base shell - they are emitted with a
-# `_clmsEnh` suffix in rdq1_attrition_table1b.csv to keep that explicit. (Cohort 1 has no claims by definition,
-# so its 1b column is unaffected either way.)
-#
-# WHY THIS IS FAITHFUL (confirmed across the Optum documentation and the RDQ request):
-#   * Cohort defs are VERBATIM-consistent across the RDQ form + case-study (Cohort 3 = "Third Party").
-#   * Concept->table map (Optum documentation): index cancer dx = ICD-9/10 in the diagnosis table; procedures
-#     = CPT/HCPCS in the procedure table; staging (TNM/stage/histology) = pathology/EO; treatment = meds.
-#   * A worked colon example in the Optum documentation shows the real code systems: CPT 43239 colonoscopy +
-#     88305 path, ICD-9-CM procedure 17.33 hemicolectomy + 45.93 anastomosis, KRAS biomarker -> confirms colon
-#     surgery is a (hemi)colectomy captured in procedure codes, and that BOTH CPT and ICD procedure code systems
-#     appear (historical rows may carry ICD-9-CM Vol-3 procedure codes, not only ICD-10-PCS 0DT... - see SURG).
-#   * EO Metastasis table is DISTANT-only (no local/lymph-node) with Mets Qualifier actual/absent -> step-4 EO
-#     path filters 'actual' and C77 regional-nodal is NOT an EO-mets exclusion (consistent with keeping C77).
-#   * EO Medications value sets (the code uses these normalized spellings, per R/README.md's confirmed list):
-#     action in {administered, filled, started, is_on}; data_source EHR arm {proc, rx_presc, rx_adm} (+NLP
-#     provider_notes for Table 1b). str_trim(lower(...)) is applied so trivial case/space differences don't matter.
-#
-# CAVEATS - what "verified" means and does NOT:
-#   * COHORT 1 (2 tables): every COLUMN checked against the deployed schema; runnable now.
-#   * COHORT 2a/3/4 (claims): the clm_* columns are now CONFIRMED on the instance (column dumps) -
-#     clm_med_diagnosis(diag, icd_flag, fst_dt); clm_med_procedure(proc, icd_flag, fst_dt);
-#     clm_med_services(proc_cd, ndc, icd_flag, fst_dt); clm_rx(gnrc_nm, ndc, fill_dt). The preflight still
-#     resolves them at RUNTIME (adapts to spellings, lists what it resolved) and prints "pending (preflight)"
-#     if anything is absent. SURGERY draws from BOTH claims proc tables: CPT/HCPCS from clm_med_services.proc_cd
-#     and ICD-PCS 0DT... from clm_med_procedure.proc; IO J-codes from clm_med_services.proc_cd.
-#   * COHORT 3 is a CANDIDATE population (MC='Y' & INTEGRATED='N', ~20.1M on the instance) PENDING OPTUM
-#     sign-off (open question #4). If Optum says it is NOT third party, Cohort 3 collapses into Cohort 2 -> n/a.
-#   * COHORT 4 = "Market Clarity IHD" = market_clarity='Y' AND idn_indicator='1' (~76.2M). Flag values CONFIRMED
-#     on the instance: market_clarity/integrated 'Y'/'N', idn_indicator '0'/'1' (NOT Y/N). Whether Cohort 4
-#     should also require Optum-claims linkage (vs the IHD flag alone) stays an Optum item (question #7).
-#   * Filter VALUES are CONFIRMED FROM OPTUM DOCUMENTATION (see R/README.md): diagnosis_status='Diagnosis of';
-#     diagnosis_cd_type in ICD9/ICD10; neoplasm_qualifier='actual'; data_source EHR arm proc/rx_presc/rx_adm;
-#     action in {started,stopped,is_on,suspended,administered,filled}; dMMR/MSI-H = MLH1/MSH2/MSH6/PMS2;
-#     mets_qualifier in {actual,absent}. CONFIRMED on the instance: claims date FORMAT (ISO date-typed) and
-#     idn_indicator value set (0/1). STILL to confirm live: exact colon neoplasm_type token, and which
-#     `action`s count as "use" (the exposure subset is a requestor assumption).
-#   * EO NLP recall is limited (per the Optum NLP-performance documentation - Metastasis 0.60, Stage TNM 0.81),
-#     so steps 3/4 can FALSE-EXCLUDE. This is a FEASIBILITY caveat (see RDQ-1-feasibility-answer.md), not a bug.
-#   * ICD-9 claims colon codes (153.x) are NOT included - the RDQ diagnosis list is ICD-10 C18 only; adding a
-#     153->C18 crosswalk would be inventing beyond the request. Flagged, not silently mapped.
-# ============================================================================
-
-suppressPackageStartupMessages({
-  library(DBI); library(odbc); library(dplyr); library(dbplyr); library(stringr)
-})
-
-# ---- SETTINGS (togglable) --------------------------------------------------
-STUDY_START <- "2020-01-01"; STUDY_END <- "2025-12-31"  # study period on the index/surgery date; NA to disable
-INCLUDE_C77 <- TRUE            # RDQ criterion 4 (C77+C78+C79). FALSE = distant-only C78-C79.
-INCLUDE_NONOP_HCPCS <- TRUE    # RDQ "as-requested" surgery codes. FALSE = surgery-only sensitivity.
-RUN_CLAIMS  <- TRUE            # FALSE = cohort-1-only run (skips the claims preflight + cohorts 2a/3/4).
-
-# ---- connection ------------------------------------------------------------
-if (!nzchar(Sys.getenv("DATABRICKS_PWD"))) stop("DATABRICKS_PWD is not set.")
-con <- dbConnect(odbc::odbc(), dsn = Sys.getenv("DATABRICKS_DSN", "RWDE"),
-                 pwd = Sys.getenv("DATABRICKS_PWD"), timeout = 120, bigint = "numeric")
-on.exit(try(dbDisconnect(con), silent = TRUE), add = TRUE)
-# lowercase deployed columns (Databricks reports UPPERCASE; dbplyr is case-sensitive)
-Tab <- function(name) tbl(con, in_catalog("hive_metastore", "clnprw_optum_mc_full_use",
-                                          paste0("t_", name, "_2025q4"))) |> rename_with(tolower)
-np  <- function(t) t |> summarise(n = n_distinct(ptid)) |> pull(n) |> as.integer()
-# Databricks-native regex match. dbplyr only translates str_detect() -> RLIKE when it recognises the
-# connection as a Spark/Databricks backend; on an unrecognised ODBC backend it errors
-# "Only fixed patterns are supported on database backends". rl() emits RLIKE directly. col_sql is raw SQL.
-rl <- function(col_sql, pattern) sql(paste0("(", col_sql, ") RLIKE '", pattern, "'"))
-
-# ---- value sets (confirmed) ------------------------------------------------
-COLON_ICD <- "^C18($|[.]?[02-9])"                 # enumerated C18 only (excludes C18.1, C19, C20)
-COLON_NEO <- c("COLON")
-SURG_CPT  <- c("44139","44140","44141","44143","44144","44145","44146","44147","44150","44151",
-               "44155","44156","44157","44158","44160","45399",
-               "44204","44205","44206","44207","44208","44210","44211","44212","44213","44238")
-SURG_PCS  <- "^0DT[E-Q]"
-SURG_HCPCS<- c("C1749","C9779","C9796","C9901","G0105","G0120","G0121","G2204","G9084","G9085",
-               "G9086","G9087","G9088","G9089","G9659","G9660","G9661","G9862","G9998","G9999",
-               "S0285","G9711","M1295")
-SURG_CODES<- if (INCLUDE_NONOP_HCPCS) c(SURG_CPT, SURG_HCPCS) else SURG_CPT
-IO        <- c("ATEZOLIZUMAB","AVELUMAB","CEMIPLIMAB","DURVALUMAB","NIVOLUMAB","PEMBROLIZUMAB",
-               "IPILIMUMAB","DOSTARLIMAB","TORIPALIMAB","TISLELIZUMAB","COSIBELIMAB")
-IO_JCODES <- c("J9022","J9023","J9119","J9173","J9299","J9289","J9271","J9228","J9272","J3263",
-               "J9329","J9275")                    # RDQ IO HCPCS J-codes (claims IO match arm)
-# RDQ IO appendix (Table 3) NDCs, digit-only. The 3 agents the RDQ prints in 5-3-2 (10-digit) dashed form
-# (toripalimab/tislelizumab/cosibelimab) are AMBIGUOUS to 11-digit: we carry the 10-digit raw AND BOTH
-# candidate 11-digit paddings - the standard product-pad (70114034001) and the form the repo's
-# sql/code_lists.sql uses (70114340001) - so the R claims-IO match agrees with the SQL vs_rdq1_io_appendix
-# vector regardless of which padding the instance stores. The match strips non-digits from the claims ndc.
-# ⚠️ confirm the instance's NDC normalization once (SELECT DISTINCT ndc ... LIMIT) and prune to the real form.
-IO_NDC <- c("50242091701","50242091801",                                   # atezolizumab (Tecentriq)
-            "44087353501",                                                 # avelumab (Bavencio)
-            "61755000801",                                                 # cemiplimab (Libtayo)
-            "00310450012","00310461150",                                   # durvalumab (Imfinzi)
-            "00003373413","00003375614","00003377211","00003377412",       # nivolumab (Opdivo)
-            "00006302601","00006302602","00006302604",                     # pembrolizumab (Keytruda)
-            "00003232711","00003232822",                                   # ipilimumab (Yervoy)
-            "00173089803",                                                 # dostarlimab (Jemperli)
-            "7011434001","70114034001","70114340001",                      # toripalimab (Loqtorzi): 10-digit + both 11-digit paddings
-            "7257912101","72579012101","72579121001",                      # tislelizumab (Tevimbra): 10-digit + both 11-digit paddings
-            "7009513001","70095013001","70095130001")                      # cosibelimab (Unloxcyt): 10-digit + both 11-digit paddings
-IO_ACT    <- c("administered","filled","started","is_on")
-MED_SRC   <- c("proc","rx_presc","rx_adm")         # coded EHR med sources (excludes NLP provider_notes)
-METS_RE   <- if (INCLUDE_C77) "^C7[789]" else "^C7[89]"
-
-# ============================================================================
-# CLAIMS PREFLIGHT - resolve+verify the documented clm_* columns on THIS instance.
-# The claims path never trusts a hard-coded name: for each needed field it picks the first
-# candidate spelling that actually exists, and records it. A required field with no match ->
-# CLAIMS_OK = FALSE and the cohorts that need claims render "pending (preflight)".
-# ============================================================================
-cols_of <- function(name) {
-  out <- tryCatch(dbGetQuery(con, sprintf(
-    "SHOW COLUMNS IN hive_metastore.clnprw_optum_mc_full_use.t_%s_2025q4", name)),
-    error = function(e) NULL)
-  if (is.null(out) || !nrow(out)) return(character(0))
-  tolower(out[[1]])
-}
-CLAIMS_OK <- FALSE; RC <- list()   # RC = resolved claims columns (filled by the preflight below)
-if (isTRUE(RUN_CLAIMS)) {
-  # candidate spellings per (table, field). ndc is OPTIONAL (IO also matches on generic + J-code).
-  need <- list(
-    clm_med_diagnosis = list(
-      code = c("diag","diagnosis_cd","dx_cd","icd_dx","diagnosis"),
-      date = c("fst_dt","from_dt","diag_date","svc_dt","service_dt","stmt_from_dt","first_service_dt")),
-    clm_rx            = list(
-      gnrc = c("gnrc_nm","generic_name","generic_desc","gnrc_desc","drug_name","gnrc"),
-      date = c("fill_dt","rx_fill_dt","service_dt","fst_dt","from_dt","svc_dt")))
-  miss <- character(0)
-  for (tb in names(need)) {
-    cc <- cols_of(tb)
-    if (!length(cc)) { miss <- c(miss, paste0(tb, " (table not found)")); next }
-    if (!("ptid" %in% cc)) miss <- c(miss, paste0(tb, ".ptid"))
-    for (f in names(need[[tb]])) {
-      hit <- need[[tb]][[f]][need[[tb]][[f]] %in% cc]
-      if (length(hit)) RC[[paste(tb, f, sep = ".")]] <- hit[1] else miss <- c(miss, paste0(tb, ".", f))
-    }
-  }
-  # Procedures live in TWO claims tables (CONFIRMED on the instance): CPT / HCPCS / J-codes in
-  # clm_med_services.proc_cd (the HCPCS source - drives CPT+HCPCS surgery AND the IO J-code arm), and
-  # ICD-PCS resection codes (0DT...) in clm_med_procedure.proc (the PCS source). Resolve each independently.
-  # HCPCS source is REQUIRED (CPT surgery + J-code IO need it); PCS source is optional (its absence only
-  # drops the ICD-PCS surgery arm - logged, not fatal - so CPT/HCPCS surgery still counts).
-  hcpcs_cands <- c("clm_med_services","clm_med_service")
-  hcpcs_field <- list(proc = c("proc_cd","procedure_cd","hcpcs_cd","cpt_cd","hcpcs"),
-                      date = c("fst_dt","from_dt","svc_dt","service_dt","stmt_from_dt","first_service_dt"))
-  pcs_cands   <- c("clm_med_procedure","clm_procedure")
-  pcs_field   <- list(proc = c("proc","proc_cd","procedure_cd","icd_proc_cd"),
-                      date = c("fst_dt","from_dt","proc_date","svc_dt","service_dt"))
-  resolve_proc <- function(cands, field, tag, required) {
-    for (tb in cands) {
-      cc <- cols_of(tb); if (!length(cc) || !("ptid" %in% cc)) next
-      p <- field$proc[field$proc %in% cc]; d <- field$date[field$date %in% cc]
-      if (length(p) && length(d)) { RC[[paste0(tag, ".tbl")]]  <<- tb
-        RC[[paste0(tag, ".proc")]] <<- p[1]; RC[[paste0(tag, ".date")]] <<- d[1]; return(invisible()) }
-    }
-    if (required) miss <<- c(miss, paste0(tag, " source (tried ", paste(cands, collapse = "/"), ")"))
-  }
-  resolve_proc(hcpcs_cands, hcpcs_field, "hcpcs", TRUE)   # CPT/HCPCS/J-codes (required)
-  resolve_proc(pcs_cands,   pcs_field,   "pcs",   FALSE)  # ICD-PCS 0DT resections (optional)
-  if (is.null(RC[["pcs.tbl"]]))
-    cat("  note: no ICD-PCS procedure source resolved - the 0DT... surgery arm is dropped for claims cohorts.\n")
-  # optional NDC columns for the IO NDC match arm (clm_rx + the HCPCS proc table). Absent -> NDC arm skipped.
-  ndc_of <- function(tb) { cc <- cols_of(tb); hit <- c("ndc","ndc_cd") [c("ndc","ndc_cd") %in% cc]; if (length(hit)) hit[1] else NULL }
-  if (!is.null(ndc_of("clm_rx")))            RC[["clm_rx.ndc"]] <- ndc_of("clm_rx")
-  if (!is.null(RC[["hcpcs.tbl"]]) && !is.null(ndc_of(RC[["hcpcs.tbl"]]))) RC[["hcpcs.ndc"]] <- ndc_of(RC[["hcpcs.tbl"]])
-  if (is.null(RC[["clm_rx.ndc"]]) && is.null(RC[["hcpcs.ndc"]]))
-    cat("  note: no NDC column resolved - IO NDC arm skipped (generic + J-code only; may undercount).\n")
-  CLAIMS_OK <- (length(miss) == 0)
-  cat("---- claims preflight ----\n")
-  if (length(RC)) for (k in names(RC)) cat(sprintf("  resolved %-28s -> %s\n", k, RC[[k]]))
-  if (!CLAIMS_OK) cat("  MISSING (claims cohorts -> 'pending (preflight)'): ",
-                      paste(miss, collapse = ", "), "\n") else cat("  all required claims columns resolved.\n")
-  cat("--------------------------\n")
-}
-# claims date parser. CONFIRMED on the instance: the clm_* `*_dt` columns are `date`-typed and stringify to
-# ISO 'yyyy-MM-dd' (e.g. clm_med_diagnosis.fst_dt -> '2024-08-09'), so to_date parses directly. The yyyyMMdd
-# fallback is kept only as a harmless belt-and-suspenders (returns NULL for ISO input, so coalesce takes ISO).
-CDATE <- function(col) sql(sprintf(
-  "coalesce(to_date(cast(%s as string)), to_date(cast(%s as string),'yyyyMMdd'))", col, col))
-rc <- function(k) RC[[k]]   # short accessor
-
-# claims-derived (ptid, date) building blocks (NULL unless CLAIMS_OK)
-cl_colon_dx <- function() if (!CLAIMS_OK) NULL else                                   # step-2 entry (1a)
-  Tab("clm_med_diagnosis") |> filter(rl(paste0("upper(", rc("clm_med_diagnosis.code"), ")"), COLON_ICD)) |>
-    transmute(ptid, dxd = CDATE(rc("clm_med_diagnosis.date")))
-# one (ptid, px, date) source from a resolved proc table tag ("hcpcs" | "pcs"); NULL if unresolved
-proc_src <- function(tag) {
-  if (is.null(RC[[paste0(tag, ".tbl")]])) return(NULL)
-  Tab(RC[[paste0(tag, ".tbl")]]) |>
-    mutate(px = regexp_replace(upper(sql(RC[[paste0(tag, ".proc")]])), "[^0-9A-Z]", ""),
-           pdt = CDATE(RC[[paste0(tag, ".date")]]))
-}
-cl_surg <- function() {                                                                # step-1 surgery
-  if (!CLAIMS_OK) return(NULL)
-  parts <- list()
-  h <- proc_src("hcpcs"); if (!is.null(h))                                             # CPT + HCPCS (proc_cd)
-    parts[[length(parts) + 1]] <- h |> filter(px %in% SURG_CODES) |> transmute(ptid, sdt = pdt)
-  p <- proc_src("pcs");   if (!is.null(p))                                             # ICD-PCS 0DT... (proc)
-    parts[[length(parts) + 1]] <- p |> filter(rl("px", SURG_PCS)) |> transmute(ptid, sdt = pdt)
-  if (!length(parts)) NULL else Reduce(union_all, parts)
-}
-cl_mets <- function() if (!CLAIMS_OK) NULL else                                        # step-4 mets exclusion
-  Tab("clm_med_diagnosis") |> filter(rl(paste0("upper(", rc("clm_med_diagnosis.code"), ")"), METS_RE)) |>
-    transmute(ptid, mdt = CDATE(rc("clm_med_diagnosis.date")))
-# step-6 IO. Matches Rx GENERIC NAME (clm_rx.gnrc_nm) + RDQ IO NDCs (clm_rx.ndc), and HCPCS/J-codes +
-# RDQ IO NDCs on the HCPCS proc table (clm_med_services.proc_cd / .ndc). NDC match strips non-digits from the
-# claims ndc column and compares to IO_NDC (10- and 11-digit forms). NDC arms activate only if the preflight
-# resolved an ndc column; if not, they are skipped (generic + J-code only) and the preflight logs it.
-ndclean <- function(col) sql(sprintf("regexp_replace(%s, '[^0-9]', '')", col))
-cl_io <- function() {
-  if (!CLAIMS_OK) return(NULL)
-  rx <- Tab("clm_rx")
-  rx <- if (!is.null(RC[["clm_rx.ndc"]]))
-    rx |> filter(upper(str_trim(sql(rc("clm_rx.gnrc")))) %in% IO | ndclean(RC[["clm_rx.ndc"]]) %in% IO_NDC)
-  else rx |> filter(upper(str_trim(sql(rc("clm_rx.gnrc")))) %in% IO)
-  parts <- list(rx |> transmute(ptid, io_dt = CDATE(rc("clm_rx.date"))))
-  if (!is.null(RC[["hcpcs.tbl"]])) {                                                    # J-codes (+ NDC) on services
-    h <- Tab(RC[["hcpcs.tbl"]]) |>
-      mutate(px = regexp_replace(upper(sql(RC[["hcpcs.proc"]])), "[^0-9A-Z]", ""))
-    h <- if (!is.null(RC[["hcpcs.ndc"]]))
-      h |> filter(px %in% IO_JCODES | ndclean(RC[["hcpcs.ndc"]]) %in% IO_NDC)
-    else h |> filter(px %in% IO_JCODES)
-    parts[[length(parts) + 1]] <- h |> transmute(ptid, io_dt = CDATE(RC[["hcpcs.date"]]))
-  }
-  Reduce(union_all, parts)
-}
-
-# ---- patient-flag scoping (patient flags are schema-verified) --------------
-pat <- Tab("patient")
-pat_scope <- function(flt) {                       # returns a ptid tbl, or NULL for cohort 1 (no scope)
-  if (is.null(flt)) return(NULL)
-  # Flag values CONFIRMED on the instance: market_clarity/integrated are 'Y'/'N'; idn_indicator is '0'/'1'.
-  # Cohort 4 = "Market Clarity IHD" = market_clarity='Y' AND idn_indicator='1' (NOT idn alone - that would add
-  # the ~23.6M market_clarity='N' IHD patients who are outside Market Clarity).
-  s <- switch(flt,
-    integrated = pat |> filter(str_trim(upper(integrated)) == "Y"),                                  # Cohort 2a
-    thirdparty = pat |> filter(str_trim(upper(market_clarity)) == "Y", str_trim(upper(integrated)) == "N"),  # Cohort 3 (~20.1M)
-    idn        = pat |> filter(str_trim(upper(market_clarity)) == "Y", str_trim(idn_indicator) == "1"))  # Cohort 4 (~76.2M); idn CONFIRMED 0/1
-  s |> distinct(ptid) |> compute()
-}
-
-# ---- shared EO objects (used by all cohorts/tables) ------------------------
-# metastatic (ICD-coded, Table 1a step 4)
-mets_icd <- Tab("diagnosis") |>
-  filter(str_trim(tolower(diagnosis_status)) == "diagnosis of", rl("upper(diagnosis_cd_type)", "^ICD"),
-         rl("upper(diagnosis_cd)", METS_RE)) |>
-  group_by(ptid) |> summarise(mdt = min(to_date(diag_date)), .groups = "drop") |> compute()
-# colon-concept neoplasm keys - attribute KEYED EO concepts (stage, TNM, mets) to the COLON primary via
-# neoplasm_histology_key, not just PTID (another primary's mets must not exclude a colon patient).
-colon_keys <- Tab("onc_neoplasm_histology") |>
-  filter(str_trim(tolower(neoplasm_qualifier)) == "actual", upper(str_trim(neoplasm_type)) %in% COLON_NEO) |>
-  distinct(neoplasm_histology_key) |> compute()
-# metastatic (EO onc_metastatic_location, Table 1b step 4) - distant-only, filter Mets Qualifier 'actual',
-# keyed to the colon primary.
-mets_eo <- Tab("onc_metastatic_location") |>
-  filter(str_trim(lower(mets_qualifier)) == "actual") |>
-  semi_join(colon_keys, by = "neoplasm_histology_key") |>
-  group_by(ptid) |> summarise(mdt = min(to_date(metastasis_dx_date)), .groups = "drop") |> compute()
-
-# step-4 mets source: EHR-ICD (1a) or EO (1b), plus claims mets for claims cohorts.
-build_mets <- function(variant, claims) {
-  base <- if (variant == "1a") mets_icd else mets_eo
-  if (claims && CLAIMS_OK) base <- union_all(base, cl_mets()) |>
-      group_by(ptid) |> summarise(mdt = min(mdt), .groups = "drop")
-  compute(base)
-}
-
-# EO stage (step 3) - identical for all cohorts. `base` = (ptid, surgery_date, first_dx).
-eo_stage <- function(base) {
-  keys <- Tab("onc_neoplasm_histology") |> semi_join(base, by = "ptid") |>
-    filter(str_trim(tolower(neoplasm_qualifier)) == "actual", upper(str_trim(neoplasm_type)) %in% COLON_NEO) |>
-    transmute(ptid, neoplasm_histology_key,
-              anchor = coalesce(to_date(neoplasm_dx_date), to_date(note_date))) |>
-    inner_join(base, by = "ptid")
-  posnodes <- Tab("onc_lymph_node") |> inner_join(base, by = "ptid") |>
-    mutate(nd = to_date(note_date)) |>
-    filter(str_trim(tolower(lymph_narrative)) == "positive lymph node", lymph_numeric > 0,
-           datediff(nd, first_dx) >= -30, datediff(nd, surgery_date) <= 90) |>
-    distinct(ptid) |> mutate(has_pos = 1L)
-  Tab("onc_tnm") |> select(neoplasm_histology_key, t, n) |>
-    inner_join(keys, by = "neoplasm_histology_key") |>
-    mutate(tnum = sql("try_cast(regexp_extract(t,'[1-4]',0) as int)"),
-           nnum = sql("try_cast(regexp_extract(n,'[0-9]',0) as int)"),
-           nraw = sql("regexp_extract(n,'[0-9]',0)")) |>
-    left_join(posnodes, by = "ptid") |> mutate(has_pos = coalesce(has_pos, 0L)) |>
-    filter(tnum >= 1, tnum <= 4,
-           (nnum > 0) | (tnum == 4 & nnum == 0) | ((nraw == "" | is.na(nnum)) & has_pos == 1L),
-           datediff(anchor, first_dx) >= -30, datediff(anchor, surgery_date) <= 90) |>
-    distinct(ptid, surgery_date, first_dx)
-}
-
-# EO dMMR / MSI-H (step 5) - identical for all cohorts. step4 = (ptid, surgery_date, first_dx).
-eo_dmmr <- function(step4) {
-  mp <- Tab("onc_neoplasm_histology") |> semi_join(step4, by = "ptid") |>
-    filter(str_trim(tolower(neoplasm_qualifier)) == "actual", !(upper(str_trim(neoplasm_type)) %in% COLON_NEO)) |>
-    distinct(ptid)
-  dmmr <- Tab("onc_biomarker") |> semi_join(step4, by = "ptid") |> anti_join(mp, by = "ptid") |>
-    filter(!(str_trim(lower(coalesce(biomarker_temporal_status, ""))) %in% c("plan","planned"))) |>
-    filter(sql(paste0(
-      "( (upper(biomarker) RLIKE 'MSI'",
-      " AND (lower(coalesce(narrative_result,'')) RLIKE 'high|unstable|positiv' OR upper(biomarker) RLIKE 'MSI-H'))",
-      " OR (upper(biomarker) RLIKE 'MLH1|MSH2|MSH6|PMS2'",
-      " AND (lower(coalesce(narrative_result,'')) RLIKE 'loss|lost|absent|deficien|mutat'",
-      " OR lower(coalesce(gene_characteristics,'')) RLIKE 'mutat|loss|deletion')) )"))
-    ) |> transmute(ptid, bio_dt = to_date(note_date))
-  step4 |> inner_join(dmmr, by = "ptid") |> filter(datediff(bio_dt, first_dx) >= 0) |>
-    distinct(ptid, surgery_date, first_dx)
-}
-
-# surgery (step 1) - structured Procedure, + Optum/3P claims procedure for claims cohorts. EO has no surgery
-# event (per the Optum documentation, colon surgery = hemicolectomy in the procedure table), so 1b keeps
-# structured Procedure too.
-# ⚠️ SURG NOTE: SURG_PCS matches ICD-10-PCS 0DT... ; the documented colon example also shows ICD-9-CM Vol-3
-# procedure codes (17.33 hemicolectomy) for older activity. If pre-ICD-10 procedure rows must count, add the
-# ICD-9-CM Vol-3 colectomy set to SURG_CODES - left out here because the RDQ surgery list is CPT/PCS/HCPCS.
-surgery_step1 <- function(fdx, claims) {
-  s <- Tab("procedure") |>
-    mutate(px = regexp_replace(upper(proc_code), "[^0-9A-Z]", ""), pdt = to_date(proc_date)) |>
-    filter(px %in% SURG_CODES | rl("px", SURG_PCS)) |> transmute(ptid, surgery_date = pdt)
-  if (claims && CLAIMS_OK) s <- union_all(s, cl_surg() |> rename(surgery_date = sdt))
-  s <- s |> semi_join(fdx, by = "ptid") |> distinct()
-  # accept either NA or NULL as "disabled" (README says NULL; the settings above default to a date or NA)
-  if (!is.null(STUDY_START) && !is.na(STUDY_START)) s <- s |> filter(surgery_date >= to_date(STUDY_START))
-  if (!is.null(STUDY_END)   && !is.na(STUDY_END))   s <- s |> filter(surgery_date <= to_date(STUDY_END))
-  compute(s)
-}
-
-# IO step 6 - EO onc_medications (EHR arm; +provider_notes NLP arm for 1b) + claims IO (Rx generic + J-code)
-# for claims cohorts. ALWAYS restrict the EO arm's data_source (never leave onc_medications unfiltered, or
-# claims-med rows would leak into cohort 1). io-after-dx, before mets.
-io_step6 <- function(step5, mets, provider_notes_ok, claims) {
-  srcs <- if (provider_notes_ok) c(MED_SRC, "provider_notes") else MED_SRC
-  eo <- Tab("onc_medications") |>
-    filter(str_trim(tolower(data_source)) %in% srcs) |>
-    filter(upper(str_trim(generic_desc)) %in% IO, str_trim(lower(action)) %in% IO_ACT) |>
-    transmute(ptid, io_dt = to_date(action_date))
-  allio <- if (claims && CLAIMS_OK) union_all(eo, cl_io()) else eo
-  allio |> inner_join(step5, by = "ptid") |> left_join(mets, by = "ptid") |>
-    filter(datediff(io_dt, first_dx) > 0, is.na(mdt) | datediff(mdt, io_dt) > 0) |>
-    distinct(ptid)
-}
-
-# entry (step 2 anchor). 1a = structured C18 dx, >=2 distinct dates (+claims C18 dx for claims cohorts);
-# 1b = EO colon neoplasm (>=1 actual concept; EO stays EO-native even for claims cohorts).
-build_fdx <- function(variant, claims) {
-  if (variant == "1a") {
-    base <- Tab("diagnosis") |>
-      filter(str_trim(tolower(diagnosis_status)) == "diagnosis of", rl("upper(diagnosis_cd_type)", "^ICD"),
-             rl("upper(diagnosis_cd)", COLON_ICD)) |>
-      transmute(ptid, dxd = to_date(diag_date))
-    if (claims && CLAIMS_OK) base <- union_all(base, cl_colon_dx())
-    base |> group_by(ptid) |>
-      summarise(first_dx = min(dxd, na.rm = TRUE), n_dx = n_distinct(dxd), .groups = "drop") |>
-      filter(n_dx >= 2) |> select(ptid, first_dx) |> compute()
-  } else {  # 1b entry: EO neoplasm. ⚠️ operationalised as >=1 actual EO colon-neoplasm date (NLP-confirmed,
-            # high precision), NOT the 1a ">=2 structured dx dates" rule - so 1a-vs-1b differences partly
-            # reflect this entry-rule difference. Flagged, not silently chosen.
-    Tab("onc_neoplasm_histology") |>
-      filter(str_trim(tolower(neoplasm_qualifier)) == "actual", upper(str_trim(neoplasm_type)) %in% COLON_NEO) |>
-      mutate(dxd = coalesce(to_date(neoplasm_dx_date), to_date(note_date))) |>
-      group_by(ptid) |> summarise(first_dx = min(dxd, na.rm = TRUE), .groups = "drop") |> compute()
-  }
-}
-
-steps <- c("1_surgery","2_newdx","3_stage","4_nomets","5_dmmr","6_io")
-
-# cohort specs: id -> (patient-flag scope, uses claims). Cohort 1 has no scope + no claims (== verified path).
-COHORTS <- list(
-  list(id = "1",  flt = NULL,         claims = FALSE),
-  list(id = "2a", flt = "integrated", claims = TRUE),
-  list(id = "3",  flt = "thirdparty", claims = TRUE),
-  list(id = "4",  flt = "idn",        claims = TRUE))
-
-# run one table variant ("1a"/"1b") across all four cohorts -> named list of 6-step vectors.
-run_variant <- function(variant) {
-  res <- list()
-  for (co in COHORTS) {
-    if (co$claims && !CLAIMS_OK) { res[[co$id]] <- setNames(rep(NA_integer_, 6), steps); next }
-    scope <- pat_scope(co$flt)
-    fdx <- build_fdx(variant, co$claims)
-    if (!is.null(scope)) fdx <- fdx |> semi_join(scope, by = "ptid") |> compute()
-    v <- integer()
-    s1 <- surgery_step1(fdx, co$claims); v["1_surgery"] <- np(s1)
-    s2 <- s1 |> inner_join(fdx, by = "ptid") |>
-      filter(datediff(surgery_date, first_dx) >= 0, datediff(surgery_date, first_dx) <= 183) |>
-      group_by(ptid, first_dx) |> summarise(surgery_date = min(surgery_date), .groups = "drop") |> compute()
-    v["2_newdx"] <- np(s2)
-    s3 <- eo_stage(s2) |> compute(); v["3_stage"] <- np(s3)
-    mets <- build_mets(variant, co$claims)
-    s4 <- s3 |> left_join(mets, by = "ptid") |>
-      filter(is.na(mdt) | datediff(mdt, surgery_date) >= 0) |> select(ptid, surgery_date, first_dx) |> compute()
-    v["4_nomets"] <- np(s4)
-    s5 <- eo_dmmr(s4) |> compute(); v["5_dmmr"] <- np(s5)
-    s6 <- io_step6(s5, mets, provider_notes_ok = (variant == "1b"), claims = co$claims) |> compute()
-    v["6_io"] <- np(s6)
-    res[[co$id]] <- v[steps]
-    cat(sprintf("  [%s cohort %-3s] 1:%s 2:%s 3:%s 4:%s 5:%s 6:%s\n", variant, co$id,
-                v["1_surgery"], v["2_newdx"], v["3_stage"], v["4_nomets"], v["5_dmmr"], v["6_io"]))
-  }
-  res
-}
-
-# ---- run + assemble --------------------------------------------------------
-cat("\n==================== TABLE 1a (coded EHR + EO) ====================\n")
-A <- run_variant("1a")
-cat("\n==================== TABLE 1b (Enriched-Oncology-led) ====================\n")
-B <- run_variant("1b")
-
-mask <- function(x) ifelse(is.na(x), "pending (preflight)",
-                    ifelse(x > 0 & x < 11, "<11", as.character(as.integer(x))))
-# Column labelling. Cohort 1 is the RDQ shell as written (1a = coded-EHR base; 1b = EO-led base, EO-pure).
-# Cohorts 2a/3/4 ADD a claims layer to the coded steps - by the cohort definition. For Table 1b this makes
-# those columns the "claims-enhanced 1b" (EO-led criteria + claims overlay) = the curated/sensitivity variant
-# per feasibility-answer §5.5, NOT the base EO-only 1b. The `_clmsEnh` suffix on the 1b claims columns makes
-# that explicit so the CSV is self-documenting; the base 1b is the `cohort1` column only.
-mk <- function(R, variant) {
-  cs <- if (variant == "1b") "_clmsEnh" else ""     # mark 1b claims cohorts as claims-enhanced (not base 1b)
-  out <- data.frame(step = steps,
-    cohort1                     = mask(R[["1"]][steps]),   # base (EO-pure for 1b)
-    x2a = mask(R[["2a"]][steps]),
-    x3  = mask(R[["3"]][steps]),                           # CANDIDATE (MC & non-integrated) - pending Optum #4
-    x4  = mask(R[["4"]][steps]),
-    stringsAsFactors = FALSE)
-  names(out)[3:5] <- c(paste0("cohort2a_optum", cs), paste0("cohort3_thirdparty", cs), paste0("cohort4_ihd", cs))
-  out
-}
-t1a <- mk(A, "1a"); t1b <- mk(B, "1b")
-
-cat("\n==================== RDQ-1 attrition - Table 1a (coded-EHR-led) ====================\n")
-print(t1a, row.names = FALSE)
-cat("\n==================== RDQ-1 attrition - Table 1b (Enriched-Oncology-led) ====================\n")
-cat("NOTE: cohort1 = base EO-only 1b (EO-pure). cohort2a/3/4 (`_clmsEnh`) = claims-ENHANCED 1b\n",
-    "     (EO-led criteria + Optum/3P claims overlay = the curated/sensitivity 1b variant, feasibility §5.5),\n",
-    "     NOT the base EO-only shell.\n")
-print(t1b, row.names = FALSE)
-cat("NOTE: claims IO (cohorts 2a/3/4, step 6) matches Rx generic + J-codes + RDQ appendix NDCs (clm_rx.ndc /\n",
-    "     clm_med_services.ndc). If the preflight logged 'no NDC column resolved', the NDC arm was skipped.\n")
-write.csv(t1a, "rdq1_attrition_table1a.csv", row.names = FALSE)
-write.csv(t1b, "rdq1_attrition_table1b.csv", row.names = FALSE)
-cat("\nwrote rdq1_attrition_table1a.csv and rdq1_attrition_table1b.csv\n")
-cat("\nNOTES before trusting counts:\n",
-    "* Cohort 1 (both tables): column-verified, runnable now.\n",
-    "* Cohort 2a/3/4: claims columns resolved by the preflight above (instance-confirmed); if it reported\n",
-    "  MISSING, those cells are 'pending (preflight)' - fix the column mapping (edit `need`) and re-run.\n",
-    "* Cohort 3 is a CANDIDATE (MC='Y' & INTEGRATED='N') pending Optum sign-off (docs/optum-gsk-questions.md #4);\n",
-    "  if Optum says it is not third party, Cohort 3 = n/a (collapses into Cohort 2).\n",
-    "* Cohort 4 = market_clarity='Y' AND idn_indicator='1' (idn confirmed 0/1); whether it also needs Optum-\n",
-    "  claims linkage vs the IHD flag alone stays an Optum item (question #7).\n",
-    "* Steps 3/5 are EO-derived for all cohorts; EO recall is limited (mets 0.60 / stage 0.81) -> possible\n",
-    "  false-exclusions (feasibility caveat, not a bug). ICD-9 claims colon codes (153.x) intentionally excluded.\n")
->>>>> FILE: R/README.md
-# R implementation — RDQ-1 colon EO attrition (Domino → Databricks, dplyr/dbplyr)
-
-R implementation of the RDQ-1 6-step attrition, for the **Domino R environment** connecting to the
-Databricks SQL warehouse over **DBI + odbc** (no Spark), driven with **dplyr/dbplyr**.
-It implements the **RDQ-1 Table 1a logic** (C18-only dx, 11 IO agents). The **modular `R/` path** and
-`../rdq1.R` produce **cohort 1 only**; the standalone **`../rdq1_full.R` now produces the full 2-table ×
-4-cohort matrix** — cohort 1 column-verified, and cohorts 2a/3/4 via a runtime **claims preflight** (see
-that file's header and the table below). A broader definition (C18/C19/C20 dx, 4 IO agents, cohort-4-only
-Enriched Oncology) will **not** reproduce Table 1a by design.
-
-> **STATUS: scaffolded — NOT run.** No data in this repo; every number is pending a Domino
-> run. Treat as a first draft to validate on the instance, not a finished/validated build.
-
-## Files
-| File | Role |
-|---|---|
-| `connect.R` | DBI/odbc connection helper (`mc_connect` — DSN + token via env vars, `bigint="numeric"`), table handle (`mc_tbl`), constants (catalog/schema/cut = `hive_metastore.clnprw_optum_mc_full_use.t_*_2025q4`, `MIN_CELL=11`), masking. |
-| `rdq1_code_lists.R` | RDQ-1 value sets as R objects (enumerated C18 regex, operative CPT + `0DT*`, non-operative HCPCS, 11 IO agents + J-codes, C77 toggle). |
-| `rdq1_colon_attrition.R` | the 6-step attrition (Table **1a**) as dplyr/dbplyr; `rdq1_attrition_table(con)` returns the masked cohort×step table. |
-| `smoke_test_fast.R` | **run this first** — quick validation on a small patient sample (seconds, not minutes): guards upstream failures per step and samples the population, so it confirms the dbplyr→Databricks translation + column names cheaply. |
-| `smoke_test.R` | fuller probe — prints the generated SQL (`show_query`) + per-step probes, but each probe runs a full `COUNT(DISTINCT ptid)` over the whole population (slow), so run it *after* `smoke_test_fast.R` passes. Each step is built inside a `build()` guard and gated on non-NULL upstreams, so a construction-time failure is reported per step rather than aborting the run. |
-
-**Standalone single-file scripts (repo root — no `source()`/helpers, for simple runs):**
-| File | Role |
-|---|---|
-| `../rdq1.R` | one flat script: cohort 1 **Table 1a** only — connect, 6 steps, print + CSV. |
-| `../rdq1_full.R` | **the full RDQ-1 matrix**: 2 tables (**1a** coded-EHR-led / **1b** EO-led) × 4 cohorts (**1** / **2a** Optum closed / **3** Third Party *candidate* / **4** Market Clarity IHD). Cohort 1 is column-verified and runnable now; cohorts **2a/3/4 add a claims layer gated by a runtime PREFLIGHT** that resolves the documented `clm_*` columns on the instance (procedure source resolved among `clm_med_procedure`/`clm_med_services`) and renders `pending (preflight)` if any required column is absent — never a guessed number. Cohort 3 = candidate `MC='Y' & INTEGRATED='N'` pending Optum #4. Writes `rdq1_attrition_table1a.csv` + `rdq1_attrition_table1b.csv`. See its header CAVEATS. |
-
-## Run (in Domino)
-```r
-Sys.setenv(DATABRICKS_DSN = "RWDE")     # or your DSN; token via DATABRICKS_PWD (project secret)
-source("R/smoke_test_fast.R")           # 1) validate translation + columns cheaply (sampled); run smoke_test.R only after this passes
-source("R/rdq1_colon_attrition.R")      # sources connect.R + rdq1_code_lists.R
-con <- mc_connect()                     # reads DATABRICKS_DSN / DATABRICKS_PWD
-tbl_1a <- rdq1_attrition_table(con, table_variant = "1a",
-                               include_c77 = TRUE, include_nonop_hcpcs = TRUE)
-print(tbl_1a)
-DBI::dbDisconnect(con)
-```
-Packages: `DBI`, `odbc`, `dplyr`, `dbplyr` (≥ 2.4, for the Databricks/Spark backend), `stringr`,
-`rlang`, `tibble` (+ `readr` to write CSV). Do **not** hard-code tokens — use `DATABRICKS_PWD`.
-Scripts resolve their own directory, so they work from the repo root, via `Rscript`, or interactively.
-
-## Baked-in assumptions (togglable; confirm with requestor)
-- `study_start`/`study_end = 2020-01-01 / 2025-12-31` (`RDQ1_STUDY_START`/`RDQ1_STUDY_END`) — the documented
-  study period, applied to the **surgery/index date** in step 1. ⚠️ Whether it should also restrict lookback
-  / other criteria (vs. allowing pre-2020 baseline) is an **open requestor decision**; the default constrains
-  only the index date. **All three R paths default to the 2020-01-01 → 2025-12-31 window**; to disable, set
-  either bound to `NULL` **or** `NA` (both are accepted in every path), or widen to change scope.
-- `include_c77 = TRUE` — RDQ criterion 4 lists C77.x/C78.x/C79.x. Can drop N+ regional patients.
-- `include_nonop_hcpcs = TRUE` — RDQ "as-requested" surgery; set `FALSE` for the surgery-only sensitivity.
-- index date = surgery date (form blank); ≥2-confirmed-dx entry; peri-op staging window `[first_dx−30, surgery+90]`.
-
-## Validate BEFORE trusting output (dbplyr can't be checked here) — use `smoke_test_fast.R` first, then `smoke_test.R`
-1. **Backend translation** — regex matching does **not** rely on `str_detect()` anymore. dbplyr only maps
-   `str_detect()`→`RLIKE` when it recognises the connection as a Spark/Databricks backend, and a DSN/ODBC
-   connection often isn't recognised (fails with *"Only fixed patterns are supported on database backends"*).
-   The pipeline therefore emits **native `RLIKE`** directly via the `rl()` helper. Only standard translations
-   remain (`str_trim()`→`TRIM`, and `to_date`/`datediff`/`regexp_extract`/`regexp_replace`/`try_cast`/RLIKE
-   pass through as Databricks SQL) — all backend-agnostic. Nothing to swap to `sql()`; it's already done.
-2. **`compute()`** — verify temp-table materialisation is permitted on the warehouse/DSN.
-3. **Column names / values** — confirm on this cut, for the fields the R Table-1a path actually reads:
-   `onc_tnm.{neoplasm_histology_key,t,n}` (CONFIRMED present via DESCRIBE), `onc_neoplasm_histology.{ptid,neoplasm_type,neoplasm_qualifier,neoplasm_histology_key,neoplasm_dx_date,note_date}`
-   (step-3 stage anchor = **`coalesce(neoplasm_dx_date, note_date)`**),
-   `onc_biomarker.{biomarker,narrative_result,gene_characteristics,biomarker_temporal_status,note_date}`,
-   `onc_lymph_node.{lymph_narrative,lymph_numeric,note_date}`, `onc_medications.{generic_desc,action,action_date,data_source}`,
-   and the **`onc_medications.data_source` VALUES** used to select the EHR med arm (a wrong value zeroes step 6).
-   (R Table-1a step 4 is **ICD-only**, so `onc_metastatic_location` is **not** read by R — that EO-mets overlay
-   is a Table-1b/sensitivity signal; confirm its fields only if you wire 1b.)
-4. **Cross-check cohort 1** against the RDQ-1 Table 1a definition (C18-only, 11 IO agents) — a broader
-   definition using C18/C19/C20, only 4 IO agents, and `use_onc` for cohort 4 only will **not** match
-   RDQ Table 1a by design. Reconcile cohort 1 first; do not reconcile cohort 2/2a until the R claims
-   union is wired (below).
-
-## Known gaps
-- **Table 1b** ("all variables from EO") is not wired in the modular `rdq1_colon_attrition.R` path
-  (`table_variant="1b"` errors), **but is implemented for cohort 1 in the standalone `rdq1_full.R`**
-  (dx from `neoplasm_dx_date`, mets from `onc_metastatic_location` keyed to the colon primary, IO incl. NLP).
-- **Step 5 is EO-biomarker-only** — R does **not** yet include the structured-Lab (LOINC) dMMR arm
-  (still a placeholder value-set anyway). So R step 5 may **undercount** dMMR/MSI-H until the biomarker
-  LOINC set is supplied; add the Lab arm before treating step 5 as complete.
-- **Cohorts 2a/3/4 (claims) — now wired in `../rdq1_full.R`, preflight-gated.** The modular `R/` path and
-  `../rdq1.R` still do **cohort 1 only**; `rdq1_full.R` adds the claims layer. Its claims columns are now
-  **instance-confirmed** (via live `DESCRIBE` / `SHOW COLUMNS` on the deployed cut — see the "Schema CONFIRMED"
-  section below), and a runtime **preflight** still resolves each `clm_*` field against the live column names
-  (CPT/HCPCS from `clm_med_services.proc_cd`, ICD-PCS from `clm_med_procedure.proc`) and renders
-  **`pending (preflight)`** if anything is absent — never a guessed number. The **claims date encoding** is
-  **CONFIRMED** ISO `date`-typed on the instance (`fst_dt` stringifies to `2024-08-09`), so `to_date` parses
-  directly; no format ambiguity remains.
-- **Cohort 3** (third-party claims) = **candidate** `market_clarity='Y' & integrated='N'` **pending Optum**
-  (question #4). If Optum says it is unenrolled Optum, not third party, Cohort 3 collapses into Cohort 2 → `n/a`.
-- **Cohort 4** = Market Clarity IHD, scoped by `market_clarity='Y' AND idn_indicator='1'` (idn confirmed
-  `0`/`1`); runs the same EO+claims pipeline. Open: whether Cohort 4 should require Optum-claims linkage vs the
-  IHD flag alone (Optum #7) — flagged in the script.
-- **Step 6 med source** — EO arm filtered to `onc_medications.data_source` (`proc`/`rx_presc`/`rx_adm`; +NLP
-  `provider_notes` for Table 1b). **Claims IO (cohorts 2a/3/4) matches `clm_rx` generic-name + the RDQ IO
-  J-codes** on `clm_med_services.proc_cd`, **plus the RDQ appendix NDCs** (`IO_NDC`, Table 3) matched on
-  `clm_rx.ndc` / `clm_med_services.ndc` (digit-normalized, so 10- and 11-digit forms both match). The NDC arm
-  auto-skips if the preflight can't resolve an `ndc` column (logged). ⚠️ If the instance stores NDC in a
-  different normalization than 10-/11-digit, confirm with `SELECT DISTINCT ndc … LIMIT` and adjust `IO_NDC`.
-- **ICD-9 claims colon codes (153.x)** intentionally **excluded** — the RDQ diagnosis list is ICD-10 C18 only;
-  a 153→C18 crosswalk would be inventing beyond the request (flagged, not silently mapped).
-- **Step 5 remains EO-biomarker-only** in `rdq1_full.R` too (no structured-Lab LOINC arm yet) — may undercount.
-
-## ✅ Schema CONFIRMED on the 2025q4 cut (deployed)
-Columns were verified live via `colnames(tbl(...))` on every table the pipeline reads (EO + structured +
-claims). Deployed columns are **UPPERCASE**; `mc_tbl()`/`Tab()` lowercase them (a lowercase reference against
-an un-lowercased handle throws `Object <col> not found` — that is the casing bug, not a missing column).
-Two names differed from the earlier assumptions — both fixed: **`procedure.proc_code`** (not `proc_cd`) and
-**`onc_medications.data_source`** (not `source`). Every other column matched, including:
-- **`diagnosis`**: `diagnosis_status`, `diagnosis_cd`, `diagnosis_cd_type`, `diag_date` (Table-1a entry).
-- **`onc_neoplasm_histology`**: `neoplasm_type`, `neoplasm_qualifier`, `neoplasm_histology_key`, `neoplasm_dx_date`, `note_date`.
-- **`onc_tnm`**: `t`, `n`, `neoplasm_histology_key` (+ `m`, `*_prefix/*_suffix`, `stage_prefix`).
-- **`onc_biomarker`**: `biomarker`, `narrative_result`, `gene_characteristics`, `biomarker_temporal_status`, `note_date` (also `numeric_result`, `test_name`).
-- **`onc_lymph_node`**: `lymph_narrative`, `lymph_numeric`, `note_date`.
-- **`onc_medications`**: `generic_desc`, `action`, `action_date`, `data_source` (also `drug_name`, `ndc`? **NO** — confirmed no NDC/J-code col).
-- **`onc_metastatic_location`**: `mets_qualifier`, `neoplasm_histology_key`, `metastasis_dx_date`.
-- **Claims (cohort 2/4 build)**: `clm_med_diagnosis.{diag,icd_flag,fst_dt}`, `clm_med_procedure.{proc,icd_flag,fst_dt}`,
-  `clm_med_services.{proc_cd,ndc,procmod*,fst_dt}`, `clm_rx.{gnrc_nm,ndc,fill_dt,days_sup}`,
-  `clm_derived_enrollment.{eligeff,eligend,medical_coverage_ind,pharmacy_coverage_ind}` — all present.
-
-## ✅ ICD-10-PCS surgery — RESOLVED (was a value-level gate)
-The structured `procedure` table carries **`proc_code` + `proc_code_type` (CPT/HCPCS)** and **no ICD-10-PCS** —
-so the `0DT*` PCS arm legitimately matches nothing in **cohort 1** (structured EHR). ICD-10-PCS resections live in
-**`clm_med_procedure.proc`** (with `icd_flag`), a **claims** table — i.e. the PCS surgery signal belongs to the
-**cohort 2/4 claims path**, not cohort 1. **Now wired in `../rdq1_full.R`**: claims surgery unions
-`clm_med_services.proc_cd` (CPT/HCPCS) **and** `clm_med_procedure.proc` (ICD-PCS `0DT…`). No action needed for cohort 1.
-
-## ✅ VALUE-level items CONFIRMED from the Optum data documentation
-Read out of the Optum data documentation (not inferred):
-- **`diagnosis_status = "Diagnosis of"`** — the documented domain is
-  *Possible diagnosis of, Other diagnosis status, History of, **Diagnosis of**, Invalid value, Not recorded*.
-  The filter uses exact `== "diagnosis of"` (case-normalised), so it correctly excludes "Possible diagnosis of".
-- **`diagnosis_cd_type` ∈ {ICD9, ICD10, Other, Unknown, SNOMED}** — the `^ICD` filter keeps ICD9/ICD10 and
-  drops SNOMED/Other, as intended.
-- **`neoplasm_qualifier = "actual"`** — a worked example shows both `actual` **and** `Actual` in one column →
-  the `str_trim(tolower(...))` hardening is required, not optional.
-- **dMMR/MSI-H = mutation in `MLH1, MSH2, MSH6, PMS2`** — stated verbatim: *"if a patient has a mutation in
-  any of the biomarkers among MLH1, MSH2, MSH6, PMS2, it can be inferred that they have dMMR/MSI-H."* Generic
-  `MMR` is not a documented term (correctly excluded). Biomarker data also live in the structured **Labs** table
-  → EO-biomarker-only step 5 may undercount until the Lab/LOINC arm is added (documented gap).
-- **`neoplasm_type` = the ORGAN/TISSUE (not the histology)** — documented as *"the organ or tissue where the
-  neoplasm forms, such as 'lung' for lung cancer"*, with the recommendation to *"limit the neoplasm field to the
-  target cancer type, in addition to indexing patients from the structured Diagnosis table"* — exactly the code's
-  approach. **Only the organ/tissue *meaning* is documented** (examples are `lung`/`prostatic`); the exact colon
-  token is **not** stated, so `neoplasm_type = "colon"` is an inference — kept as a live check below. The `upper()`
-  compare makes casing moot regardless.
-- **`data_source` (medications) EHR arm = `proc`, `rx_presc`, `rx_adm`** — the documented structured-EHR sources
-  (Prescription/Administration/Procedure). The docs capitalise `Rx_presc`/`Rx_adm`, so `str_trim(tolower(...))` is
-  required. Claims sources are `clm_rx`, `clm_med_services` (cohort 2/4). Table 1a uses only the three EHR values.
-- **`action` values exist and are documented** — `started`/`stopped`/`is_on`/`suspended` (`is_on` = current-meds
-  list; `suspended`/`stopped` = discontinuation), plus `administered` and `filled`. ⚠️ The *values* are documented,
-  but **which** actions count as "use" — the code's exposure subset `administered/filled/started/is_on` (excluding
-  `stopped/suspended`) — is an **analytic/requestor assumption, NOT a documented rule** (kept as a live-check item).
-- **`mets_qualifier = "actual"`** (also `"absent"`) — the documented domain is `{actual, absent}` → filtering to
-  `actual` correctly excludes negated ("absent") metastasis mentions.
-- **TNM `t`/`n` value format** — `t ∈ {1a, 4d, ...}`, `n ∈ {0, 3c, x, ...}` (with separate prefix/suffix columns).
-  Validates the `regexp_extract(t,'[1-4]')` / `regexp_extract(n,'[0-9]')` logic and the `x`/missing-N → positive-node
-  fallback.
-
-## ⚠️ Still to CONFIRM on the instance (docs don't enumerate these) — `SELECT DISTINCT` / requestor
-- **`neoplasm_type` colon token** — docs confirm it's the organ name, but not that colon is stored as `colon`
-  (vs a synonym `colorectal`/`large intestine`). Low risk — `upper()`-safe — but it gates cohort entry, so verify.
-- **`action` exposure subset** — the action values are documented (above), but *which* count as "use"
-  (`administered/filled/started/is_on`, excluding `stopped/suspended`) is a **requestor/analytic assumption**, not
-  a documented rule — confirm with the requestor.
-- **`data_source` NLP value** (Table 1b only) — the note-derived medication source value (code assumes
-  `provider_notes`) is not in the documented structured-inclusion set; confirm before trusting the 1b IO arm.
-- **`narrative_result` MSI-H result strings** — the gene-mutation route above IS the documented dMMR/MSI-H
-  inference; the supplementary MSI test-result phrase match (`high|unstable|positiv`) remains best-effort.
->>>>> FILE: RDQ/RDQ-1/RDQ-1-feasibility-answer.md
-# RDQ-1 — how to answer it with the current Optum MC asset
-
-> **Request:** *"Colon cancer cohort exploration using Optum Market Clarity Enhanced Oncology
-> Dataset in the US"* (OneCDP 317023; Asset 53937, Colon cancer, Dostarlimab; AZUR-2).
-> Requestor: Jamie Heyward (Epidemiology); Analyst: Ben Ackerman; planned delivery 10-Jul-2026.
->
-> **This file analyses how to answer RDQ-1 from what the repository already contains.** It does
-> **not** contain counts — none can be produced from this git container (see §3).
-
----
-
-## 1. What RDQ-1 actually asks (faithful restatement)
-
-**Database / period.** GSK Optum Market Clarity (2007 → 2025-Q4). Study period **01-Jan-2020 → 31-Dec-2025**.
-
-**Population — a 6-criterion cohort** (identical inclusion logic stated twice, for an "EHR+Enhanced
-Oncology" and an "Enhanced Oncology" population):
-
-| # | Criterion | RDQ-1 code list |
-|---|---|---|
-| 1 | Colon-cancer **surgery** | the surgery code list (CPT + ICD-10-PCS + HCPCS) |
-| 2 | **Newly diagnosed** colon cancer **≤6 months (183 d)** before surgery | the enumerated C18 diagnosis codes (see §5.2; **not** a `^C18` prefix) |
-| 3 | Stage **T1–4 N1–2** or **T4 N0** (if N staging absent, # lymph nodes > 0) | — |
-| 4 | **No metastatic** diagnosis prior to surgery date | ICD-10 **C77.x, C78.x, C79.x** |
-| 5 | **dMMR+ or MSI-H** | — |
-| 6 | **IO use** any time after colon-cancer diagnosis and **before** metastatic diagnosis (before or after surgery) | the IO code list (11 IO agents w/ NDC + HCPCS) |
-
-**Outputs — two attrition tables, each across four data-source cohorts (columns):**
-
-- **Table 1a** — attrition where criteria **leverage EHR codes + enhanced oncology** (steps 1, 2, 4, 6 tagged "[from EHR]"; stage and dMMR from enhanced oncology).
-- **Table 1b** — attrition where criteria **leverage all variables from enhanced oncology** (the same six steps, derived from the NLP/enriched-oncology layer).
-  - ⚠️ **"All from EO" is not literally achievable for every step.** Enhanced Oncology covers
-    neoplasm/histology, stage/TNM, metastasis, biomarkers and oncology medications — but **there is no EO
-    "surgery event" source**: the repo (and standard practice) derives surgery from the structured
-    `Procedure` table (`question-to-table-mapping.md`; `caseA_colon.sql` step 1). So the **step-1 surgery
-    row of Table 1b** still needs structured Procedure (or a requestor-agreed EO surrogate) — flag it as
-    "not directly EO-only." Treat Table 1b as "EO-derived **where EO holds the concept**," not end-to-end EO.
-
-Cohort columns (both tables):
-
-| Col | RDQ-1 definition |
-|---|---|
-| **Cohort 1** | EHR + physician notes + enriched oncology (**agnostic to claims**) |
-| **Cohort 2 (2a)** | + linked **Optum** Medical & Rx (closed) claims |
-| **Cohort 3** | + linked **Third-Party** Medical & Rx claims |
-| **Cohort 4** | **Market Clarity IHD** |
-
-**Index date** — not specified in the request (open item, see §5.7).
-
----
-
-## 2. What we already have that answers most of it
-
-RDQ-1 is the **finalized version of "Case Study A"** that the repo was already built around. The repo
-therefore contains a **strong starting design and partial runnable scaffolding** — *not* a validated
-RDQ-1 analytic build. The reference pipeline is self-described as "design-complete, **execution-scaffolded**"
-(`lib_cancer_cohort.sql` header), the notebook is a **simplified demo** with placeholder credentials, and
-`PLAN.md` notes the six-source attrition / overlap / discordance is not a one-button output. With that
-caveat, the reusable pieces are:
-
-| Asset | What it gives RDQ-1 |
-|---|---|
-| `docs/case_studies/A-colon-dMMR-MSI.md` | The 6-step cohort spec, the data-source-cohort framing, the feasibility-commentary template, the overlap/discordance output. |
-| `sql/reference_pipeline/caseA_colon.sql` | The **reference / scaffolded** 6-step attrition design (steps 1→6) as parameterized SQL (generic Case A; code-correctness fixes applied — see §8). |
-| `notebooks/caseA_colon_attrition_databricks.py` | A runnable Databricks notebook producing the attrition table across the source cohorts. |
-| `sql/reference_pipeline/code_lists.sql` | Value sets (colon ICD, colectomy CPT/PCS, IO/chemo drugs + J-codes, dMMR/MSI lab set). |
-| `sql/reference_pipeline/lib_cancer_cohort.sql` | Shared cohort-entry, staging, mets, dMMR, drug-exposure flags; the per-cohort source-layer switch. |
-| `docs/data-model-reference.md` | The deployed schema is **mapped**: `hive_metastore.clnprw_optum_mc_full_use`, cut `2025q4`, tables `t_<name>_2025q4` (52 tables). Each criterion's table/field is identified. |
-| `docs/question-to-table-mapping.md` | Per-criterion table → field → derivation → layer → capture caveat. |
-
-So the methodology, the schema mapping, and the query skeleton exist as a **draft**. What is **not** done
-is (a) running it against live data; (b) the requestor decisions in §5 (C77, index date, HCPCS, a/b split);
-and (c) the **VALUE-level confirmations in §8** (ICD-10-PCS coverage; the categorical filter values). The
-column names are **confirmed** on the deployed cut (§8 — including `data_source`, `proc_code`, `onc_tnm`),
-and the code-correctness items are resolved. Treat this as a validated cohort-1 build pending a live run,
-not a finished full-matrix build.
-
----
-
-## 3. Can we produce the numbers right now? — honest answer: **no**
-
-- This is the **git repository**, not the Databricks workspace. The notebook's `HOST` / `HTTP_PATH` are
-  placeholders (`adb-XXXX…`), and the pipeline is labelled **"design-complete, execution-scaffolded"**
-  (`lib_cancer_cohort.sql` header). There is **no patient data in this container.**
-- Producing the tables requires **running** the RDQ-1 build inside the licensed Databricks workspace
-  (`adb-2026261073024158…`, per `data-model-reference.md`) against the `2025q4` cut. Runnable paths:
-  the **standalone `rdq1_full.R`** (single file — the **full 2-table × 4-cohort matrix**: Tables 1a/1b ×
-  cohorts 1 / 2a / 3-candidate / 4, with a runtime claims preflight), or `rdq1.R`
-  (cohort 1, Table 1a only), or the modular **`R/rdq1_colon_attrition.R`** (cohort 1, Table 1a). The
-  `sql/reference_pipeline/rdq1_colon.sql` is a Trino/Athena reference (port `assert_true`/`date_add`
-  to Spark first). (The generic `caseA_colon_attrition_databricks.py` will **not** reproduce Table 1a.)
-- Per the request's own governance and the repo convention, small cells (1–10) are suppressed
-  (`MIN_CELL=11`, shown `<11`).
-- **No counts are stated or estimated in this document.** The cells stay `[to populate on run]`.
-
----
-
-## 4. Non-standard choices & embedded assumptions in RDQ-1 *itself*
-
-Separately from "does it match our pipeline" (§5), several things RDQ-1 specifies are **not standard
-RWD/epidemiology practice**, or are **assumptions the request leaves unstated**. These are inherent to the
-request as written and should be surfaced to the requestor regardless of how we implement — each is graded
-by where it could **bias the cohort**. Everything below reflects the request as written and the Optum data
-realities documented in `docs/data-model-reference.md`.
-
-### Internally inconsistent / clinically questionable
-- **(A) C77.x in the metastatic exclusion can conflict with an N+ cohort.** C77 = *secondary malignant
-  neoplasm of lymph nodes*; it **can overlap with the regional nodal (N+) disease the cohort is trying to
-  retain** (criterion 3 deliberately selects **N1–2**). It is not the case that every C77 code is regional —
-  but excluding C77 wholesale risks dropping target patients. *(→ decision in §5.1.)*
-- **(D) Lymph-node count used as an N-stage proxy.** "In absence of N staging, no. of lymph nodes is >0"
-  substitutes a node *count* for N stage. The `onc_lymph_node` table is **stand-alone (no
-  `neoplasm_histology_key`)** and carries `lymph_numeric` (a node **count** that may be
-  positive/negative/**or** biopsied nodes — **not** unambiguously "# positive") and
-  `lymph_numeric_scale` (# **examined**) — conflating "nodes >0" with "positive nodes >0" would misclassify
-  node-negative resections as N+. Recall-limited and attribution-ambiguous for multi-primary patients.
-- **(J) The surgery list includes non-surgical HCPCS.** Per the code list's **own descriptions**, these
-  include screening colonoscopy (G0105/G0120/G0121), disease-status/demonstration codes (G9084–G9089,
-  G9659/G9660…), and history-of-colectomy / CRC-registry codes (G9711, M1295). These are **not operative
-  events** and would inflate step 1. *(The code descriptions come from the RDQ code list itself; whether to
-  keep them is a **clinical/coding-review** decision — see §5.4.)*
-- **(I) The IO list is broad for the indication** *(clinical-review concern, not a document fact)*. The
-  list has 11 checkpoint agents including **ipilimumab (CTLA-4)** and several agents that are not part
-  of standard CRC regimens (avelumab, toripalimab, tislelizumab, cosibelimab). This is a clinical judgement,
-  flagged for confirmation: "any IO" ≠ "IO given for this colon cancer," especially with the
-  open-ended window in (H). RDQ-1 lists them, so the default is to include all 11.
-
-### Blind to known NLP under-capture (false exclusions)
-- **(E) Treats stage as a clean filter, but it is enrichment-derived and recall-limited.** Step 3 is
-  **not** `[from EHR]`-tagged in either table — stage comes from **EO TNM / lymph-node** capture in **both**
-  Table 1a *and* 1b. So the constraint is not "structured EHR staging is absent"; it is that **EO TNM
-  extraction is recall-limited** (NLP recall ≈0.81, AJCC edition not captured — `data-model-reference.md`),
-  and the lymph-node fallback (criterion 3's "# nodes >0") is itself stand-alone and recall-limited
-  (see (D)). Step 3 therefore attrits partly for *data-capture* reasons rather than biology — the binding
-  constraint the request doesn't acknowledge. (In the cohort **columns**, this bites wherever EO is thinner.)
-- **(F) Metastatic exclusion is ICD-coded (C77/78/79) — consistent for Table 1a, but under-detects.** This
-  is a per-table point, not a blanket "RDQ ignores EO mets": **Table 1a** leverages EHR codes, so an
-  ICD-only mets exclusion is internally consistent there; the concern is that ICD codes alone **cannot use
-  the EO note-derived metastatic-location evidence**, so some metastatic patients may be wrongly **retained**
-  in 1a. (Separately, EO metastasis extraction is itself recall-limited — Optum reports the **EO Metastasis
-  *concept* NLP recall ≈0.60**, `data-model-reference.md` "NLP model performance"; note this is the
-  EO-concept recall, **not** an ICD-code recall figure.) **Implementation (RDQ-1 path):** Table 1a step 4
-  is **ICD-only** (`flag_mets_rdq1` and R `rdq1_step4_nomets` use structured C77/78/79 alone) — faithful
-  to the `[from EHR]` tag; the **EO `onc_metastatic_location`** overlay is deliberately **excluded from 1a**
-  and reserved for **Table 1b** / a curated-sensitivity run (§5.5). (The *generic* Case A notebook/lib still
-  union the two — that's the generic demo, not the RDQ-1 1a column.)
-- **(G) "dMMR+ or MSI-H" with no result-interpretation rule.** The assay semantics are non-trivial and a
-  classic error source: MMR-IHC **"positive" = retained protein = proficient (must NOT count)**, whereas
-  **loss/absent/deficient = dMMR**; MSI **high/unstable = MSI-H**. Leaving "positive" undefined invites
-  miscounting in either direction. **In the repo:** both the notebook and the reference SQL apply this rule
-  correctly — `lib_cancer_cohort.sql` applies the per-concept rule in both the EO-biomarker and
-  structured-Lab arms, and `caseA_colon_attrition_databricks.py` excludes MMR "positive", so both paths agree.
-
-### Undefined / unstated assumptions
-- **(B) No ≥2-confirmed-diagnosis rule and no rule-out handling.** Single-code cancer identification is
-  non-standard; RWE convention (and `methodology-and-derivation.md`) requires **≥2 confirmed dx on
-  separate dates** to suppress rule-out/false-positive coding. As written, a single rule-out code qualifies.
-- **(C) "Newly diagnosed" with no clean-baseline washout.** "≤183 d before surgery" bounds the window
-  *forward* but sets no *backward* lookback to ensure the diagnosis is genuinely **incident** — prevalent or
-  recurrent disease can enter. (The repo's `caseA` step 2 adds an explicit pre-window washout; the request
-  omits it.)
-- **(H) The IO timing window is effectively open-ended.** "After diagnosis and prior to metastatic
-  diagnosis" — but criterion 4 already removes anyone with mets before surgery, and for never-metastatic
-  patients there is **no upper bound**, so IO administered far downstream (or for another indication) still
-  qualifies.
-- **(L) Index date is not specified** in the request, yet every temporal criterion (newly-dx window, IO timing,
-  mets-before-surgery) needs an anchor. *(→ §5.7.)*
-- **(M) Cohort 4 "Market Clarity IHD" is a different denominator.** IHD is the broad de-identified
-  individual-data universe — stacking it as a 4th column of the *same* attrition compares a different source
-  population against the EHR+EO cohorts (apples-to-oranges within one table).
-- **(N) Study period 2020–2025 on a 2007–2025 database — define the lookback rule.** *Conditional:* if
-  **all** input criteria are restricted to 2020+, patients operated early in the window have **truncated
-  lookback** (pre-surgery dx history, prior IO) — a left-truncation effect. If instead the study period
-  anchors only the **surgery/index** date and **pre-2020 data may be used for baseline/history**, the effect
-  is mitigated. The request doesn't state which — so **define explicitly whether pre-2020 data is in scope for
-  lookback**. *(Implemented — the code applies the study window to the **surgery/index date only**
-  (the mitigated reading): R `RDQ1_STUDY_START`/`RDQ1_STUDY_END` = 2020-01-01/2025-12-31 in step 1, and SQL
-  `params_rdq1.study_start`/`study_end`. Togglable (set to `NULL`/widen to restrict-all or disable). Pre-2020
-  lookback stays usable by default. Confirm the agreed lookback rule.)*
-- **(K) C18 subcodes only — omitting C18.1 (appendix) and C19/C20 (rectosigmoid/rectum).** Defensible for "colon,"
-  but the **C18.1 omission looks inadvertent** and the rectosigmoid boundary is an unstated scoping choice.
-- **(O) "Closed" Optum claims and the 2a/2b split are undefined.** Cohort 2 says Optum Medical & Rx
-  "(closed)" claims, and Table 1a's header shows "Cohort 2a" — neither the "closed" qualifier nor the a/b
-  distinction is defined in the request.
-
-> **Net:** items **A, D, J, F, G** can *change which patients are in the cohort* and deserve an explicit
-> requestor/clinical decision before any run; **B, C, E, H, L–O** are definitional gaps to pin down so the
-> numbers are interpretable. None of this blocks the *method* — but it does mean Table 1a/1b would encode
-> these choices, so they must be agreed, not assumed.
-
----
-
-## 5. Reconciliation: RDQ-1 (authoritative) vs. the current pipeline
-
-RDQ-1 supplies explicit code lists and a cohort layout that **differ** from the generic Case A model in
-the repo (which uses a looser colorectal definition). These must be reconciled **before** a run, and
-a few need a **requestor/clinical decision** — they are not the analyst's to silently change.
-
-> **Most of §5 is implemented** as flagged, togglable defaults (see §8) — the value sets, the C77 toggle,
-> the cohort remap, and the SQL corrections. What remains is the **requestor decisions** and a **live run**;
-> the sub-sections below give the rationale for each change.
-
-### 5.1 Metastatic-exclusion codes — **C77 conflict (decision needed)**
-- **RDQ-1 (criterion 4):** exclude **C77.x, C78.x, C79.x** prior to surgery.
-- **Current pipeline:** distant-only **C78–C79**, and **deliberately keeps C77** (secondary lymph-node
-  neoplasm) — see `lib_cancer_cohort.sql` `flag_mets` and `caseA_colon.sql` header.
-- **Why it matters:** the cohort is **locally advanced, N+ (T1–4 N1–2)**. C77 ("secondary malignant
-  neoplasm of lymph nodes") **can overlap with** the regional nodal disease the cohort is meant to retain,
-  so excluding C77 wholesale risks dropping target N+ patients. RDQ-1 resolves the repo's open question —
-  but in the **opposite** direction.
-- **Action:** confirm with the requestor. If C77 is truly to be excluded, change `flag_mets` to
-  `^C7[789]`. **Recommend flagging the clinical tension** (regional nodal disease ≠ distant metastasis)
-  before doing so.
-
-### 5.2 Colon diagnosis codes — **use the explicit enumerated list**
-- **RDQ-1 diagnosis code list:** an **enumerated list** — C18, C18.0, C18.2, C18.3, C18.4, C18.5, C18.6,
-  C18.7, C18.8, C18.9. Note **C18.1 (appendix) is *not* in the list**.
-- **Current pipeline:** `^C18|^C19|^C20` (colon **+ rectosigmoid + rectum**); notebook adds C19/C20.
-- **Action:** match the **exact enumerated diagnosis codes**, *not* a `^C18` prefix — a prefix
-  regex would silently re-include **C18.1**, which the list omits. So either enumerate the listed
-  subcodes or use a prefix-minus-C18.1 pattern. Confirm with the requestor whether the C18.1 omission (and
-  the exclusion of rectosigmoid/rectum C19/C20) is intentional before finalizing.
-
-### 5.3 IO agent list — **extend to all 11**
-- **RDQ-1 IO code list:** atezolizumab (J9022), avelumab (J9023), cemiplimab (J9119),
-  durvalumab (J9173), nivolumab (J9299 / J9289), pembrolizumab (J9271), ipilimumab (J9228),
-  dostarlimab (J9272), toripalimab (J3263), tislelizumab (J9329), cosibelimab (J9275) — **plus NDC codes**.
-- **Current pipeline:** `vs_drug` has 7 IO agents; the notebook's `IO_DRUGS` lists only 4 (pembro, nivo,
-  dostar, ipi).
-- **Action — bigger than adding value-set rows.** Today step 6 joins `flag_drug` → `vs_drug` **by generic
-  name only** (`generic_desc`), so honouring the RDQ IO list means: (i) add the **4 missing agents**
-  (avelumab, toripalimab, tislelizumab, cosibelimab) and the missing **J-codes** (J9289, J9023, J3263,
-  J9329, J9275); **and** (ii) **wire new NDC/HCPCS matching logic** — the pipeline has no NDC join path
-  today, and matching the listed NDCs requires sourcing an NDC field (claims `clm_rx`, or `onc_medications`
-  if it carries NDC) and a new match arm, not just new rows. Confirm whether **ipilimumab** (CTLA-4) counts
-  as "IO" here — RDQ-1 lists it, so default = yes.
-
-### 5.4 Surgery codes — **adopt the RDQ list; do not silently drop RDQ-listed codes**
-- **RDQ-1 surgery code list:** an **enumerated** CPT list (individual rows spanning 44139…44160, plus
-  45399 and the laparoscopic 44204…44238 rows — **discrete codes, not a numeric range**), ICD-10-PCS `0DT*`
-  resection codes, **and an HCPCS block**. *(Implement the exact listed codes; do not code a CPT range.)*
-- **Current pipeline:** a CPT subset + one PCS prefix (`0DT[E-Q]`).
-- **Caveat to raise:** the RDQ-1 HCPCS block mixes true procedures with **non-surgical** codes —
-  **screening colonoscopy** (G0105, G0120, G0121), **disease-status / demonstration** codes
-  (G2204, G9084–G9089, G9659/G9660, etc.), and **history-of-colectomy / CRC registry** codes
-  (G9711, M1295). Treating these as "colon-cancer surgery" would **inflate step-1** with screening and
-  history events.
-- **Action — present options, do not edit the RDQ code list away.** Because the deliverable is
-  RDQ-authoritative, the default is to **load the surgery code list verbatim, all codes included**. Then either:
-  1. produce an **as-requested run** (all listed codes) **plus a surgery-only sensitivity run** (CPT +
-     ICD-10-PCS resections, excluding the screening/history/disease-status HCPCS) so the inflation is
-     quantified rather than assumed; **or**
-  2. obtain **explicit requestor/coding sign-off** before excluding any RDQ-listed HCPCS from step 1.
-
-  Either way, **do not silently remove** RDQ-listed codes. (The non-surgical character of those HCPCS codes
-  is evident from the code descriptions themselves; the exclusion decision is the requestor's.)
-
-### 5.5 Cohort structure — **the big one (re-map columns)**
-- **RDQ-1:** enriched oncology + physician notes are present in **cohorts 1, 2 and 3** (they differ only by
-  the **claims** layer added: none / Optum / third-party); **cohort 4 = Market Clarity IHD**. Two tables
-  (1a EHR-codes-led, 1b all-enriched-oncology).
-- **Current pipeline:** models **enriched oncology in cohort 4 only** (`use_onc` true for `'4'`); cohorts
-  1–3 are claims/EHR-only and therefore **attrit to zero at steps 3 and 5** by construction.
-- **Why it matters:** under RDQ-1, steps 3 (stage) and 5 (dMMR/MSI-H) **should populate** in cohorts 1–3
-  (they have enriched oncology), so the current "claims-only cohorts go to zero" behaviour is **wrong for
-  this RDQ**. The columns also map to **breadth of linkage**, not presence/absence of enrichment.
-- **Action:** re-map the source-layer switch so EO is on for cohorts 1–3, the **claims UNION** distinguishes
-  them, and add the **two-table (1a/1b)** split (EHR-code-derived vs enriched-oncology-derived criteria).
-  This is the largest single change. **Note** the Table 1b "all-EO" surgery caveat from §1 (no EO surgery
-  source → step 1 still needs structured `Procedure`), and the cohort-source mapping and dMMR result rule
-  (§8) — both are handled as part of this re-map.
-- **Define Table 1b cleanly (don't blur the shell).** "All variables from enhanced oncology" means the base
-  Table 1b should derive each step from EO where EO holds the concept — **mets from `onc_metastatic_location`,
-  stage from EO TNM/nodes, dMMR from EO biomarker, IO from EO meds**. Where ICD/structured codes are added
-  on top (mets via C77/78/79; surgery via `Procedure`), that is a **curated/sensitivity variant of 1b**,
-  not the base 1b — **label it as such** so Table 1b still answers the RDQ shell as written. The two concepts
-  with no clean EO-only source are **surgery** (always structured `Procedure`) and the **mets ICD overlay**.
-
-### 5.6 Third-party claims (Cohort 3) — **candidate population found; pending Optum confirmation**
-Full instance investigation in **`RDQ/RDQ-1/cohort-3-third-party-investigation.md`**. Summary:
-- The deployed cut has **one `clm_*` claims layer** (of 52 tables) and **no per-claim source field**
-  (checked `payer_type`, `bus`, `paid_status`, `bill_type`, `member_detail.PRODUCT/ASO/CDHP/HEALTH_EXCH`,
-  `lab_results.source`, `insurance.INS_TYPE` — all payer/plan/adjudication, none is Optum-vs-third-party).
-- **But** the Patient table splits into `MARKET_CLARITY` / `INTEGRATED` / `IDN_INDICATOR` flags. A real
-  **~20.1M** population is `MARKET_CLARITY=Y & INTEGRATED=N` (has claims, no integrated coverage) — the
-  only plausible in-data basis for Cohort 3. Its Rx claims are adjudicated (~70% `PAID`) with real payers
-  but skew more to `Unknown` payer — **mixed signals**: looks like closed Optum claims with missing
-  enrollment, yet could be open/third-party. The data cannot decide.
-- **Action:** do **not** deliver a bare `n/a`. Render Cohort 3 as a **candidate `MC & non-integrated`
-  population pending Optum confirmation** (open question #4). If Optum confirms `MC=Y & INTEGRATED=N` =
-  third-party claims → build it as `market_clarity='Y' AND integrated='N'`; if they say those are
-  unenrolled Optum members → Cohort 3 collapses into Cohort 2 and renders `n/a`.
-
-### 5.7 Smaller confirmations
-| Item | RDQ-1 | Pipeline | Action |
-|---|---|---|---|
-| **≥2 confirmed dx dates** entry rule | not stated | required (RWE standard) | Document as an assumption; confirm acceptable. |
-| **Index date** | not specified | n/a | Ask requestor to define (surgery date? first dx?). |
-| **2a/2b/3a/3b split** | Table 1a header shows "Cohort 2a" | modeled broad vs strict | Confirm whether the a/b (continuous-enrollment) split is still wanted. |
-| **Peri-op staging window** | not specified | `[first_dx−30 d, surgery+90 d]` | Confirm window. |
-| **dMMR/MSI-H result rule** | "dMMR+ or MSI-H" (undefined) | both paths apply the assay-specific per-concept rule | ✅ Done — confirm the rule is acceptable. |
-| **Structured-Lab (LOINC) dMMR arm** | — | **SQL has the Lab-union arm scaffolded** (the `src_lab` arm of `flag_dmmr_msi`) with **placeholder LOINC** value-set (`code_lists.sql` `vs_biomarker_lab`); the **notebook does not union Labs at all** | Open: (a) supply the biomarker LOINC value-set to replace the SQL placeholders; (b) add the Lab arm to the notebook if used. |
-| **SQL EO mets table name** | — | deployed table is `onc_metastatic_location` | ✅ Confirmed — lib uses `onc_metastatic_location`. |
-
----
-
-## 6. Recommended path to the deliverable
-
-1. **Reconcile §4 and §5 with the requestor.** Most code lists are now *given* by the RDQ-1 request (removes
-   much of the prior "needs sign-off" risk). The genuine decisions left: **C77 inclusion** (§4.A / §5.1), the
-   **non-surgical HCPCS codes** (§4.J / §5.4), the **cohort re-mapping + 1a/1b split** (§5.5), the
-   **dMMR/MSI-H positivity rule** (§4.G), the **≥2-dx / washout entry rule** (§4.B–C), and **index date**.
-2. **Update the code lists & pipeline to the RDQ-1 lists verbatim** — ✅ **implemented** (§8): enumerated
-   C18 (`colon_rdq1`), the full surgery code list (operative + flagged non-op HCPCS), 11 IO agents + the
-   NDC/J-code table, and C77/C78/C79 as a togglable default. *(NDC/HCPCS match wiring + the requestor decisions
-   remain open.)*
-3. **Fix the code-correctness items** (SQL `onc_metastatic_location` name; per-concept dMMR result rule) —
-   ✅ **done** (§8); SQL and notebook agree.
-4. **Restructure the cohort columns** to RDQ-1's 4-cohort × 2-table layout — ✅ **done** in `rdq1_full.R`
-   (full matrix). Render **Cohort 3 as a candidate** (`market_clarity='Y' & integrated='N'`) **pending Optum
-   #4**, not a bare `n/a`; keep the Table 1b surgery row on structured `Procedure` (§1).
-5. **Run** the notebook/SQL in the Databricks workspace against `2025q4`; apply `MIN_CELL=11`.
-6. **Populate Table 1a / 1b**, then add the **cross-source overlap (Venn/UpSet)** and per-step capture %
-   that drive the feasibility narrative (`A-colon-dMMR-MSI.md`).
-7. **Write the feasibility commentary** against the RDQ business rationale — real-world treatment
-   effectiveness / tolerability / natural history, judged on longitudinality, completeness, accuracy, and
-   validatability.
-
----
-
-## 7. Scope guardrails (what answering this RDQ will *not* do)
-
-- **No invented counts.** Cells stay empty until a real run.
-- **No silent clinical redefinition.** C77 inclusion, the non-surgical HCPCS handling, the dMMR result
-  rule, and the cohort re-mapping are surfaced for decision, not changed quietly.
-- **No silent deviation from the RDQ code lists.** RDQ-listed codes are loaded **as written**; any narrowing
-  (e.g. surgery-only sensitivity) is an **explicit, separately-labelled** run or a signed-off decision —
-  never a quiet edit (§5.4).
-- **Cohort 3 (third-party claims)** is rendered as a **candidate** population (`market_clarity='Y' AND
-  integrated='N'`, ~20.1M) **pending Optum's provenance answer** (question #4) — not approximated, and not a
-  bare `n/a`. If Optum confirms it is not third party, Cohort 3 collapses into Cohort 2 → `n/a` (§5.6).
-- **Repo state is described accurately** — notebook vs SQL differences (dMMR rule, Lab arm, mets
-  table name) are called out (§8), not papered over.
-
----
-
-## 8. Implementation notes & known limitations
-
-The full RDQ-1 reconciliation is implemented in code. Decision-dependent items are encoded as **flagged,
-togglable defaults** (not silent choices), per §4/§5. Nothing has been run — validate on the instance
-before sign-off.
-
-### Value sets & cohort keying (`sql/reference_pipeline/code_lists.sql`)
-- `vs_cancer_icd 'colon_rdq1'` = enumerated C18 regex `^C18($|[.]?[02-9])` (excludes C18.1/C19/C20; §5.2).
-  Additive — the generic `colon` value set is untouched.
-- `vs_neoplasm 'colon_rdq1'` = colon. Step-3/step-5 concept keying is **neoplasm-only (site-defined)**:
-  `vs_cancer_icd.histology_note` is NULL and no `vs_histology` rows are defined, so `colon_rdq1` keys on
-  `neoplasm_type='colon'` alone. Colon is a site-defined cohort (unlike histology-dependent cohorts such as
-  NSCLC); site-only keying avoids adding an undocumented adenocarcinoma requirement and closes a cross-cancer
-  histology leak.
-- **IO agents:** the 4 previously-missing agents (avelumab/toripalimab/tislelizumab/cosibelimab) are in
-  `vs_drug`; the full 11-agent IO code list (NDC + J-code + brand, incl. nivolumab `J9289`) is in
-  `vs_rdq1_io_appendix` for the NDC/HCPCS match arm (§5.3).
-- **Surgery:** operative CPT/PCS as `vs_surgery 'colon_rdq1'`; the non-operative HCPCS
-  (screening/status/history) as `'colon_rdq1_hcpcs'`, included only when `include_nonop_hcpcs` (§5.4).
-
-### dMMR / MSI-H result rule (`sql/reference_pipeline/lib_cancer_cohort.sql`)
-- Applied **per-concept** in both the EO-biomarker and structured-Lab arms: MSI → `high|unstable|positiv`;
-  MMR genes → narrative `loss|lost|absent|deficien` **or** `gene_characteristics` `mutat|loss|deletion`.
-  MMR `positive` (retained protein = proficient) is **not** counted. Matches the notebook, R, and
-  `A-colon-dMMR-MSI.md`.
-- Only the 4 HGNC MMR genes (MLH1/MSH2/MSH6/PMS2) are used; the generic `MMR` term is not a stored value
-  and is not used. `biomarker_temporal_status = plan` is excluded.
-- The EO mets table is `onc_metastatic_location`.
-- The `narrative_result` value strings are not documented (they live in `ONC_NARRATIVE_RESULT_LU`) and are
-  used as best-effort proxies — confirm on instance.
-
-### RDQ-1 attrition build (`sql/reference_pipeline/rdq1_colon.sql`, Trino/Athena reference)
-- 6-step attrition mirroring `caseA_colon.sql`, with the RDQ-1 deltas: C18-only dx, C77-inclusive mets
-  (`flag_mets_rdq1`, togglable `include_c77`), EO on in cohorts 1/2a, cohort 3a = n/a, cohort 4 = IHD.
-  Baked-in assumptions (index = surgery date; C77; non-op HCPCS) are `params_rdq1` flags with inline provenance.
-- Cohort 2 uses lib cohort **`2a`** so the Optum-claims union fires (a bare `2` would run EHR-only). `use_onc`
-  is computed automatically (`cohort in ('1','2a','3a')` when `tumour='colon_rdq1'`), so cohorts 1/2a keep EO
-  stage/dMMR without a cross-file edit. Column labels come from lib's `params.cohort` (one source of truth).
-  Guards fail fast: `assert_true(table_variant='1a')`, `assert_true(tumour='colon_rdq1')`,
-  `assert_true(cohort in ('1','2a','4'))`.
-- **Table 1a fidelity:** step 4 mets is **ICD-only** (C77/78/79) — the EO `onc_metastatic_location` overlay
-  is reserved for Table 1b / a curated-sensitivity run. Step 6 uses **coded meds only** (the NLP
-  `provider_notes` source is excluded); the IO window is applied **per administration** (`ACTION_DATE` is
-  per-administration, so a valid later dose is not excluded by a per-patient global-min).
-- Step 2 washout filters `diagnosis_cd_type LIKE 'ICD%'`.
-- **Step 3 staging:** stage-window anchor = `coalesce(neoplasm_dx_date, note_date)` (stage-at-diagnosis links
-  via `neoplasm_dx_date`, falling back to the neoplasm `note_date`). The lymph-node fallback requires
-  `lymph_narrative = 'positive lymph node'` **AND** `lymph_numeric > 0` (`lymph_numeric` alone is ambiguous —
-  it may be positive/negative/biopsied nodes). Spark-safe: an empty `regexp_extract(...)` result is treated as
-  N-missing, not only NULL.
-- Value matching is **case-insensitive** (`trim(lower(...))` for `neoplasm_type`/`histology`; `upper()` for
-  `diagnosis_cd`) so data stored as `COLON`/`Colon` is not silently zeroed.
-- Step 1 matches on the **normalized `proc_cd`** value (`upper` + strip non-alnum) plus a `^0DT[E-Q]` PCS
-  regex arm, so a mislabeled/blank `proc_cd_type` cannot silently drop a real surgery. (Stricter type-gating
-  is available once the `proc_cd_type` spellings are confirmed.)
-- Medication filters use `ACTION='is_on'` (+ `filled`) and `DATA_SOURCE` values
-  `proc/provider_notes/rx_adm/rx_presc`.
-- The **1b "all-EO" re-sourcing** (dx/mets/IO from EO only, surgery still `Procedure`) is specified in
-  `rdq1_colon.sql` (R6-note) but **not built in the SQL path** — it is not shipped there as an untested
-  transform. (It **is** implemented for **cohort 1** in the standalone `rdq1_full.R`, which computes both
-  Table 1a and 1b; the 1b entry-rule change is flagged in that script's header.)
-- Reset/README updated (`00_reset.sql`, `sql/reference_pipeline/README.md`). `priority_tumour_counts`
-  excludes RDQ-specific tags (`tumour not like '%_rdq%'`) so `colon_rdq1` cannot leak into the generic
-  priority matrix and be double-counted.
-
-### R implementation (`R/`, Domino → Databricks via dplyr/dbplyr over ODBC, no Spark)
-- `connect.R`, `rdq1_code_lists.R`, `rdq1_colon_attrition.R` (Table 1a 6-step attrition), and `smoke_test.R`
-  (validate the dbplyr→SQL translation, incl. per-step probes, before the full run). Scaffolded — not run;
-  see `R/README.md`.
-- **Cohort coverage differs by R path.** The **modular `R/rdq1_colon_attrition.R`** (and `rdq1.R`) emit
-  **cohort 1 only** — their guard is a whitelist (`cohort != '1' → n/a`), so a claims cohort cannot be computed
-  under a mislabeled column. The **standalone `rdq1_full.R`** now wires the **full 4-cohort matrix**: cohorts
-  2a/3/4 add the Optum/third-party claims layer (surgery from `clm_med_services.proc_cd` + `clm_med_procedure.proc`,
-  colon dx + mets from `clm_med_diagnosis`, IO from `clm_rx` + J-codes), gated by a runtime **preflight** that
-  resolves the `clm_*` columns and renders `pending (preflight)` if any is absent. Cohort 3 is the candidate
-  `MC='Y' & INTEGRATED='N'` pending Optum #4; Cohort 4 = `market_clarity='Y' AND idn_indicator='1'`.
-- R step 5 is **EO-biomarker-only** (no structured-Lab dMMR arm yet), so it can undercount vs SQL until the
-  biomarker LOINC value-set is supplied.
-- EO mets uses `metastasis_dx_date`; step 5 applies the single-primary restriction and requires the biomarker
-  on/after first dx.
-
-### Dialect & runnability
-- `rdq1_colon.sql` / `caseA_colon.sql` are the **Trino/Athena reference**; the **runnable Databricks paths
-  are the notebook + R** (`assert_true`/`date_add` need porting to Spark to run the SQL on Databricks).
-
-### What `[from EHR]` means in Table 1a
-The RDQ tags steps 1/2/4/6 `[from EHR]` to distinguish **coded-data** steps from the **EO/NLP-derived** steps
-(3 stage, 5 dMMR). It does **not** mean "EHR-structured only, excluding claims": the **cohort** dimension is
-what adds claims breadth (cohort 1 = no claims; cohort 2a = + Optum claims). So for cohort 2a the coded steps
-legitimately use EHR **+ Optum claims** codes (`src_diag`/`src_proc`/claims meds); step 6 excludes only the
-NLP `provider_notes` source (NLP ≠ coded). Read the Table 1a step sources as "**coded data (EHR + the
-cohort's claims layer)**", not pure-EHR. (The standalone `rdq1_full.R` now **wires the claims layer** for
-cohort 2a — EHR + Optum claims on the coded steps; the modular `R/` path stays cohort-1 only, so use
-`rdq1_full.R` or the SQL path for cohort 2a.)
-
-### ✅ Schema confirmed on the deployed 2025q4 cut (via live `DESCRIBE`)
-Columns are UPPERCASE on Databricks (the R helper lowercases them). Two names differed from earlier
-assumptions and are fixed in code: **`procedure.proc_code`** (not `proc_cd`) and
-**`onc_medications.data_source`** (not `source`/`DATA_SOURCE`). `onc_tnm.{t,n,neoplasm_histology_key}`,
-`neoplasm_type`, and `onc_metastatic_location.{metastasis_dx_date,mets_qualifier,neoplasm_histology_key}`
-all confirmed present. So the `source`-vs-`DATA_SOURCE` gate is **resolved**.
-
-### VALUE-level items CONFIRMED from the Optum data documentation
-Read from the Optum data documentation (see `R/README.md` for the itemised list):
-- `diagnosis_status = "Diagnosis of"` (full domain enumerated), `diagnosis_cd_type ∈ {ICD9, ICD10, …}`.
-- `neoplasm_qualifier = "actual"` and `mets_qualifier ∈ {actual, absent}` → filtering to `actual` drops negated
-  mentions. Values appear in mixed case in the docs → `str_trim(tolower(...))` is required.
-- `neoplasm_type` is the **organ/tissue** (histology is separate); `data_source` EHR arm = `proc/rx_presc/rx_adm`;
-  the `action` value set is documented; dMMR/MSI-H = mutation in **MLH1/MSH2/MSH6/PMS2** (stated verbatim).
-
-### Still to confirm on the instance (docs don't enumerate these) — `SELECT DISTINCT`
-- **ICD-10-PCS surgery codes** — the `procedure` table is CPT/HCPCS; ICD-10-PCS resections live in claims
-  (`clm_med_procedure.proc`), a cohort-2/4 signal (resolved for cohort 1).
-- **Exact colon `neoplasm_type` token** — docs confirm it's the organ name, but not that colon is stored as
-  `colon` vs a synonym (`colorectal`/`large intestine`). `upper()`-safe; still a live check.
-- **`action` exposure subset** — the values are documented, but *which* actions count as "use"
-  (`administered/filled/started/is_on`, excluding `stopped/suspended`) is an **analytic/requestor assumption**, not
-  a documented rule.
-- **Table 1b–only values** — the NLP `data_source` value (code assumes `provider_notes`) and the planned-biomarker
-  flag (`plan`); plus the supplementary MSI-H `narrative_result` result strings (the gene route above is the
-  documented authority). A wrong value silently zeroes a step.
-- **Inferences flagged (not invented):** the colon neoplasm-only keying is extrapolated from the site-defined
-  lung worked example (no explicit "colon" cohort spec exists); the single-primary biomarker restriction is a
-  sound inference, not an explicit rule; the `tp_clm_*` third-party-claims table names are placeholders; which
-  `ACTION` values count as "use" is an undocumented inference.
-- **Biomarker LOINC value-set** for the structured-Lab dMMR arm is still a placeholder in `code_lists.sql` —
-  supply it to replace the placeholders (and add the Lab arm to R/notebook if used).
-
-### Still open
-Live run; requestor decisions (C77 direction, index date, HCPCS handling, a/b split, C18.1 / C19–C20 scope);
-the structured-Lab dMMR arm (step 5 is EO-biomarker-only); and the few remaining live-check values listed above
-(exact colon token, `action` exposure subset, the Table 1b–only `provider_notes`/planned/MSI-H strings).
-Confirm the code lists before any code list is signed off or run.
-
-**Claims cohorts 2a/3/4 — now implemented, not yet trusted.** `rdq1_full.R` produces the full 2-table ×
-4-cohort matrix: cohorts 2a/3/4 add the Optum/third-party claims layer behind a runtime **preflight** (which
-resolves the `clm_*` columns). The remaining gate is: **Cohort 3** provenance (Optum #4) and **Cohort 4**
-definition (Optum #7). *(Claims IO **NDC matching is now WIRED** — the RDQ appendix NDCs (Table 3) are matched
-on `clm_rx.ndc` / `clm_med_services.ndc`, digit-normalized, in addition to Rx generic name + J-codes; the arm
-auto-skips if the preflight can't resolve an ndc column. Claims **date-format** is **RESOLVED** — `*_dt` are ISO `date`-typed on the
-instance, so the parser's `to_date` path is exact.)* Note (d) the **Table 1b claims columns are labelled
-`_clmsEnh`** (claims-enhanced / curated variant, not the base EO-only 1b — §5.5). The modular `R/` path stays
-cohort-1 only and is the trusted Table 1a path.
->>>>> END
-
-
-"""
-Extract rdq1_transfer.txt back into files.
-
-Usage:
-    python rdq1_extract.py [bundle.txt] [output_dir]
-
-Defaults: bundle = rdq1_transfer.txt, output_dir = current directory.
-
-UTF-8 text; each file's content sits between a '>>>>> FILE: <path>' marker line
-and the next marker. This extractor:
-  * reads tolerant of LF, CRLF or CR line endings (a Windows checkout that
-    converted endings still extracts cleanly);
-  * writes every file as UTF-8 with LF endings in binary mode (no platform
-    translation, nothing doubled);
-  * rejects absolute paths and '..' segments (writes only under output_dir).
-Pure standard library, Python 3.x.
-"""
-import sys, os
-
-MARK = ">>>>> FILE: "
-END  = ">>>>> END"
-
-def main():
-    bundle  = sys.argv[1] if len(sys.argv) > 1 else "rdq1_transfer.txt"
-    out_dir = sys.argv[2] if len(sys.argv) > 2 else "."
-    if not os.path.isfile(bundle):
-        print("ERROR: bundle not found:", bundle); sys.exit(1)
-    with open(bundle, "r", encoding="utf-8") as fh:
-        lines = fh.read().splitlines()          # handles \n, \r\n, \r
-    path, buf, count = None, [], 0
-    def flush():
-        nonlocal count
-        if path is None: return
-        parts = [p for p in path.replace("\\", "/").split("/") if p not in ("", ".")]
-        if os.path.isabs(path) or any(p == ".." for p in parts) or not parts:
-            print("  SKIP unsafe path:", path); return
-        target = os.path.join(out_dir, *parts)
-        parent = os.path.dirname(target)
-        if parent: os.makedirs(parent, exist_ok=True)
-        content = "\n".join(buf) + "\n"          # LF endings + trailing newline
-        with open(target, "wb") as out:          # binary -> no CRLF translation
-            out.write(content.encode("utf-8"))
-        print("  wrote", target, "(%d lines)" % len(buf))
-        count += 1
-    for line in lines:
-        if line.startswith(MARK):
-            flush(); path = line[len(MARK):].strip(); buf = []
-        elif line.strip() == END:
-            flush(); path = None
-        elif path is not None:
-            buf.append(line)
-    flush()                                      # handles a bundle with no END marker
-    print("done: %d files into %s" % (count, os.path.abspath(out_dir)))
-
-if __name__ == "__main__":
-    main()
+SELECT mr.PATID, mr.CLAIM_DT, mr.CLAIM_TYPE, mr.RAW_CODE_RAW AS RAW_CODE,
+       mr.CODE_TYPE, c.MED_ABBR AS MEDICATION, c.MED_CLASS AS MEDICATION_CLASS,
+       cast(NULL as int) AS DAYS_SUP
+FROM med_raw mr
+JOIN codes c ON c.PATID = mr.PATID AND c.CODE_TYPE = mr.CODE_TYPE AND c.CODE_N = mr.CODE_N
+JOIN win w  ON w.PATID = mr.PATID AND mr.CLAIM_DT BETWEEN w.INDEX_DATE AND w.OBS_END_DT
+UNION ALL
+SELECT rr.PATID, rr.CLAIM_DT, rr.CLAIM_TYPE, rr.RAW_CODE_RAW AS RAW_CODE,
+       rr.CODE_TYPE, c.MED_ABBR AS MEDICATION, c.MED_CLASS AS MEDICATION_CLASS,
+       rr.DAYS_SUP
+FROM rx_raw rr
+JOIN codes c ON c.PATID = rr.PATID AND c.CODE_TYPE = rr.CODE_TYPE AND c.CODE_N = rr.CODE_N
+JOIN win w  ON w.PATID = rr.PATID AND rr.CLAIM_DT BETWEEN w.INDEX_DATE AND w.OBS_END_DT
+ORDER BY PATID, CLAIM_DT, MEDICATION, CLAIM_TYPE;
