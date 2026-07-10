@@ -1,11 +1,9 @@
 # RDQ 317023 — Colon Cancer / Dostarlimab (AZUR-2) — Cohort Feasibility
 
-**Self-contained source of truth** for the cohort attrition feasibility. Pairs with the one code
-file **`R/rdq1_cohort1.R`** (dbplyr over ODBC to Databricks — no Spark). Everything needed —
-datasets, cohort structure, per-step logic, code lists, every live-data validation check and its
-observed result, every design decision, and the reproducible validation queries (EHR **and** claims,
-§10) — lives in this file. Nothing outside this md and its companion code file is required to read,
-reproduce, or run the pipeline.
+The deliverable is this file plus **`R/rdq1_cohort1.R`** (dbplyr over ODBC to Databricks, no Spark).
+Everything is here: datasets, cohort rules, per-step logic, code lists, validation results, decisions,
+and the SQL to reproduce them (§10). No other file is needed to read or run it. The one outside piece
+is `createInPersonalSchema()` — prod provides it, and only when `materialize=TRUE` writes tables (L5).
 
 - **Deployment:** `hive_metastore.clnprw_optum_mc_full_use`, tables `t_*_2025q4` (52 deployed).
 - **Study window:** 01-Jan-2020 → 31-Dec-2025. **Product:** Optum Market Clarity, Enhanced Oncology.
@@ -17,6 +15,12 @@ reproduce, or run the pipeline.
   (1a / 1b)** — 6 attrition funnels. `rdq1_run(con)` returns all 6; pass `cohorts=`/`variants=` to
   subset (e.g. `rdq1_run(con, cohorts="1")`). Cohorts 2a/3 add the `t_clm_*` claims arms (§3) on top
   of the notes+claims patient gate.
+- **`R/rdq1_check_v2_staging.R` and `R/rdq1_diag_q6b.R` are diagnostics, NOT part of the deliverable.**
+  `rdq1_check_v2_staging.R` is the **Q6 check** (still open — forces steps 3 & 5 to the enriched-onc
+  arm for *both* variants). `rdq1_diag_q6b.R` is the **Q6b check** — Q6b is **already resolved** (prod
+  switched to the patient-level tie = its arm B), so this one is historical/re-verification only. Both
+  source the main file and are `Rscript`-runnable. Production is still the single `R/rdq1_cohort1.R`;
+  delete `rdq1_check_v2_staging.R` once Q6 is decided, and `rdq1_diag_q6b.R` whenever you like.
 
 ---
 
@@ -25,13 +29,11 @@ reproduce, or run the pipeline.
 Two orthogonal dimensions produce the RDQ Table 1a / 1b grid.
 
 **Variant (table rows) — 1a vs 1b, additive:**
-- **1a = EHR structured codes + physician-notes NLP + `t_lab`**, WITHOUT enriched oncology.
-- **1b = 1a + enriched-oncology `t_onc_*`**, purely additive (every 1a source retained, `t_onc_*`
-  added on top) ⇒ **1b ≥ 1a usually holds**, but is *not strictly guaranteed at every step*: 1b's
-  extra dx source (`t_onc_neoplasm_histology`) can move the dx-linked index surgery to an earlier
-  one, and a different index shifts the later stage/mets/IO windows — so 1b can occasionally dip
-  below 1a at a downstream step. The 1a→1b delta = how many patients enriched oncology adds, largest
-  where codes are weak (staging, biomarker).
+- **1a = EHR codes + physician-notes NLP + `t_lab`**, no enriched oncology.
+- **1b = 1a + enriched-oncology `t_onc_*`** (every 1a source kept, `t_onc_*` on top). So **1b ≥ 1a**
+  usually — but not strictly at every step: 1b's extra dx source can move the index surgery earlier,
+  which shifts the later windows. The 1a→1b gap = what enriched oncology adds, biggest where codes are
+  weak (staging, biomarker).
 
 **Cohort column — 1 / 2a / 3, by claims linkage on `t_patient` (all flags `Y`/`N`, dict-defined):**
 
@@ -41,18 +43,18 @@ Two orthogonal dimensions produce the RDQ Table 1a / 1b grid.
 | **Cohort 2a** | + linked **Optum** Medical & Rx claims | `has_notes='Y' & market_clarity='Y' & integrated='Y'` |
 | **Cohort 3** | + linked **3rd-party** Medical & Rx claims | `has_notes='Y' & market_clarity='Y' & integrated='N'` |
 
-- **Notes gate uses `HAS_NOTES`, not `NOTES_ELIGIBLE`.** `t_patient` has two notes flags:
-  `NOTES_ELIGIBLE` (1/0 — the source *can* supply notes) and `HAS_NOTES` (Y/N — the patient
-  *actually has* ≥1 note-sourced record). They diverge (a patient can be eligible with no note on
-  file). "EHR + physician notes" needs notes *present* ⇒ gate on `HAS_NOTES='Y'`.
-- **Flag semantics:** `MARKET_CLARITY=Y` → has linked claims (Optum or partner); `INTEGRATED=Y` →
-  Optum-sourced claims (3rd-party = `MC=Y & INTEGRATED=N`); `ELIGIBILITY=Y` → claims enrollment
-  present. Nesting `EHR ⊇ MC=Y ⊇ Eligibility=Y ⊇ Integrated=Y`. Do **not** confuse `INTEGRATED`
-  (Y/N) with `IDN_INDICATOR` (1/0 — a different column).
-- **Monotonicity:** 1a→1b rows are monotonic on *population* (same patients, added ascertainment),
-  so 1b ≥ 1a holds at the step level in the common case — but not *strictly* at every step, because
-  the dx-linked index surgery is chosen per-variant (see above). Claims columns 1→2a→3 are **NOT**
-  monotonic — each is its own attrition on its own sub-population.
+- **Scope = these 3 cohorts only (signed off).** The *clarified* ask defines exactly Cohort 1 / 2a / 3.
+  An earlier version of the RDQ form carried a 4th column ("Cohort 4: Market Clarity IHD, closed") —
+  that column is **out of scope** and deliberately not implemented, per the clarified ask.
+- **Notes gate = `HAS_NOTES`, not `NOTES_ELIGIBLE`.** `t_patient` has both: `NOTES_ELIGIBLE` (1/0 —
+  source *can* supply notes) and `HAS_NOTES` (Y/N — patient *has* ≥1 note). They differ. "EHR + notes"
+  needs notes present, so gate on `HAS_NOTES='Y'`.
+- **Flags:** `MARKET_CLARITY=Y` = has linked claims; `INTEGRATED=Y` = Optum claims (3rd-party =
+  `MC=Y & INTEGRATED=N`); `ELIGIBILITY=Y` = enrollment present. Nested `EHR ⊇ MC=Y ⊇ Eligibility=Y ⊇
+  Integrated=Y`. Don't confuse `INTEGRATED` (Y/N) with `IDN_INDICATOR` (1/0 — a different column).
+- **Monotonicity:** 1a→1b is monotonic on population (same patients, more ascertainment), so 1b ≥ 1a
+  usually — not strictly, since the index surgery is picked per variant. Cohort columns 1→2a→3 are
+  **not** monotonic — each is its own attrition on its own sub-population.
 
 ---
 
@@ -104,37 +106,37 @@ Per-patient anchors: `surgery_date` (Step 1, = index) · `colon_dx_date` (Step 2
 **claims arm** (added for 2a/3).
 
 **Step 1 — Colon cancer surgery.**
-- 1a/1b → `t_procedure`: `proc_code ∈` surgery list (§4), match exact `proc_code`, study-window-bounded.
-- **Index = earliest DX-LINKED colectomy** (not merely the earliest colectomy): the builder returns
-  *all* qualifying surgeries, and step 2 pairs each with the colon dx and picks the earliest surgery
-  that has a newly-dx colon cancer in its 183-day lookback. Fixes the case where an early unrelated
-  colectomy (sharing the generic codes) would pin the index and drop the patient (D14).
-- claims (2a/3): `t_clm_med_services.proc_cd` (CPT/HCPCS) · `t_clm_med_procedure.proc` (ICD-PCS);
-  date `fst_dt`. (Inpatient facility procedures already land in `med_procedure`, so
-  `inpat_confinement` is not separately queried.)
+- 1a/1b → `t_procedure`: `proc_code ∈` surgery list (§4), exact match, in study window.
+- **Index = earliest DX-LINKED colectomy**, not just the earliest colectomy. The builder returns all
+  qualifying surgeries. Step 2 pairs each with the colon dx and picks the earliest surgery that has a
+  new colon dx in its 183-day lookback. This stops an unrelated early colectomy from pinning the index
+  and dropping the patient (D14).
+- claims (2a/3): `t_clm_med_services.proc_cd` (CPT/HCPCS) + `t_clm_med_procedure.proc` (ICD-PCS), date
+  `fst_dt`. Inpatient procedures already land in `med_procedure`, so `inpat_confinement` is skipped.
 
 **Step 2 — Newly diagnosed colon cancer ≤183 d before surgery.**
 - 1a → `t_diagnosis`: `diagnosis_cd ∈` colon set (un-dotted; **C181 excluded**),
   `diagnosis_cd_type='ICD10'`, `diag_date ∈ [surgery−183, surgery]`. `diagnosis_status` **not**
   filtered (near-uniform "Diagnosis of"; low-information).
-- 1b → also `t_onc_neoplasm_histology`: `neoplasm_type ∈ {colon, colorectal, sigmoid}`,
-  `neoplasm_qualifier='actual'`, anchor `note_date`.
+- 1b → also `t_onc_neoplasm_histology`: `neoplasm_type ∈ {colon, colorectal, sigmoid, cecum}`
+  (substring match; `ascending/transverse/descending colon` already contain "colon"; **`cecum`** is
+  a separate term — see Vneo), `neoplasm_qualifier='actual'`, anchor `note_date`.
 - claims: `t_clm_med_diagnosis.diag` (colon set), date `fst_dt`. (Inpatient diagnoses already land
   in `med_diagnosis`.)
-- "Newly diagnosed" = **earliest colon dx that falls *inside* `[surgery−183, surgery]`**. Every dx
-  source is bounded to the study window `[2020, 2025]` first, and the orchestrator keeps only
-  in-window dx before taking the min — so pre-study (e.g. 2007) claims codes can neither anchor the
-  date nor exclude the patient. (Resolves §11 Q1.)
+- "Newly diagnosed" = **earliest colon dx inside `[surgery−183, surgery]`**. Every dx source is bounded
+  to `[2020, 2025]` first, then the orchestrator keeps only in-window dx before taking the min. So a
+  pre-study (e.g. 2007) claims code can't set the date or exclude the patient (Q1).
 
 **Step 3 — Stage T1–4 N1–2, or T4 N0 (if N absent, node-positive).**
 - 1a → `t_procedure` disease-status G-codes: **G9086** (t1-4,n1-2,m0 → T1-4N1-2 ✅), **G9085**
   (t4,n0,m0 → T4N0 ✅); G9084 does not qualify. *(Observed rarity: G9085≈11, G9086≈97 rows total.)*
 - 1b → `t_onc_tnm` (`T∈{1-4} & N∈{1,2}` OR `T=4 & N=0`); **N-absent fallback
   `t_onc_lymph_node.lymph_narrative='positive lymph node'`** (NOT `lymph_numeric>0`, which counts
-  negatives/examined). **`onc_tnm` is tied to the INDEX colon tumor per
-  Optum §4.3.2** — the colon neoplasm whose diagnosis note falls in the episode's 183-day newly-dx
-  window (`neoplasm_histology_key`), so a different colon primary's stage can't qualify; post-op
-  pathological staging of the same tumor still counts (tumor-ID, not stage-note windowing). See §11 Q5.
+  negatives/examined). **`onc_tnm` is tied to ANY of the patient's colon tumors** (`neoplasm_histology_key`
+  ∈ the colon-neoplasm key set) — a **patient-level colon tie**, not the exact index tumor. The tighter
+  Optum §4.3.2 episode-key tie was tested and dropped ~5.9× of staged patients to key fragmentation
+  (staging sits on the surgical-path key, not the pre-op-note key); for the ~99% single-colon-primary
+  patient the two are the same tumor. See §11 Q5/Q6b.
 - claims: G9085/G9086 in `t_clm_med_services.proc_cd` **only** — claims carry no structured TNM
   (limitation; notes-gated 2a/3 patients still have EHR/notes staging).
 - **All staging sources are bounded to the study window** `[2020, 2025]` (staging is episode-specific;
@@ -178,9 +180,10 @@ Per-patient anchors: `surgery_date` (Step 1, = index) · `colon_dx_date` (Step 2
   separately matched — the generic name is reliably populated, and the RDQ IO drugs are IV infusions
   rarely in retail Rx anyway, see §11 Q2; **PAID only** via `transaction_type`) +
   `t_clm_med_services` (`ndc`/`proc_cd` J-codes).
-- Window: **`io_date ∈ [colon_dx_date, mets_date)`** — left-closed (same-day-as-dx IO counts as
-  "after dx"), right-open (strictly before mets). Matches the code (`io_date >= colon_dx_date &
-  io_date < mets_date`); see §6 D16.
+- Window: **`io_date ∈ [colon_dx_date, mets_date)`**, also capped at `RDQ1_STUDY_END` — left-closed
+  (same-day-as-dx IO counts as "after dx"), right-open (strictly before mets), and bounded to the
+  study window on top like every other event source. Matches the code (`io_date >= colon_dx_date &
+  io_date <= RDQ1_STUDY_END & io_date < mets_date`); see §6 D16.
 
 **Tables touched per step:**
 
@@ -225,7 +228,8 @@ Observed values are embedded here (no external evidence files needed). Reproduci
 | ID | Target | Observed live result | Decision it drove |
 |---|---|---|---|
 | DESC | 14 EHR tables | columns match dict; Databricks returns UPPERCASE | `mc_tbl()` lowercases via `rename_with(tolower)` |
-| V1 | `t_procedure` | `proc_code_type` live value = **`CPT`** (dict says CPT4); `proc_code` present incl. `44140`≈60k, `J9271`≈425k, `G9085`≈11, `G9086`≈97; `neoplasm_type` top values null(63.5M), mammary, skin, prostatic, lung, **colon(10.5M)**, …, **colorectal(920k)**, **sigmoid(531k)** | match `'CPT'`; broaden colon tie to `{colon,colorectal,sigmoid}`; keep rare G-codes |
+| V1 | `t_procedure` | `proc_code_type` live value = **`CPT`** (dict says CPT4); `proc_code` present incl. `44140`≈60k, `J9271`≈425k, **`G9085`≈11, `G9086`≈97** (staging G-codes near-empty) | surgery matches **exact `proc_code`, no type filter** — the code list (CPT+PCS+HCPCS) is specific, so filtering on `proc_code_type` would only risk dropping a code stored under a different type label. (Optional: a `proc_code × proc_code_type` cross-tab would confirm no same-string collision.) Keep the G-codes but expect ~0 staging (Q6) |
+| Vneo | `t_onc_neoplasm_histology.neoplasm_type` | colon-region distinct patients: `colon` 805k, `colorectal` 213k, `sigmoid` 52k, `ascending colon` 40k, `transverse colon` 30k, **`cecum` 23k**, `descending colon` 14k; non-colon `small intestine`/`gastrointestinal`/`intestine` also present | colon tie = `{colon, colorectal, sigmoid, cecum}`. `ascending/transverse/descending colon` contain "colon" so are caught; **`cecum` does not — it was missing and is now added** (C18.0, right-side, dMMR-rich). `small intestine` etc. are not C18 → excluded |
 | V3 | `t_onc_biomarker` vs `t_biomarker` | MSI/MMR distribution is in `t_onc_biomarker.narrative_result`; `t_biomarker` returned ~no MSI/MMR rows; TNM category strings compact (`1`,`1a`,`2`,`4b`,`x`); free-text `stage` messy (`advanced`,`early stage`,`m0`–`m7`) | biomarker source = `t_onc_biomarker`; `substr(t/n,1,1)` logic; do **not** use `onc_stage.stage` as primary staging |
 | Vlab | `t_lab` | MSI/MMR test names: 4-antibody IHC panel `MLH1/PMS2/MSH6/MSH2 antigen` (~4,300 each) + `Microsatellite instability (MSI)` (~2,600); `test_result` vocab (uppercase) = `INTACT`(12.5k),`NEGATIVE`(6.8k),`null`(3k),`LOST`(1k),`EXPRESSED`(783),`POSITIVE`(631),`PERFORMED`(607),`SEE NOTE`(487) | `t_lab` = supplementary structured feed; separate `RDQ1_LAB_*` vectors; loss term = `LOST`; exclude ambiguous `NEGATIVE`/`POSITIVE` on proteins/MMR |
 | Vlymph | `t_onc_lymph_node`, `t_onc_medications` | `lymph_narrative ∈ {positive lymph node, negative lymph node, examined}`; `onc_medications.data_source` = claims (`clm_med_serv`,`clm_rx`) **and** non-claims (`proc`,`provider_notes`,`rx_adm`,`rx_presc`) | node fallback = `lymph_narrative='positive lymph node'`; IO filter to the 4 non-claims sources |
@@ -252,11 +256,10 @@ Observed values are embedded here (no external evidence files needed). Reproduci
 | | | MMR = `no loss of expression` | 15,204 |
 | | | protein = `positive` (MLH1 10,671; MSH6 10,019; MSH2 9,883; PMS2 8,212) — protein-`positive` means *present/intact*, so **excluded** | |
 
-Note the per-biomarker semantics: `positive` = MSI-High for the **MSI** biomarker (counted) but
-protein-present/intact for the **protein** biomarkers (excluded) — hence the parameterized matcher.
-A naive `status NOT IN (negative, equivocal)` rule would have wrongly counted MSI-`stable` (105k),
-MMR-`proficient` (24k), and protein-`intact` (~46k each) as positive. `t_biomarker` (legacy NLP)
-returned ~no MSI/MMR rows; `null` narrative_result is common (MMR `null` 114,065) and is not counted.
+Why the matcher is per-biomarker: `positive` means MSI-High for the **MSI** marker (counted) but
+present/intact for the **protein** markers (excluded). A naive "not negative/equivocal" rule would
+wrongly count MSI-`stable` (105k), MMR-`proficient` (24k), and protein-`intact` (~46k each). Legacy
+`t_biomarker` had ~no MSI/MMR rows; `null` narrative_result is common (MMR `null` 114,065), not counted.
 
 **V8-A2 interpretable-positive detail** (the only claims-lab rows that count toward step 5; the rest
 are placeholders `PRC`/`Comment`/`see note`/`Performed`/`TNP-###`, or negatives `NEGATIVE`/`Normal`/
@@ -276,7 +279,7 @@ Trap: `DETECTED`/`Not Detected` on a **mutation/variant** test means the OPPOSIT
 | D2 | Cohorts 1/2a/3 by `t_patient` claims flags | flag semantics (dict + V7) |
 | D3 | Notes gate = `HAS_NOTES='Y'` (not `NOTES_ELIGIBLE`) | needs notes present, not merely eligible |
 | D4 | Patient-level joins by `ptid` | attrition is patient-level |
-| D5 | `onc_tnm` staging tied to the **index colon tumor** (colon neoplasm diagnosed in the episode's 183-day window) via `neoplasm_histology_key` — **Optum EO manual §4.3.2** | staging is tumor-specific + episode-specific; post-op pTNM of that tumor still counts (tumor-ID, not note-time-windowing) |
+| D5 | `onc_tnm` staging tied at **patient-level to any colon tumor** (`neoplasm_histology_key` ∈ colon-neoplasm keys), incl. **cecum** | Q6b: the exact §4.3.2 episode-key tie dropped ~5.9× (key fragmentation, staging on the path key); patient-level colon = same tumor for ~99% single-primary |
 | D6 | Mets matched PATIENT-LEVEL, not colon-key-tied | RDQ criterion 4 (C77-79) is patient-level by design |
 | D7 | Colon dx = exact-set (C181 excluded); mets = 3-char prefix | RDQ appendix; ICD un-dotted |
 | D8 | Biomarker positive rule calibrated per source vocab | lenient matcher would miscount MSI-stable/MMR-proficient |
@@ -287,8 +290,9 @@ Trap: `DETECTED`/`Not Detected` on a **mutation/variant** test means the OPPOSIT
 | D13 | Step-5 claims-lab arm `tst_desc`-conditional (§3 step 5) | V8-A2: same result string flips meaning by test type |
 | D14 | Index = **earliest DX-LINKED colectomy** (earliest colectomy with a newly-dx colon cancer in its 183-day lookback), not the earliest colectomy; "newly dx" = earliest colon dx **inside** [index_surgery−183, index_surgery]; all dx, mets & staging sources bounded to the study window [2020, 2025] | RDQ index blank; recovers patients whose earliest colectomy is unrelated; prevents claims lookback reaching pre-study evidence |
 | D15 | `MIN_CELL=11`; materialize to `osk02156` via `createInPersonalSchema()` | disclosure control; personal-schema persistence |
-| D16 | IO window = `[colon_dx_date, mets_date)` (same-day-as-dx IO counts; strictly before mets) | "after dx" read inclusively; mets is the exclusion boundary |
+| D16 | IO window = `[colon_dx_date, mets_date)`, capped at `RDQ1_STUDY_END` (same-day-as-dx IO counts; strictly before mets; within study window) | "after dx" read inclusively; mets is the exclusion boundary; every event source bounded to [2020, 2025] |
 | D17 | Biomarker (step 5) stays **patient-level "ever"**, NOT study-window-bounded | MSI-H/dMMR is a stable tumor/germline trait; bounding could wrongly exclude a valid pre-window test |
+| D18 | A cohort column can dip below another at step 6 (e.g. c2a 1b s6=6 < c1 1b s6=7) — not a bug | 2a/3 add claims mets, so `mets_date` is earlier or equal; the `[dx, mets)` IO window is tighter, so IO after a claims-found mets is (correctly) excluded. Better mets detection → stricter "before mets" |
 
 ---
 
@@ -309,6 +313,16 @@ Trap: `DETECTED`/`Not Detected` on a **mutation/variant** test means the OPPOSIT
 
 ## 8. How to run
 
+**As a script (`Rscript`) — the file has a guarded entry point that runs the full grid:**
+```sh
+Rscript R/rdq1_cohort1.R                  # connects, runs all 6 funnels, materializes to personal schema
+RDQ1_MATERIALIZE=0 Rscript R/rdq1_cohort1.R   # same, but do NOT persist the step tables
+```
+Per-step counts stream to **stderr** (`[c1 1a] step 1 n=...`); the stacked table prints to **stdout**.
+The entry point only fires when the file is the top-level script — `source()`ing it (interactively or
+from the check scripts) just defines the functions.
+
+**Interactively:**
 ```r
 source("R/rdq1_cohort1.R")               # self-contained: connection + table helpers are included
 con  <- mc_connect()                     # global `con` (materialize=TRUE also needs the prod createInPersonalSchema())
@@ -316,6 +330,13 @@ both <- rdq1_run(con)                    # attrition counts for 1a + 1b
 both <- rdq1_run(con, materialize = TRUE, replace = TRUE)   # + persist step tables to osk02156
 print(both)
 rdq1_biomarker_values(con)               # helper: dump candidate MSI/MMR value strings to eyeball
+```
+
+**Diagnostics (Rscript-runnable, not part of the deliverable):**
+```sh
+Rscript R/rdq1_check_v2_staging.R        # v2 reading (Q6): forces steps 3 & 5 to enriched-onc for 1a too
+Rscript R/rdq1_diag_q6b.R                # Q6b: episode-tied vs any-colon-tumor staging (cohort 1)
+Rscript R/rdq1_diag_q6b.R 2a             # Q6b for cohort 2a
 ```
 
 Config toggles at the top of `R/rdq1_cohort1.R`: `RDQ1_STUDY_START/END`, `RDQ1_DX_WINDOW_DAYS=183`,
@@ -331,7 +352,26 @@ sensitivity analysis).
   all six steps, calibrated to the V8 findings (paid_status not filtered; Rx PAID-only; ICD-10 code
   match; claims staging = G-codes only; small `tst_desc`-conditional claims-lab MSI/MMR arm).
   `rdq1_run(con)` returns all 6 funnels (3 cohorts × 2 variants).
-- ⏳ **`rdq1_run(con)`** in Databricks — the only source of actual attrition counts (all cohorts).
+- ⏳ **`rdq1_run(con)`** in Databricks — the only source of real attrition counts.
+
+**First run — observed (BASELINE, before the cecum + patient-level-tie fixes; re-run will differ):**
+
+| funnel | s1 | s2 | s3 | s4 | s5 | s6 |
+|---|---|---|---|---|---|---|
+| c1 1a | 61,394 | 15,826 | 0 | 0 | 0 | 0 |
+| c2a 1a | 222,355 | 61,609 | 0 | 0 | 0 | 0 |
+| c3 1a | 5,167 | 1,556 | 0 | 0 | 0 | 0 |
+| c1 1b | 61,394 | 19,055 | 597 | 330 | 83 | **7** |
+| c2a 1b | 222,355 | 65,112 | 681 | 390 | 94 | **6** |
+
+What this run told us: (a) **`1a` step 3 = 0 everywhere** — structured/claims carry no TNM (Q6, data
+reality); (b) `1b` step 3 works but was tiny (597); (c) `s1` is equal across 1a/1b in a cohort (surgery
+is variant-free) and `1b` step 2 > `1a` step 2 (extra dx source) — both as expected; (d) cohort columns
+cross (c2a 1b s6=6 < c1 1b s6=7) — expected, see D18. These fixes came out of it (see change log §12).
+
+- **Q6b staging diagnostic** (`rdq1_diag_q6b`, cohort 1): `s2`=19,055, patients with a pre-op
+  colon-neoplasm note = 13,873, **episode-tied staging = 597, patient-level staging = 3,500 (5.9×)**.
+  → switched step 3 to the patient-level colon tie (D5, Q5/Q6b).
 - ○ **V6b** (optional) — confirm exact IO `generic_desc`/NDC strings; substring matcher already robust.
 
 ---
@@ -437,24 +477,32 @@ SELECT 'clm_rx.transaction_type', transaction_type, COUNT(*) FROM t_clm_rx_2025q
 
 -- V8-H  date sanity (confirm real date type + plausible range)
 SELECT CAST(MIN(fst_dt) AS STRING) min_dt, CAST(MAX(fst_dt) AS STRING) max_dt FROM t_clm_med_diagnosis_2025q4;
+
+-- V8-I  NDC stored-form probe (L3): which 11-digit padding do the 3 ambiguous 5-3-2 IO agents use?
+--   Whichever forms return rows are the ones to keep; prune the rest from RDQ1_IO_NDC.
+SELECT ndc, COUNT(*) n_rows, COUNT(DISTINCT ptid) n_pts
+FROM t_clm_rx_2025q4
+WHERE ndc IN ('70114034001','70114340001',   -- toripalimab
+              '72579012101','72579121001',   -- tislelizumab
+              '70095013001','70095130001')   -- cosibelimab
+GROUP BY ndc ORDER BY ndc;
 ```
 
 ---
 
 ## 11. Open questions & known limitations (validation pass)
 
-- **Q1 — "newly diagnosed" × claims lookback (RESOLVED).** Original flaw: only the *surgery*
-  builder was study-window-bounded; the colon-dx and mets builders took `min()` over **all
-  history**, so a cohort-2a/3 claims lookback to ~2007 could set `min(dx)`/`min(mets)` before the
-  window and wrongly exclude a legitimate in-study patient. **Fix (implemented):** both `rdq1_colon_dx`
-  and `rdq1_mets` now bound every source to the study window `[2020-01-01, 2025-12-31]`, and step 2
-  only considers colon dx **inside `[surgery−183, surgery]`**, taking the *earliest in-window* dx as
-  `colon_dx_date`. The qualifying dx is therefore always within the study period — 2007 can never
-  leak in. This matches the literal reading "newly diagnosed *within 183 days* prior to surgery."
-- **Q2 — IO via retail pharmacy is ~zero.** The RDQ IO drugs are all IV checkpoint inhibitors
-  (`-mab`/`-limab`), which are buy-and-bill infusions, not retail scripts. So the `t_clm_rx` IO arm
-  will capture little; the real claims IO signal is `t_clm_med_services` J-codes. The Rx arm is kept
-  (additive, harmless) but low-yield.
+- **Q1 — "newly diagnosed" × claims lookback (RESOLVED).** Bug: only the surgery builder was
+  window-bounded, so the dx/mets builders took `min()` over all history. A 2a/3 claims lookback to
+  ~2007 could set `min(dx)`/`min(mets)` before 2020 and wrongly drop a valid patient. Fix:
+  `rdq1_colon_dx` and `rdq1_mets` now bound every source to `[2020-01-01, 2025-12-31]`, and step 2
+  keeps only colon dx inside `[surgery−183, surgery]` (earliest in-window). So 2007 can't leak in.
+  - **Accepted trade-off (mets, step 4):** since mets is also window-bounded, a mets before 2020 does
+    not exclude an in-window surgery patient (2019 mets + 2020 surgery → kept). Deliberate — only
+    in-study mets can exclude.
+- **Q2 — IO via retail pharmacy is ~zero.** The RDQ IO drugs are IV checkpoint inhibitors
+  (buy-and-bill infusions), not retail scripts. So the `t_clm_rx` arm catches little; the real claims
+  IO signal is `t_clm_med_services` J-codes. The Rx arm is kept (harmless, additive) but low-yield.
 - **Q3 — biomarker is patient-level "ever" by design (RESOLVED as D17).** Steps 1-4 and staging are
   study-window-bounded (D14); **biomarker (step 5) is deliberately NOT** — MSI-H/dMMR is a stable
   tumor/germline trait, so a valid pre-window test still applies; bounding it could wrongly exclude.
@@ -462,32 +510,50 @@ SELECT CAST(MIN(fst_dt) AS STRING) min_dt, CAST(MAX(fst_dt) AS STRING) max_dt FR
 - **Q4 — claims diagnoses carry no status.** A work-up/"rule-out" C18 coded on a claim counts as a
   colon dx (claims have no `diagnosis_status`). Inherent claims limitation; the EHR side also does
   not filter status (it's low-information).
-- **Q5 — staging (step 3) is episode-tied per Optum §4.3.2 (IMPLEMENTED).** Optum's Enriched Oncology
-  manual §4.3.2 ("Stage at diagnosis") says to link the Stage/TNM concepts to `t_onc_neoplasm_histology`
-  via **`neoplasm_histology_key`** and identify the tumor by its diagnosis. The pipeline implements this:
-  the 1b `onc_tnm` staging is restricted to the **index colon tumor** — the colon neoplasm whose
-  diagnosis note falls in the index surgery's 183-day newly-dx window (`rdq1_colon_neo_dated` →
-  `episode_keys` → `semi_join(onc_tnm, by=c(ptid, neoplasm_histology_key))`). So a *different* colon
-  primary's stage no longer satisfies step 3.
-  - **This is tumor-identification, NOT stage-note time-windowing** — post-op **pathological (pTNM)**
-    staging of the same tumor (documented 70-120+ days after resection) still counts, because it
-    carries the same `neoplasm_histology_key`. This deliberately avoids the trap where a surgery-anchored
-    time window would drop valid node-positive/T4/delayed cases.
-  - **Residuals (documented limitations):** (i) the G9085/G9086 arm is colon-specific by code definition
-    but patient-level (no tumor key); (ii) the N-absent **lymph-node fallback** uses `t_onc_lymph_node`,
-    which has **no `neoplasm_histology_key`**, so the positive-node corroboration is patient-level and
-    can't be tumor-tied; (iii) identification uses `note_date` (reliable) rather than the partial-string
-    `neoplasm_dx_date`; a patient whose colon tumor has no onc-neoplasm note in the window contributes
-    no `onc_tnm` stage (relies on G-codes/lymph). Net effect: step-3 counts are episode-specific and may
-    be modestly lower than an any-colon-tumor tie — this is the intended Optum behavior.
-- **L1 — NOT YET EXECUTED.** The pipeline parses clean and every filter is calibrated to observed
-  values, but it has **not been run** against Databricks. dbplyr→Spark-SQL translation of the raw
-  predicates, `datediff`, and the union/semi-join chains is unverified until `rdq1_run(con)` runs.
-  No attrition counts are asserted anywhere.
+- **Q5 — staging (step 3) tie: patient-level colon (RESOLVED — replaced the strict §4.3.2 episode
+  tie).** Optum §4.3.2 links Stage/TNM to `t_onc_neoplasm_histology` via `neoplasm_histology_key`. We
+  first implemented the strict **episode** tie (onc_tnm restricted to the colon tumor diagnosed in the
+  index surgery's 183-day window). **Q6b measured it on live data and it dropped ~5.9× of genuinely
+  staged patients** (597 tied vs 3,500 patient-level, cohort 1). Cause = **key fragmentation**: 13,873
+  of 19,055 step-2 patients *had* a pre-op colon-neoplasm note, but the staging `onc_tnm` sits on a
+  *different* `neoplasm_histology_key` (the surgical-pathology record), so the exact `(ptid, key)` tie
+  failed. **Now tied patient-level to any of the patient's colon tumors** (`semi_join(onc_tnm,
+  colon-neoplasm keys)` — colon set includes **cecum**), which for the ~99% single-colon-primary patient
+  is the same tumor; a rare multi-primary could borrow another colon primary's stage (accepted). G-codes
+  and the lymph fallback were already patient-level. `rdq1_colon_neo_dated`/`episode_keys` are no longer
+  used by the pipeline (retained only by the `rdq1_diag_q6b` check).
+- **Q6 — do steps 3 (Stage) & 5 (biomarker) belong to `1a`, or only `1b`? (OPEN — scoping decision.)**
+  Observed in the first run: **`1a` step 3 = 0** for all cohorts (1/2a/3), but **`1b` step 3 is
+  healthy** (`c1 1b`=597, `c2a 1b`=681 — *pre-Q6b*; now patient-level, so ~6× higher on the next run).
+  The `1a` zero is data reality, not a missing code — `1a`
+  staging is only the disease-status G-codes **G9085/G9086**, which cover **~7–14 patients in the
+  whole database** (`RDQ/proc and neoplasm.txt`); structured EHR/claims carry no TNM. The RDQ form
+  reinforces this — it tags steps 1/2/4/6 as **`[from EHR]`** but **not** step 3 (Stage) or step 5
+  (dMMR/MSI-H). Two readings: **(#1, strict / current prod)** `1a` excludes enriched oncology, so `1a`
+  step 3 ≈ 0 is a legitimate finding (real numbers live in `1b`); **(#2)** staging/biomarker draw from
+  `t_onc_tnm`/`t_onc_biomarker` in *both* tables. `R/rdq1_check_v2_staging.R` implements #2.
+  **This is now purely a scoping choice for the requestor** — the `1b` path is confirmed working (NOT
+  a bug: independent code re-reads verified the `substr` T/N parse, the `n→n_val` rename, the
+  unions, and the 183-day window are all correct against the real `onc_tnm` vocabulary).
+  - **Q6b — episode-tie was over-restrictive (RESOLVED → patient-level, see Q5/D5).** The steep `1b`
+    step-2→step-3 drop is a data-availability signature: claims inflate step 2 but add **zero** `onc_tnm`
+    rows (`c1→c2a` step 2 +46,057 while step 3 moved only +84). The Q6b diagnostic (`R/rdq1_diag_q6b.*`)
+    confirmed the exact-key tie was the culprit — **A(episode-tied)=597 vs B(patient-level)=3,500, 5.9×**,
+    with `s2`=19,055 and `step3_tied`=597 both reproducing the prod run. Step 3 was switched to the
+    patient-level colon tie, so the next run's `1b` step 3 (and the whole downstream funnel) should rise
+    ~6×, with the **cecum** fix on top (`cecum`≈23k pts was missing from the colon matcher).
+- **L1 — PARTIAL RUN OBSERVED; full validation still pending.** A first `rdq1_run(con)` executed in
+  Databricks and returned counts, so the dbplyr→Spark-SQL translation, `datediff`, and union/semi-join
+  chains **do run** (no translation error seen). Observed so far: all three `1a` funnels, `c1 1b`
+  (full), and `c2a 1b` through step 3. **Still pending:** `c2a 1b` steps 4–6, all of `c3 1b`,
+  `rdq1_run_v2(con)`, the Q6/Q6b decision and diagnostic, and a clean final full-grid pass. Treat the
+  observed values as a first look — **no counts are asserted in this file.**
 - **L2 — masked vs raw N.** `rdq1_run()` output carries both raw `n` and suppressed `n_display`
   (`MIN_CELL=11`). Share `n_display`; treat raw `n` as internal.
 - **L3 — `t_clm_rx.ndc` is Char(20)** vs the 11-digit `RDQ1_IO_NDC` list; the `gnrc_nm` substring is
-  the primary Rx match, so NDC format mismatch (if any) is low-impact.
+  the primary Rx match, so NDC format mismatch (if any) is low-impact. For the three 5-3-2 agents
+  (toripalimab/tislelizumab/cosibelimab) the 10→11-digit padding is ambiguous, so the list carries
+  **both** 11-digit forms; confirm the stored form on the instance (`SELECT DISTINCT ndc …`) and prune.
 - **L4 — `createInPersonalSchema()` env-var mismatch (affects `materialize=TRUE` only).** The helper
   checks table *existence* against `Sys.getenv("DOMINO_USER_NAME")` but *writes* to
   `Sys.getenv("DOMINO_STARTING_USERNAME")`; if those differ, an existence check could target a
@@ -500,12 +566,34 @@ SELECT CAST(MIN(fst_dt) AS STRING) min_dt, CAST(MAX(fst_dt) AS STRING) max_dt FR
 
 ---
 
-*Maintainer note: append to §5 for each new value-check and §6 for each design decision so this file
-stays the single, self-contained source of truth.*
+## 12. Change log (QC pass)
+
+What we checked, decided, and changed. Newest first.
+
+- **Cecum added to the colon matcher.** Live `neoplasm_type` showed `cecum` (23k pts) was dropped — it
+  has no "colon" substring. Added `CECUM` (Vneo, D5). Right-side, dMMR-rich, so it lifts steps 2/3/5.
+- **Step-3 staging → patient-level colon tie.** Q6b showed the exact-key episode tie kept only 597 of
+  3,500 stageable patients (5.9×), from key fragmentation. Dropped the tie (D5, Q5/Q6b).
+- **First `rdq1_run` executed** (see §9). Confirmed SQL runs; found `1a` step 3 = 0 (no structured TNM)
+  and the tiny 1b staging that drove the two fixes above.
+- **IO capped at `RDQ1_STUDY_END`** so all six event sources sit inside [2020, 2025] (D16).
+- **NDC: both 11-digit paddings restored** for the 3 ambiguous 5-3-2 IO drugs (L3); V8-I probe added.
+- **Scope frozen at 3 cohorts.** Cohort 4 (old form) is out, per the clarified ask (§1).
+- **Study-window mets accepted.** A pre-2020 mets does not exclude an in-window surgery patient (Q1).
+- **Scripts made `Rscript`-runnable** (guarded entry points; §8). Added the `rdq1_diag_q6b` /
+  `rdq1_check_v2_staging` diagnostics.
+- **Repo cleaned for prod.** Inlined `connect.R` into the one code file; removed dev/validation
+  scratch files; both deliverables carry no external-file references.
+
+**Still open:** Q6 (do steps 3 & 5 belong to `1a`?), and finishing the full re-run with both fixes.
+
+---
+
+*Maintainer note: append to §5 for each new value-check, §6 for each decision, and §12 for each change.*
 
 
 # ============================================================================
-# rdq1_cohort1.R
+# rdq1_cohort1.R — RDQ 317023, colon cancer / dostarlimab (AZUR-2).
 # Six-step attrition for cohorts 1/2a/3 x variants 1a/1b. dbplyr over ODBC to Databricks (no Spark).
 #
 # Run:
@@ -529,11 +617,13 @@ stays the single, self-contained source of truth.*
 #
 # Design notes:
 #   - Index = the earliest colectomy that has a new colon dx in the 183 days before it.
-#   - Staging (onc_tnm) ties to the colon tumor diagnosed in this episode (Optum manual §4.3.2).
+#   - Staging (onc_tnm) ties to ANY of the patient's colon tumors (patient-level). The stricter
+#     episode-key tie was tested (Q6b) and dropped ~5.9x of staged patients, so it was dropped.
 #   - Mets exclusion is patient-level: criterion 4 excludes any C77-79, not just colon mets.
 #   - All cohorts require physician notes (has_notes = 'Y').
 #
-# NOT RUN YET. Check the generated SQL and the value lists on a data slice before trusting counts.
+# FIRST RUN done — it executes and returns counts; full validation still pending. Finish all funnels,
+# run the v2 check, and eyeball the value lists before trusting final counts.
 # ============================================================================
 
 # ---- Connection + table helpers (Domino -> Databricks, dplyr/dbplyr over ODBC, no Spark) ----
@@ -631,7 +721,12 @@ RDQ1_IO_NDC <- c(   # 11-digit, no dashes
   "50242091701","50242091801","44087353501","61755000801",
   "00310450012","00310461150","00003373413","00003375614","00003377211","00003377412",
   "00006302601","00006302602","00006302604","00003232711","00003232822",
-  "00173089803","70114034001","72579012101","70095013001")
+  "00173089803",
+  # 5-3-2 agents (toripalimab/tislelizumab/cosibelimab): 10->11-digit padding is ambiguous, so carry
+  # BOTH 11-digit forms until the stored form is confirmed on the instance (SELECT DISTINCT ndc).
+  "70114034001","70114340001",     # toripalimab
+  "72579012101","72579121001",     # tislelizumab
+  "70095013001","70095130001")     # cosibelimab
 
 ## dMMR / MSI-H (criterion 5). A record is positive when:
 ##   MSI marker (not MSS)        + status in RDQ1_MSI_POS_STATUS   -> MSI-High
@@ -652,9 +747,11 @@ RDQ1_LAB_PROT_LOSS <- c("lost", "loss", "loss of expression", "absent", "no expr
 RDQ1_BIOMARKER_NAME_SUBSTR <- c("MSI","MICROSATELLITE","MMR","MISMATCH REPAIR",
                                 "MLH1","MSH2","MSH6","PMS2")
 
-## Colon neoplasm_type values, for tying enriched-onc records to the colon tumor. In the live data
-## colon, colorectal and sigmoid are all colon; rectal/anus are not.
-RDQ1_COLON_NEO_SUBSTR <- c("COLON", "COLORECTAL", "SIGMOID")
+## Colon neoplasm_type substrings, for tying enriched-onc records to the colon tumor. The live
+## distribution: 'colon' (umbrella), 'colorectal', 'sigmoid', and 'ascending/transverse/descending
+## colon' (these contain 'colon' so 'COLON' already matches them). 'cecum' (C18.0, right-side, ~23k
+## pts) does NOT contain 'colon' so it needs its own term. rectal/anus/small intestine are NOT colon.
+RDQ1_COLON_NEO_SUBSTR <- c("COLON", "COLORECTAL", "SIGMOID", "CECUM")
 
 # ============================================================================
 # 2. HELPERS
@@ -736,8 +833,9 @@ rdq1_colon_neo_keys <- function(con)
                   neoplasm_qualifier == "actual") |>
     dplyr::distinct(neoplasm_histology_key)
 
-# Colon tumor keys with their note date. Lets the orchestrator pick the tumor diagnosed in this
-# episode (Optum manual §4.3.2). We use note_date; neoplasm_dx_date is a messy partial string.
+# Colon tumor keys with their note date. Was used for the old episode-key staging tie; PROD no longer
+# calls it (staging is patient-level now) — kept only for the Q6b diagnostic. note_date is used
+# because neoplasm_dx_date is a messy partial string.
 rdq1_colon_neo_dated <- function(con)
   mc_tbl(con, "onc_neoplasm_histology") |>
     dplyr::filter(dbplyr::sql(rdq1_like_any("neoplasm_type", RDQ1_COLON_NEO_SUBSTR)),
@@ -812,9 +910,9 @@ rdq1_stage_ok <- function(con, variant, use_claims = FALSE, neo_keys = NULL) {
     g <- dplyr::union(g, gc)
   }
   if (variant == "1a") return(g)
-  # onc_tnm rows. Tie to the colon tumor (Optum §4.3.2): if neo_keys is given (the episode tumor from
-  # the orchestrator) restrict to that tumor by (ptid, key), else use any colon tumor. This ties to
-  # the tumor, not the note date, so post-op pathology of the same tumor still counts.
+  # onc_tnm rows, tied to a colon tumor. PROD passes no neo_keys, so we use the else branch: any of
+  # the patient's colon tumors (patient-level). neo_keys (the exact episode tumor by ptid+key) is kept
+  # only so the Q6b diagnostic can compare the old tie; see the orchestrator note (Q6b).
   # (rename n -> n_val; `n` clashes with dplyr::n(). We read the first char of T and N.)
   tnm <- mc_tbl(con, "onc_tnm") |>
     dplyr::filter(note_date >= RDQ1_STUDY_START, note_date <= RDQ1_STUDY_END)   # study window
@@ -974,15 +1072,13 @@ rdq1_attrition_table <- function(con, variant = c("1a", "1b"), cohort = c("1", "
     dplyr::group_by(ptid, surgery_date) |>
     dplyr::summarise(colon_dx_date = min(dx_date, na.rm = TRUE), .groups = "drop")
 
-  # Optum §4.3.2: the episode tumor = the colon neoplasm diagnosed in this 183-day window. Restrict
-  # onc_tnm staging to it, so a different colon primary's stage can't qualify. G-codes and the node
-  # fallback stay patient-level.
-  episode_keys <- rdq1_colon_neo_dated(con) |>
-    dplyr::inner_join(s2, by = "ptid") |>
-    dplyr::filter(neo_date <= surgery_date,
-                  datediff(surgery_date, neo_date) <= RDQ1_DX_WINDOW_DAYS) |>
-    dplyr::distinct(ptid, neoplasm_histology_key)
-  s3 <- s2 |> dplyr::semi_join(rdq1_stage_ok(con, variant, uc, episode_keys), by = "ptid")
+  # Staging is tied to ANY of the patient's colon tumors (patient-level colon tie), not to the exact
+  # episode neoplasm_histology_key. The tighter Optum-4.3.2 episode-key tie was tested (Q6b) and
+  # dropped ~5.9x of genuinely-staged patients: the same tumor gets multiple neoplasm_histology_keys
+  # (pre-op clinical note vs surgical-pathology record), and onc_tnm sits on the pathology key while
+  # the pre-op-note key seeded the tie. For the ~99% single-colon-primary patient this is the same
+  # tumor. G-codes and the node fallback are already patient-level.
+  s3 <- s2 |> dplyr::semi_join(rdq1_stage_ok(con, variant, uc), by = "ptid")
 
   s4 <- s3 |>
     dplyr::left_join(mets, by = "ptid") |>
@@ -992,7 +1088,10 @@ rdq1_attrition_table <- function(con, variant = c("1a", "1b"), cohort = c("1", "
 
   s6 <- s5 |>
     dplyr::inner_join(rdq1_io(con, variant, uc), by = "ptid") |>
-    dplyr::filter(io_date >= colon_dx_date, is.na(mets_date) | io_date < mets_date) |>
+    # io_date >= colon_dx_date already keeps IO on/after 2020 (dx is study-bounded); cap the top end
+    # too so every event source is inside [2020, 2025].
+    dplyr::filter(io_date >= colon_dx_date, io_date <= RDQ1_STUDY_END,
+                  is.na(mets_date) | io_date < mets_date) |>
     dplyr::distinct(ptid, surgery_date, colon_dx_date, mets_date)
 
   steps  <- list(s1, s2, s3, s4, s5, s6)
@@ -1047,4 +1146,153 @@ rdq1_biomarker_values <- function(con, n = 200) {
     onc_biomarker = mc_tbl(con, "onc_biomarker") |>
       dplyr::filter(dbplyr::sql(rdq1_like_any("biomarker", RDQ1_BIOMARKER_NAME_SUBSTR))) |>
       dplyr::count(biomarker, narrative_result, sort = TRUE) |> head(n) |> dplyr::collect())
+}
+
+# ============================================================================
+# 6. Rscript entry point
+# ============================================================================
+# `Rscript rdq1_cohort1.R` connects and runs the full grid (all 3 cohorts x 2 variants).
+# When the file is source()d (interactively, or by the v2 check) this block does nothing —
+# sys.nframe() is 0 only when the file is the top-level script, >0 when sourced.
+# Set RDQ1_MATERIALIZE=0 to skip persisting the step-6 tables to the personal schema (default: on).
+if (sys.nframe() == 0L && !interactive()) {
+  con <- mc_connect()
+  mat <- !identical(Sys.getenv("RDQ1_MATERIALIZE", "1"), "0")
+  if (mat && !exists("createInPersonalSchema")) {   # don't lose a good run at the persistence step
+    message("createInPersonalSchema() is not loaded — running WITHOUT materialize. ",
+            "Load the prod personal-schema helper (or set RDQ1_MATERIALIZE=0) to silence this.")
+    mat <- FALSE
+  }
+  res <- rdq1_run(con, materialize = mat, replace = mat)
+  # per-step counts already streamed to stderr; print the stacked table to stdout
+  print(res[, c("cohort", "variant", "step", "n", "n_display", "pct_step1", "pct_prev")],
+        row.names = FALSE)
+}
+
+
+
+# ============================================================================
+# rdq1_check_v2_staging.R — CHECK SCRIPT (not the prod deliverable).
+#
+# Purpose: test reading #2 of the RDQ form. The form does NOT tag step 3 (Stage)
+# or step 5 (dMMR/MSI-H) as "[from EHR]" (steps 1/2/4/6 are). Structured codes
+# carry no TNM: the qualifying G-codes G9085/G9086 cover ~7-14 patients total, so
+# the 1a funnel dies at step 3. Reading #2 says staging + biomarker should come
+# from enriched oncology (t_onc_tnm / t_onc_biomarker) in BOTH tables, and 1a vs
+# 1b should differ only on the [from EHR] steps (1, 2, 4, 6).
+#
+# This script leaves rdq1_cohort1.R alone. It reuses every builder and just swaps
+# the step-3 and step-5 calls to force the enriched-onc arm ("1b") for all variants.
+#
+# Run — either works:
+#   Rscript R/rdq1_check_v2_staging.R    # standalone: sources the main file, then runs the v2 grid
+#   # or interactively:
+#   source("R/rdq1_cohort1.R"); source("R/rdq1_check_v2_staging.R"); rdq1_run_v2(mc_connect())
+# Compare the step-3 / step-5 rows against the prod rdq1_run(con).
+# ============================================================================
+
+# Make sure the main pipeline is loaded. If the builders aren't defined yet (e.g. run via Rscript),
+# source rdq1_cohort1.R from next to THIS script. Sourcing it does NOT trigger the prod run — the
+# main file's entry point is guarded by sys.nframe().
+if (!exists("rdq1_attrition_table") || !exists("rdq1_stage_ok")) {
+  .args <- commandArgs(trailingOnly = FALSE)
+  .fa   <- sub("^--file=", "", .args[grep("^--file=", .args)])
+  .here <- if (length(.fa)) dirname(normalizePath(.fa)) else if (dir.exists("R")) "R" else "."
+  .main <- file.path(.here, "rdq1_cohort1.R")
+  if (!file.exists(.main)) stop("Cannot find rdq1_cohort1.R next to this script; source it first.")
+  source(.main)
+}
+
+# Same orchestrator as prod, with two lines changed: step 3 and step 5 always use
+# the enriched-onc arm ("1b") regardless of the table variant. Steps 1/2/4/6 keep
+# the real variant, so 1a still excludes enriched onc for surgery/dx/mets/IO.
+rdq1_attrition_table_v2 <- function(con, variant = c("1a", "1b"), cohort = c("1", "2a", "3"),
+                                    materialize = FALSE, replace = FALSE, verbose = TRUE) {
+  variant <- match.arg(variant); cohort <- match.arg(cohort)
+  uc <- cohort != "1"
+
+  dx   <- rdq1_colon_dx(con, variant, uc)
+  mets <- rdq1_mets(con, variant, uc)
+
+  s1 <- rdq1_surgery(con, uc) |>
+    dplyr::semi_join(rdq1_cohort_pts(con, cohort), by = "ptid")
+
+  pairs <- s1 |>
+    dplyr::inner_join(dx, by = "ptid") |>
+    dplyr::filter(dx_date <= surgery_date,
+                  datediff(surgery_date, dx_date) <= RDQ1_DX_WINDOW_DAYS)
+  idx_surg <- pairs |>
+    dplyr::group_by(ptid) |>
+    dplyr::summarise(surgery_date = min(surgery_date, na.rm = TRUE), .groups = "drop")
+  s2 <- pairs |>
+    dplyr::inner_join(idx_surg, by = c("ptid", "surgery_date")) |>
+    dplyr::group_by(ptid, surgery_date) |>
+    dplyr::summarise(colon_dx_date = min(dx_date, na.rm = TRUE), .groups = "drop")
+
+  # v2: staging always uses the enriched-onc arm ("1b": t_onc_tnm + G-codes + node fallback),
+  # patient-level colon tie (same as prod since Q6b). This is the change vs the 1a prod path for step 3.
+  s3 <- s2 |> dplyr::semi_join(rdq1_stage_ok(con, "1b", uc), by = "ptid")
+
+  s4 <- s3 |>
+    dplyr::left_join(mets, by = "ptid") |>
+    dplyr::filter(is.na(mets_date) | mets_date >= surgery_date)
+
+  # v2: biomarker always uses the enriched-onc arm (adds t_onc_biomarker). Only change for step 5.
+  s5 <- s4 |> dplyr::semi_join(rdq1_biomarker(con, "1b", uc), by = "ptid")
+
+  s6 <- s5 |>
+    dplyr::inner_join(rdq1_io(con, variant, uc), by = "ptid") |>
+    dplyr::filter(io_date >= colon_dx_date, io_date <= RDQ1_STUDY_END,
+                  is.na(mets_date) | io_date < mets_date) |>
+    dplyr::distinct(ptid, surgery_date, colon_dx_date, mets_date)
+
+  steps  <- list(s1, s2, s3, s4, s5, s6)
+  labels <- c("1. Colon cancer surgery",
+              "2. Newly diagnosed colon cancer within 183d prior to surgery",
+              "3. Stage T1-4N1-2 or T4N0 (enriched onc)",
+              "4. No metastatic diagnosis prior to surgery",
+              "5. dMMR+ or MSI-H (enriched onc)",
+              "6. IO use after dx and prior to metastatic diagnosis")
+
+  n <- integer(length(steps))
+  for (i in seq_along(steps)) {
+    n[i] <- n_ptid(steps[[i]])
+    if (verbose) message(sprintf("[c%s %s v2] step %d  n=%s", cohort, variant, i,
+                                 format(n[i], big.mark = ",")))
+  }
+
+  out <- data.frame(
+    cohort = cohort, variant = variant, step = seq_along(steps), criterion = labels, n = n,
+    pct_step1 = round(100 * n / n[1], 1),
+    pct_prev  = round(100 * n / c(n[1], head(n, -1)), 1),
+    n_display = mc_mask(n), stringsAsFactors = FALSE)
+
+  if (materialize) {
+    createInPersonalSchema(s6, paste0("rdq1_v2_c", cohort, "_", variant), replace = replace)
+  }
+  out
+}
+
+# Run the requested cohorts x variants under v2 (default = all 6).
+rdq1_run_v2 <- function(con, cohorts = RDQ1_COHORTS, variants = RDQ1_VARIANTS,
+                        materialize = FALSE, replace = FALSE) {
+  grid <- expand.grid(cohort = cohorts, variant = variants,
+                      KEEP.OUT.ATTRS = FALSE, stringsAsFactors = FALSE)
+  do.call(rbind, Map(function(co, va)
+    rdq1_attrition_table_v2(con, va, co, materialize = materialize, replace = replace),
+    grid$cohort, grid$variant))
+}
+
+# ---- Rscript entry point: `Rscript rdq1_check_v2_staging.R` runs the v2 grid ----
+# Materializes to rdq1_v2_c<cohort>_<variant> if RDQ1_MATERIALIZE is not "0" (default: on).
+if (sys.nframe() == 0L && !interactive()) {
+  con <- mc_connect()
+  mat <- !identical(Sys.getenv("RDQ1_MATERIALIZE", "1"), "0")
+  if (mat && !exists("createInPersonalSchema")) {
+    message("createInPersonalSchema() is not loaded — running WITHOUT materialize.")
+    mat <- FALSE
+  }
+  res <- rdq1_run_v2(con, materialize = mat, replace = mat)
+  print(res[, c("cohort", "variant", "step", "n", "n_display", "pct_step1", "pct_prev")],
+        row.names = FALSE)
 }
