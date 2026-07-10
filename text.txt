@@ -1,3 +1,15 @@
+################################################################################
+# RDQ 317023 — Colon Cancer / Dostarlimab (AZUR-2) — COMBINED HANDOFF
+# Three files concatenated for transfer. Split at the FILE x/3 banners to restore.
+#   1/3  docs/RDQ_317023_cohort_feasibility.md   (documentation)
+#   2/3  R/rdq1_cohort1.R                         (the pipeline — the code deliverable)
+#   3/3  R/personalSchemaFunctions.R             (prod helper for materialize=TRUE)
+################################################################################
+
+################################################################################
+# FILE 1/3: docs/RDQ_317023_cohort_feasibility.md
+################################################################################
+
 # RDQ 317023 — Colon Cancer / Dostarlimab (AZUR-2) — Cohort Feasibility
 
 The deliverable is this file plus **`R/rdq1_cohort1.R`** (dbplyr over ODBC to Databricks, no Spark).
@@ -159,9 +171,16 @@ Per-patient anchors: `surgery_date` (Step 1, = index) · `colon_dx_date` (Step 2
   - 1b → adds `t_onc_biomarker` (the real source). No ICD code exists for MSI-H/dMMR.
 - **Positive definition** (calibrated to real vocab, see §5 for the observed value sets):
   - MSI-High = `microsatellite instability (MSI)` (not MSS) with `high`/`positive`.
-  - MMR deficient = `DNA mismatch repair (MMR)` with `deficient`/`loss`/`loss of expression`.
-  - Protein loss = MLH1/MSH2/MSH6/PMS2 with `loss`/`loss of expression`/`absent`/`no expression`/`negative`.
-  - `t_lab` vocab is separate (`LOST`=loss; ambiguous `NEGATIVE`/`POSITIVE` excluded on proteins).
+  - MMR deficient = `DNA mismatch repair (MMR)` **and** the composite `DNA mismatch repair deficiency
+    (dMMRs)` panel with `deficient`/`loss`/`loss of`/`abnormal`/`positive`/`detected` (the dMMRs panel
+    reports deficiency as ABNORMAL/POSITIVE/DETECTED/LOSS OF; NORMAL/NEGATIVE/NOT DETECTED = proficient,
+    excluded). Safe — it's the only MMR-named `t_lab` test.
+  - Protein loss = MLH1/MSH2/MSH6/PMS2 IHC with `loss`/`lost`/`loss of expression`/`absent`/
+    `no expression`/**`not expressed`** (the antigen tests report loss as `NOT EXPRESSED`).
+  - **MMR gene mutation (Q7)** = an MMR-gene `*mutation*` test with `pathogenic`/`positive`/`present`
+    (Lynch) — counts as dMMR. `variant of unknown significance`/`benign` are **excluded**. Gated on
+    `MUTATION` in the test name so it never fires on antigen/MSI tests (where `positive` = the opposite).
+  - `t_lab` vocab is separate (`LOST`/`NOT EXPRESSED`=loss; ambiguous `NEGATIVE`/`POSITIVE` excluded on proteins).
 - claims (2a/3): small `tst_desc`-conditional arm on `t_clm_lab_results` — **MSI-High** =
   MSI/microsatellite test (`tst_desc` NOT matching `methylation`/`borrelia`/`hermsii`/`mutation`/
   `variant`/`gene`/`without`/`w/o` — those flip the meaning of a POSITIVE) with `rslt_txt ∈
@@ -231,7 +250,9 @@ Observed values are embedded here (no external evidence files needed). Reproduci
 | V1 | `t_procedure` | `proc_code_type` live value = **`CPT`** (dict says CPT4); `proc_code` present incl. `44140`≈60k, `J9271`≈425k, **`G9085`≈11, `G9086`≈97** (staging G-codes near-empty) | surgery matches **exact `proc_code`, no type filter** — the code list (CPT+PCS+HCPCS) is specific, so filtering on `proc_code_type` would only risk dropping a code stored under a different type label. (Optional: a `proc_code × proc_code_type` cross-tab would confirm no same-string collision.) Keep the G-codes but expect ~0 staging (Q6) |
 | Vneo | `t_onc_neoplasm_histology.neoplasm_type` | colon-region distinct patients: `colon` 805k, `colorectal` 213k, `sigmoid` 52k, `ascending colon` 40k, `transverse colon` 30k, **`cecum` 23k**, `descending colon` 14k; non-colon `small intestine`/`gastrointestinal`/`intestine` also present | colon tie = `{colon, colorectal, sigmoid, cecum}`. `ascending/transverse/descending colon` contain "colon" so are caught; **`cecum` does not — it was missing and is now added** (C18.0, right-side, dMMR-rich). `small intestine` etc. are not C18 → excluded |
 | V3 | `t_onc_biomarker` vs `t_biomarker` | MSI/MMR distribution is in `t_onc_biomarker.narrative_result`; `t_biomarker` returned ~no MSI/MMR rows; TNM category strings compact (`1`,`1a`,`2`,`4b`,`x`); free-text `stage` messy (`advanced`,`early stage`,`m0`–`m7`) | biomarker source = `t_onc_biomarker`; `substr(t/n,1,1)` logic; do **not** use `onc_stage.stage` as primary staging |
-| Vlab | `t_lab` | MSI/MMR test names: 4-antibody IHC panel `MLH1/PMS2/MSH6/MSH2 antigen` (~4,300 each) + `Microsatellite instability (MSI)` (~2,600); `test_result` vocab (uppercase) = `INTACT`(12.5k),`NEGATIVE`(6.8k),`null`(3k),`LOST`(1k),`EXPRESSED`(783),`POSITIVE`(631),`PERFORMED`(607),`SEE NOTE`(487) | `t_lab` = supplementary structured feed; separate `RDQ1_LAB_*` vectors; loss term = `LOST`; exclude ambiguous `NEGATIVE`/`POSITIVE` on proteins/MMR |
+| Vlab | `t_lab` | MSI/MMR test names: 4-antibody IHC panel `MLH1/PMS2/MSH6/MSH2 antigen` (~4,300 each) + `Microsatellite instability (MSI)` (~2,600); `test_result` vocab (uppercase) = `INTACT`(12.5k),`NEGATIVE`(6.8k),`null`(3k),`LOST`(1k),`EXPRESSED`(783),`POSITIVE`(631),`PERFORMED`(607),`SEE NOTE`(487) | `t_lab` = supplementary structured feed; separate `RDQ1_LAB_*` vectors; loss terms = `LOST`/`NOT EXPRESSED`; exclude ambiguous `NEGATIVE`/`POSITIVE` on proteins/MMR |
+| Vlab-2 | `t_lab` (per-test result vocab) | IHC antigen loss = `LOST` **and `NOT EXPRESSED`** (MLH1 `NOT EXPRESSED`≈23 pts — was missed); MSI positive = `HIGH`(222 pts) (no `MSI-H`/`unstable` in data); `MLH1/MSH2/MSH6/PMS2 gene.mutation` tests carry `POSITIVE`(~80), `PATHOGENIC`(~7), `PRESENT`(~6) vs separate `VARIANT OF UNKNOWN SIGNIFICANCE`/`BENIGN` | add `not expressed` to protein-loss; keep MSI=`high`; add MMR-mutation arm `RDQ1_MMR_MUT_POS` excl. VUS/benign (Q7/D19) |
+| Vlab-3 | `t_lab` `DNA mismatch repair deficiency (dMMRs)` test (26-row vocab) | deficient = `ABNORMAL`(48), `LOSS OF`(20), `POSITIVE`(11), `DETECTED`(1); proficient = `NORMAL`(321), `NORMAL EXPRESSION`(53), `NEGATIVE`(20), `NOT DETECTED`; rest non-informative (`SEE NOTE`/`TNP`/numeric strays) | add `abnormal`/`positive`/`detected`/`loss of` to `RDQ1_LAB_MMR_DEF` (only MMR-named `t_lab` test → no leak); proficient/ambiguous excluded (Q7) |
 | Vlymph | `t_onc_lymph_node`, `t_onc_medications` | `lymph_narrative ∈ {positive lymph node, negative lymph node, examined}`; `onc_medications.data_source` = claims (`clm_med_serv`,`clm_rx`) **and** non-claims (`proc`,`provider_notes`,`rx_adm`,`rx_presc`) | node fallback = `lymph_narrative='positive lymph node'`; IO filter to the 4 non-claims sources |
 | Vmets | `t_onc_metastatic_location`, `t_diagnosis` | `mets_qualifier ∈ {actual, absent}`; `mets_temporal_status ∈ {current, history}`; `metastasis_dx_date` often null/partial (`YYYYmmdd`); `DIAGNOSIS_CD_TYPE` multi-vocab; `DIAGNOSIS_STATUS` near-uniform "Diagnosis of" | mets = `actual`+`current`, anchor `note_date`, patient-level; do **not** filter `diagnosis_status` |
 | V6 | `t_administrations`, `t_prescription` | both are **structured EHR** (not claims); `GENERIC_DESC` well-normalized (salt suffixes e.g. "METOPROLOL TARTRATE"); `NDC` 11-digit un-dashed; **`ADMIN_DATE` frequently NULL** (rows use `ORDER_DATE`) | IO match = `generic_desc` substring OR `ndc`; `t_administrations` date = `coalesce(admin_date, order_date)` |
@@ -293,6 +314,7 @@ Trap: `DETECTED`/`Not Detected` on a **mutation/variant** test means the OPPOSIT
 | D16 | IO window = `[colon_dx_date, mets_date)`, capped at `RDQ1_STUDY_END` (same-day-as-dx IO counts; strictly before mets; within study window) | "after dx" read inclusively; mets is the exclusion boundary; every event source bounded to [2020, 2025] |
 | D17 | Biomarker (step 5) stays **patient-level "ever"**, NOT study-window-bounded | MSI-H/dMMR is a stable tumor/germline trait; bounding could wrongly exclude a valid pre-window test |
 | D18 | A cohort column can dip below another at step 6 (e.g. c2a 1b s6=6 < c1 1b s6=7) — not a bug | 2a/3 add claims mets, so `mets_date` is earlier or equal; the `[dx, mets)` IO window is tighter, so IO after a claims-found mets is (correctly) excluded. Better mets detection → stricter "before mets" |
+| D19 | Step 5 counts a **pathogenic/positive MMR gene-mutation** (Lynch) as dMMR — `RDQ1_MMR_MUT_POS`, gated on a `*mutation*` MMR-gene test, VUS/benign excluded (Q7) | ~80–90 lab patients whose dMMR is genetic; requestor's target is dMMR colon cancer. Widens criterion 5 from phenotype to genotype (noted) |
 
 ---
 
@@ -308,6 +330,14 @@ Trap: `DETECTED`/`Not Detected` on a **mutation/variant** test means the OPPOSIT
 5. **Enriched-onc dx dates are strings** — `neoplasm_dx_date`, `metastasis_dx_date` are `YYYYMMDD`,
    possibly partial → prefer `note_date`.
 6. **`rslt_nbr` unusable in claims labs** — uniform `0.00`; use `rslt_txt` (§3 step 5).
+7. **Speed — `fast = TRUE` (default).** dbplyr is lazy, so a naive run recomputes the whole chain for
+   every per-step count (6 steps × 6 funnels = 36 full re-executions) — that's what made the first run
+   take ~5 h. `fast` mode `compute()`s each step to a temp table (counts read the small table, not the
+   base scans) and restricts each heavy lab/claims scan to the patients still in the funnel (tiny by
+   steps 5–6). **Results are identical** (the restrictions are semi-joins the funnel already applies).
+   Toggle off with `rdq1_run(con, fast = FALSE)` or `RDQ1_FAST=0` if the warehouse rejects temp tables.
+   Other levers: `RDQ1_MATERIALIZE=0` skips the table writes for a counts-only run; a larger SQL
+   warehouse helps; no Spark is used or needed.
 
 ---
 
@@ -341,7 +371,8 @@ Rscript R/rdq1_diag_q6b.R 2a             # Q6b for cohort 2a
 
 Config toggles at the top of `R/rdq1_cohort1.R`: `RDQ1_STUDY_START/END`, `RDQ1_DX_WINDOW_DAYS=183`,
 `RDQ1_REQUIRE_NOTES=TRUE`, all code-list vectors, and the biomarker status vectors (tune for
-sensitivity analysis).
+sensitivity analysis). Run-time env vars: `RDQ1_MATERIALIZE=0` (skip table writes), `RDQ1_FAST=0`
+(disable the temp-table speed-up, see §7.7).
 
 ---
 
@@ -542,6 +573,22 @@ GROUP BY ndc ORDER BY ndc;
     with `s2`=19,055 and `step3_tied`=597 both reproducing the prod run. Step 3 was switched to the
     patient-level colon tie, so the next run's `1b` step 3 (and the whole downstream funnel) should rise
     ~6×, with the **cecum** fix on top (`cecum`≈23k pts was missing from the colon matcher).
+- **Q7 — count an MMR *gene-mutation* test as dMMR? (RESOLVED — YES, added.)** A teammate's `t_lab`
+  pull showed the `MLH1/MSH2/MSH6/PMS2 gene.mutation` tests carry `POSITIVE` (~80 pts), `PATHOGENIC`
+  (~7), `PRESENT` (~6) — separate from `VARIANT OF UNKNOWN SIGNIFICANCE` / `BENIGN`. These are Lynch /
+  germline-somatic MMR mutations, and the requestor's target is dMMR colon cancer, so we now **count
+  them as dMMR** (adds ~80–90 patients whose dMMR is proven genetically). Implemented as a **new arm**
+  in `rdq1_dmmr_msi_predicate` (`RDQ1_MMR_MUT_POS = pathogenic/positive/present`), gated on `MUTATION`
+  in the test name and on an MMR gene, so it can't fire on antigen/MSI tests. **VUS/benign are
+  excluded.** This is a deliberate widening of criterion 5 from tumor phenotype (IHC/MSI) to genotype
+  (mutation) — flag it when interpreting counts. Same pull also confirmed the MSI positive term is
+  `HIGH` (already matched); `msi-h`/`unstable` are **not** in the data (no change).
+  - **Composite `DNA mismatch repair deficiency (dMMRs)` test — also wired.** A follow-up pull found
+    this standalone panel test (matched by our MMR arm). Its deficient values — **`ABNORMAL`(48),
+    `LOSS OF`(20), `POSITIVE`(11), `DETECTED`(1)** — weren't in the MMR vocab, so we were missing them.
+    Added to `RDQ1_LAB_MMR_DEF` (~60–80 more patients). `NORMAL`/`NORMAL EXPRESSION`/`NEGATIVE`/
+    `NOT DETECTED` = proficient and stay excluded. Safe because this is the **only** MMR-named `t_lab`
+    test, so `POSITIVE`/`ABNORMAL` can't leak onto the antigen/MSI tests.
 - **L1 — PARTIAL RUN OBSERVED; full validation still pending.** A first `rdq1_run(con)` executed in
   Databricks and returned counts, so the dbplyr→Spark-SQL translation, `datediff`, and union/semi-join
   chains **do run** (no translation error seen). Observed so far: all three `1a` funnels, `c1 1b`
@@ -570,6 +617,19 @@ GROUP BY ndc ORDER BY ndc;
 
 What we checked, decided, and changed. Newest first.
 
+- **Speed-up: `fast` mode (default on).** The first run took ~5 h because each per-step count re-ran
+  the whole lazy chain (36×). `fast` `compute()`s each step to a temp table and restricts the heavy
+  lab/claims scans to the surviving funnel patients — identical results (§7.7). `RDQ1_FAST=0` reverts.
+- **`DNA mismatch repair deficiency (dMMRs)` panel test wired.** Its deficient values
+  `ABNORMAL`/`POSITIVE`/`DETECTED`/`LOSS OF` were missing from `RDQ1_LAB_MMR_DEF`; added (~60–80 pts).
+  Only MMR-named `t_lab` test, so no leak (Q7).
+- **MMR gene-mutation now counts as dMMR (Q7/D19).** Added `RDQ1_MMR_MUT_POS` = `pathogenic/positive/
+  present` as a 4th arm in `rdq1_dmmr_msi_predicate`, gated on a `*mutation*` MMR-gene test (VUS/benign
+  excluded). ~80–90 lab patients. Widens criterion 5 to genotype — requestor-approved.
+- **`t_lab` protein-loss: added `"not expressed"`.** The `MLH1/MSH2/MSH6/PMS2 antigen` IHC tests report
+  loss as `NOT EXPRESSED` (MLH1: 23 pts), which our `no expression` term missed. Added to
+  `RDQ1_LAB_PROT_LOSS`/`RDQ1_LAB_MMR_DEF`. Also raised **Q7** (MMR gene-mutation positives) — since
+  resolved yes; see the two entries above.
 - **Cecum added to the colon matcher.** Live `neoplasm_type` showed `cecum` (23k pts) was dropped — it
   has no "colon" substring. Added `CECUM` (Vneo, D5). Right-side, dMMR-rich, so it lifts steps 2/3/5.
 - **Step-3 staging → patient-level colon tie.** Q6b showed the exact-key episode tie kept only 597 of
@@ -585,12 +645,17 @@ What we checked, decided, and changed. Newest first.
 - **Repo cleaned for prod.** Inlined `connect.R` into the one code file; removed dev/validation
   scratch files; both deliverables carry no external-file references.
 
-**Still open:** Q6 (do steps 3 & 5 belong to `1a`?), and finishing the full re-run with both fixes.
+**Still open:** Q6 (do steps 3 & 5 belong to `1a`?), and a full re-run with all the fixes above (the
+first run in §9 is pre-fix baseline).
 
 ---
 
 *Maintainer note: append to §5 for each new value-check, §6 for each decision, and §12 for each change.*
 
+
+################################################################################
+# FILE 2/3: R/rdq1_cohort1.R
+################################################################################
 
 # ============================================================================
 # rdq1_cohort1.R — RDQ 317023, colon cancer / dostarlimab (AZUR-2).
@@ -732,7 +797,8 @@ RDQ1_IO_NDC <- c(   # 11-digit, no dashes
 ##   MSI marker (not MSS)        + status in RDQ1_MSI_POS_STATUS   -> MSI-High
 ##   MMR marker                  + status in RDQ1_MMR_DEF_STATUS   -> MMR deficient
 ##   MMR protein (MLH1/2/6/PMS2) + status in RDQ1_PROT_LOSS_STATUS -> protein loss
-## Anything else (MSI stable/low, MMR proficient/intact, protein intact) is negative.
+##   MMR gene MUTATION test       + status in RDQ1_MMR_MUT_POS      -> pathogenic MMR mutation (Q7)
+## Anything else (MSI stable/low, MMR proficient/intact, protein intact, VUS/benign mutation) is negative.
 ## MSI/MMR live in t_onc_biomarker. t_biomarker had none. t_lab is a small extra source.
 RDQ1_MSI_POS_STATUS   <- c("high", "positive")
 RDQ1_MMR_DEF_STATUS   <- c("deficient", "loss", "loss of expression")
@@ -741,8 +807,16 @@ RDQ1_PROT_LOSS_STATUS <- c("loss", "loss of expression", "absent", "no expressio
 ## mean different things across lab tests, so we drop them for proteins/MMR and keep "positive" only
 ## for the MSI test.
 RDQ1_LAB_MSI_POS   <- c("high", "positive")
-RDQ1_LAB_MMR_DEF   <- c("deficient", "lost", "loss", "loss of expression", "absent")
-RDQ1_LAB_PROT_LOSS <- c("lost", "loss", "loss of expression", "absent", "no expression")
+## RDQ1_LAB_MMR_DEF also covers the composite "DNA mismatch repair deficiency (dMMRs)" test — the only
+## MMR-named t_lab test, so these panel terms can't leak elsewhere. Deficient = ABNORMAL / POSITIVE /
+## DETECTED / "LOSS OF" (truncated). NORMAL / NORMAL EXPRESSION / NEGATIVE / NOT DETECTED = proficient
+## (excluded by not being listed).
+RDQ1_LAB_MMR_DEF   <- c("deficient", "lost", "loss", "loss of", "loss of expression", "absent",
+                        "not expressed", "abnormal", "positive", "detected")
+RDQ1_LAB_PROT_LOSS <- c("lost", "loss", "loss of expression", "absent", "no expression", "not expressed")
+## MMR gene-MUTATION arm (Q7): a pathogenic/positive MMR gene mutation (Lynch) counts as dMMR. Applies
+## only to "*mutation*" tests. VUS / benign / likely benign are deliberately NOT here (uncertain).
+RDQ1_MMR_MUT_POS   <- c("pathogenic", "positive", "present")
 ## Broad name matches — used only by the validation helper to list candidate rows, not by the matcher.
 RDQ1_BIOMARKER_NAME_SUBSTR <- c("MSI","MICROSATELLITE","MMR","MISMATCH REPAIR",
                                 "MLH1","MSH2","MSH6","PMS2")
@@ -779,7 +853,8 @@ rdq1_io_predicate <- function(name_cols, include_ndc = TRUE) {
 rdq1_dmmr_msi_predicate <- function(bcol, scol,
                                     msi_pos   = RDQ1_MSI_POS_STATUS,
                                     mmr_def   = RDQ1_MMR_DEF_STATUS,
-                                    prot_loss = RDQ1_PROT_LOSS_STATUS) {
+                                    prot_loss = RDQ1_PROT_LOSS_STATUS,
+                                    mut_pos   = RDQ1_MMR_MUT_POS) {
   U   <- function(x) paste0("upper(", x, ")")
   inl <- function(col, vals) paste0("lower(", col, ") IN (",
            paste0("'", tolower(gsub("'", "''", vals)), "'", collapse = ","), ")")
@@ -788,9 +863,13 @@ rdq1_dmmr_msi_predicate <- function(bcol, scol,
   is_mmr  <- paste0("(", U(bcol), " LIKE '%MISMATCH REPAIR%' OR ", U(bcol), " LIKE '%(MMR)%')")
   is_prot <- paste0("(", paste(sprintf("%s LIKE '%%%s%%'", U(bcol),
                      c("MLH1","MSH2","MSH6","PMS2")), collapse = " OR "), ")")
+  # MMR gene-mutation test: a "*MUTATION*" test of an MMR gene, positive/pathogenic/present (Q7).
+  # Gating on MUTATION keeps this off the antigen/MSI tests, where "positive" means the opposite.
+  is_mut  <- paste0("(", U(bcol), " LIKE '%MUTATION%' AND (", is_mmr, " OR ", is_prot, "))")
   paste0("( (", is_msi, " AND NOT ", is_mss, " AND ", inl(scol, msi_pos), ")",
          " OR (", is_mmr, " AND ", inl(scol, mmr_def), ")",
-         " OR (", is_prot, " AND ", inl(scol, prot_loss), ") )")
+         " OR (", is_prot, " AND ", inl(scol, prot_loss), ")",
+         " OR (", is_mut, " AND ", inl(scol, mut_pos), ") )")
 }
 
 # ============================================================================
@@ -1045,54 +1124,58 @@ rdq1_io <- function(con, variant, use_claims = FALSE) {
 # 4. ORCHESTRATOR
 # ============================================================================
 rdq1_attrition_table <- function(con, variant = c("1a", "1b"), cohort = c("1", "2a", "3"),
-                                  materialize = FALSE, replace = FALSE, verbose = TRUE) {
+                                  materialize = FALSE, replace = FALSE, verbose = TRUE, fast = TRUE) {
   variant <- match.arg(variant); cohort <- match.arg(cohort)
   uc <- cohort != "1"                       # cohorts 2a/3 add claims ascertainment
 
-  dx   <- rdq1_colon_dx(con, variant, uc)
-  mets <- rdq1_mets(con, variant, uc)
+  # fast = TRUE: after each step write it to a temp table (compute()) and restrict the next heavy
+  # source scan to the patients still in the funnel. This stops the lazy per-step counts from
+  # re-running the whole chain, and shrinks the big lab/claims scans as the funnel narrows. Results
+  # are identical to fast = FALSE — the restrictions are semi-joins the funnel already applies. Set
+  # fast = FALSE if the warehouse rejects temp tables.
+  cmp <- function(x) if (fast) dplyr::compute(x) else x
 
   # spine: surgeries, gated to this cohort's patients
-  s1 <- rdq1_surgery(con, uc) |>
-    dplyr::semi_join(rdq1_cohort_pts(con, cohort), by = "ptid")
+  s1 <- cmp(rdq1_surgery(con, uc) |>
+              dplyr::semi_join(rdq1_cohort_pts(con, cohort), by = "ptid"))
 
-  # Index = the earliest colectomy that has a colon dx in its 183-day window. Pair each surgery with
-  # the dx, keep pairs inside the window, take the earliest such surgery, and its earliest dx. This
-  # stops an early unrelated colectomy from pinning the index and dropping the patient. Step-1 count
-  # (distinct ptid) is unchanged; step-2 can only go up.
-  pairs <- s1 |>
+  # Index = earliest colectomy with a colon dx in its 183-day window. Pair each surgery with the dx
+  # (restricted to surgery patients), keep in-window pairs, take the earliest such surgery + dx. Stops
+  # an unrelated early colectomy from pinning the index. Step-1 count unchanged; step-2 can only go up.
+  dx <- cmp(rdq1_colon_dx(con, variant, uc) |> dplyr::semi_join(s1, by = "ptid"))
+  pairs <- cmp(s1 |>
     dplyr::inner_join(dx, by = "ptid") |>
     dplyr::filter(dx_date <= surgery_date,
-                  datediff(surgery_date, dx_date) <= RDQ1_DX_WINDOW_DAYS)
+                  datediff(surgery_date, dx_date) <= RDQ1_DX_WINDOW_DAYS))
   idx_surg <- pairs |>                       # earliest dx-linked surgery = index
     dplyr::group_by(ptid) |>
     dplyr::summarise(surgery_date = min(surgery_date, na.rm = TRUE), .groups = "drop")
-  s2 <- pairs |>
+  s2 <- cmp(pairs |>
     dplyr::inner_join(idx_surg, by = c("ptid", "surgery_date")) |>
     dplyr::group_by(ptid, surgery_date) |>
-    dplyr::summarise(colon_dx_date = min(dx_date, na.rm = TRUE), .groups = "drop")
+    dplyr::summarise(colon_dx_date = min(dx_date, na.rm = TRUE), .groups = "drop"))
 
-  # Staging is tied to ANY of the patient's colon tumors (patient-level colon tie), not to the exact
-  # episode neoplasm_histology_key. The tighter Optum-4.3.2 episode-key tie was tested (Q6b) and
-  # dropped ~5.9x of genuinely-staged patients: the same tumor gets multiple neoplasm_histology_keys
-  # (pre-op clinical note vs surgical-pathology record), and onc_tnm sits on the pathology key while
-  # the pre-op-note key seeded the tie. For the ~99% single-colon-primary patient this is the same
-  # tumor. G-codes and the node fallback are already patient-level.
-  s3 <- s2 |> dplyr::semi_join(rdq1_stage_ok(con, variant, uc), by = "ptid")
+  # Staging tied patient-level to any colon tumor (Q6b: the exact episode-key tie dropped ~5.9x, from
+  # neoplasm_histology_key fragmentation — staging sits on the path key, not the pre-op-note key).
+  # Scan restricted to step-2 patients. G-codes and the node fallback are already patient-level.
+  stg <- cmp(rdq1_stage_ok(con, variant, uc) |> dplyr::semi_join(s2, by = "ptid"))
+  s3  <- cmp(s2 |> dplyr::semi_join(stg, by = "ptid"))
 
-  s4 <- s3 |>
+  mets <- cmp(rdq1_mets(con, variant, uc) |> dplyr::semi_join(s3, by = "ptid"))
+  s4   <- cmp(s3 |>
     dplyr::left_join(mets, by = "ptid") |>
-    dplyr::filter(is.na(mets_date) | mets_date >= surgery_date)
+    dplyr::filter(is.na(mets_date) | mets_date >= surgery_date))
 
-  s5 <- s4 |> dplyr::semi_join(rdq1_biomarker(con, variant, uc), by = "ptid")
+  bio <- cmp(rdq1_biomarker(con, variant, uc) |> dplyr::semi_join(s4, by = "ptid"))
+  s5  <- cmp(s4 |> dplyr::semi_join(bio, by = "ptid"))
 
-  s6 <- s5 |>
-    dplyr::inner_join(rdq1_io(con, variant, uc), by = "ptid") |>
-    # io_date >= colon_dx_date already keeps IO on/after 2020 (dx is study-bounded); cap the top end
-    # too so every event source is inside [2020, 2025].
+  # IO window [colon_dx, mets), capped at study end so all six sources sit inside [2020, 2025].
+  io <- cmp(rdq1_io(con, variant, uc) |> dplyr::semi_join(s5, by = "ptid"))
+  s6 <- cmp(s5 |>
+    dplyr::inner_join(io, by = "ptid") |>
     dplyr::filter(io_date >= colon_dx_date, io_date <= RDQ1_STUDY_END,
                   is.na(mets_date) | io_date < mets_date) |>
-    dplyr::distinct(ptid, surgery_date, colon_dx_date, mets_date)
+    dplyr::distinct(ptid, surgery_date, colon_dx_date, mets_date))
 
   steps  <- list(s1, s2, s3, s4, s5, s6)
   labels <- c("1. Colon cancer surgery",
@@ -1124,11 +1207,11 @@ rdq1_attrition_table <- function(con, variant = c("1a", "1b"), cohort = c("1", "
 
 # Run the requested cohorts x variants and stack the attrition tables (default = all 6).
 rdq1_run <- function(con, cohorts = RDQ1_COHORTS, variants = RDQ1_VARIANTS,
-                     materialize = FALSE, replace = FALSE) {
+                     materialize = FALSE, replace = FALSE, fast = TRUE) {
   grid <- expand.grid(cohort = cohorts, variant = variants,
                       KEEP.OUT.ATTRS = FALSE, stringsAsFactors = FALSE)
   do.call(rbind, Map(function(co, va)
-    rdq1_attrition_table(con, va, co, materialize = materialize, replace = replace),
+    rdq1_attrition_table(con, va, co, materialize = materialize, replace = replace, fast = fast),
     grid$cohort, grid$variant))
 }
 
@@ -1154,145 +1237,55 @@ rdq1_biomarker_values <- function(con, n = 200) {
 # `Rscript rdq1_cohort1.R` connects and runs the full grid (all 3 cohorts x 2 variants).
 # When the file is source()d (interactively, or by the v2 check) this block does nothing —
 # sys.nframe() is 0 only when the file is the top-level script, >0 when sourced.
-# Set RDQ1_MATERIALIZE=0 to skip persisting the step-6 tables to the personal schema (default: on).
+# RDQ1_MATERIALIZE=0 skips persisting the step-6 tables (default: on).
+# RDQ1_FAST=0 turns off the temp-table / candidate-restriction speed-up (default: on).
 if (sys.nframe() == 0L && !interactive()) {
   con <- mc_connect()
-  mat <- !identical(Sys.getenv("RDQ1_MATERIALIZE", "1"), "0")
+  mat  <- !identical(Sys.getenv("RDQ1_MATERIALIZE", "1"), "0")
+  fast <- !identical(Sys.getenv("RDQ1_FAST", "1"), "0")
   if (mat && !exists("createInPersonalSchema")) {   # don't lose a good run at the persistence step
     message("createInPersonalSchema() is not loaded — running WITHOUT materialize. ",
             "Load the prod personal-schema helper (or set RDQ1_MATERIALIZE=0) to silence this.")
     mat <- FALSE
   }
-  res <- rdq1_run(con, materialize = mat, replace = mat)
+  res <- rdq1_run(con, materialize = mat, replace = mat, fast = fast)
   # per-step counts already streamed to stderr; print the stacked table to stdout
   print(res[, c("cohort", "variant", "step", "n", "n_display", "pct_step1", "pct_prev")],
         row.names = FALSE)
 }
 
 
+################################################################################
+# FILE 3/3: R/personalSchemaFunctions.R
+################################################################################
 
-# ============================================================================
-# rdq1_check_v2_staging.R — CHECK SCRIPT (not the prod deliverable).
-#
-# Purpose: test reading #2 of the RDQ form. The form does NOT tag step 3 (Stage)
-# or step 5 (dMMR/MSI-H) as "[from EHR]" (steps 1/2/4/6 are). Structured codes
-# carry no TNM: the qualifying G-codes G9085/G9086 cover ~7-14 patients total, so
-# the 1a funnel dies at step 3. Reading #2 says staging + biomarker should come
-# from enriched oncology (t_onc_tnm / t_onc_biomarker) in BOTH tables, and 1a vs
-# 1b should differ only on the [from EHR] steps (1, 2, 4, 6).
-#
-# This script leaves rdq1_cohort1.R alone. It reuses every builder and just swaps
-# the step-3 and step-5 calls to force the enriched-onc arm ("1b") for all variants.
-#
-# Run — either works:
-#   Rscript R/rdq1_check_v2_staging.R    # standalone: sources the main file, then runs the v2 grid
-#   # or interactively:
-#   source("R/rdq1_cohort1.R"); source("R/rdq1_check_v2_staging.R"); rdq1_run_v2(mc_connect())
-# Compare the step-3 / step-5 rows against the prod rdq1_run(con).
-# ============================================================================
 
-# Make sure the main pipeline is loaded. If the builders aren't defined yet (e.g. run via Rscript),
-# source rdq1_cohort1.R from next to THIS script. Sourcing it does NOT trigger the prod run — the
-# main file's entry point is guarded by sys.nframe().
-if (!exists("rdq1_attrition_table") || !exists("rdq1_stage_ok")) {
-  .args <- commandArgs(trailingOnly = FALSE)
-  .fa   <- sub("^--file=", "", .args[grep("^--file=", .args)])
-  .here <- if (length(.fa)) dirname(normalizePath(.fa)) else if (dir.exists("R")) "R" else "."
-  .main <- file.path(.here, "rdq1_cohort1.R")
-  if (!file.exists(.main)) stop("Cannot find rdq1_cohort1.R next to this script; source it first.")
-  source(.main)
-}
+createInPersonalSchema <- function(pointerObject, remoteTableName, replace = FALSE) {
+  # Check if the object provided in 'pointerObject' is of the expected class
+  isTblLazy <- as.logical(max(class(pointerObject) == "tbl_lazy"))
+  # Check if remote table already exists
+  tableExists <- dbExistsTable(
+    con, Id(schema = Sys.getenv("DOMINO_USER_NAME"), table = tolower(remoteTableName)))
 
-# Same orchestrator as prod, with two lines changed: step 3 and step 5 always use
-# the enriched-onc arm ("1b") regardless of the table variant. Steps 1/2/4/6 keep
-# the real variant, so 1a still excludes enriched onc for surgery/dx/mets/IO.
-rdq1_attrition_table_v2 <- function(con, variant = c("1a", "1b"), cohort = c("1", "2a", "3"),
-                                    materialize = FALSE, replace = FALSE, verbose = TRUE) {
-  variant <- match.arg(variant); cohort <- match.arg(cohort)
-  uc <- cohort != "1"
-
-  dx   <- rdq1_colon_dx(con, variant, uc)
-  mets <- rdq1_mets(con, variant, uc)
-
-  s1 <- rdq1_surgery(con, uc) |>
-    dplyr::semi_join(rdq1_cohort_pts(con, cohort), by = "ptid")
-
-  pairs <- s1 |>
-    dplyr::inner_join(dx, by = "ptid") |>
-    dplyr::filter(dx_date <= surgery_date,
-                  datediff(surgery_date, dx_date) <= RDQ1_DX_WINDOW_DAYS)
-  idx_surg <- pairs |>
-    dplyr::group_by(ptid) |>
-    dplyr::summarise(surgery_date = min(surgery_date, na.rm = TRUE), .groups = "drop")
-  s2 <- pairs |>
-    dplyr::inner_join(idx_surg, by = c("ptid", "surgery_date")) |>
-    dplyr::group_by(ptid, surgery_date) |>
-    dplyr::summarise(colon_dx_date = min(dx_date, na.rm = TRUE), .groups = "drop")
-
-  # v2: staging always uses the enriched-onc arm ("1b": t_onc_tnm + G-codes + node fallback),
-  # patient-level colon tie (same as prod since Q6b). This is the change vs the 1a prod path for step 3.
-  s3 <- s2 |> dplyr::semi_join(rdq1_stage_ok(con, "1b", uc), by = "ptid")
-
-  s4 <- s3 |>
-    dplyr::left_join(mets, by = "ptid") |>
-    dplyr::filter(is.na(mets_date) | mets_date >= surgery_date)
-
-  # v2: biomarker always uses the enriched-onc arm (adds t_onc_biomarker). Only change for step 5.
-  s5 <- s4 |> dplyr::semi_join(rdq1_biomarker(con, "1b", uc), by = "ptid")
-
-  s6 <- s5 |>
-    dplyr::inner_join(rdq1_io(con, variant, uc), by = "ptid") |>
-    dplyr::filter(io_date >= colon_dx_date, io_date <= RDQ1_STUDY_END,
-                  is.na(mets_date) | io_date < mets_date) |>
-    dplyr::distinct(ptid, surgery_date, colon_dx_date, mets_date)
-
-  steps  <- list(s1, s2, s3, s4, s5, s6)
-  labels <- c("1. Colon cancer surgery",
-              "2. Newly diagnosed colon cancer within 183d prior to surgery",
-              "3. Stage T1-4N1-2 or T4N0 (enriched onc)",
-              "4. No metastatic diagnosis prior to surgery",
-              "5. dMMR+ or MSI-H (enriched onc)",
-              "6. IO use after dx and prior to metastatic diagnosis")
-
-  n <- integer(length(steps))
-  for (i in seq_along(steps)) {
-    n[i] <- n_ptid(steps[[i]])
-    if (verbose) message(sprintf("[c%s %s v2] step %d  n=%s", cohort, variant, i,
-                                 format(n[i], big.mark = ",")))
+  if(!isTblLazy) {
+    message(paste0("'", pointerObject, "' is not a pointer object. Please check that you have not put the object name in quotes."))
+  } else if(!tableExists) {
+    message(paste0("Rendering pointer object '", deparse(substitute(pointerObject)), "' to personal schema as ", remoteTableName, "..."))
+    dbExecute(con,
+              paste0(
+                "CREATE TABLE ", Sys.getenv("DOMINO_STARTING_USERNAME"),
+                ".", remoteTableName, " AS ",
+                sql_render(pointerObject)
+              ))
+  } else if (tableExists & replace) {
+    message(paste0("Rendering pointer object '", deparse(substitute(pointerObject)), "' to personal schema and replacing ", remoteTableName, "..."))
+    dbExecute(con,
+              paste0(
+                "REPLACE TABLE ", Sys.getenv("DOMINO_STARTING_USERNAME"),
+                ".", remoteTableName, " AS ",
+                sql_render(pointerObject)
+              ))
+  } else {
+    message(paste0("Table '", remoteTableName, "' already exists in personal schema. If you want to replace it, specify 'replace = TRUE'"))
   }
-
-  out <- data.frame(
-    cohort = cohort, variant = variant, step = seq_along(steps), criterion = labels, n = n,
-    pct_step1 = round(100 * n / n[1], 1),
-    pct_prev  = round(100 * n / c(n[1], head(n, -1)), 1),
-    n_display = mc_mask(n), stringsAsFactors = FALSE)
-
-  if (materialize) {
-    createInPersonalSchema(s6, paste0("rdq1_v2_c", cohort, "_", variant), replace = replace)
-  }
-  out
-}
-
-# Run the requested cohorts x variants under v2 (default = all 6).
-rdq1_run_v2 <- function(con, cohorts = RDQ1_COHORTS, variants = RDQ1_VARIANTS,
-                        materialize = FALSE, replace = FALSE) {
-  grid <- expand.grid(cohort = cohorts, variant = variants,
-                      KEEP.OUT.ATTRS = FALSE, stringsAsFactors = FALSE)
-  do.call(rbind, Map(function(co, va)
-    rdq1_attrition_table_v2(con, va, co, materialize = materialize, replace = replace),
-    grid$cohort, grid$variant))
-}
-
-# ---- Rscript entry point: `Rscript rdq1_check_v2_staging.R` runs the v2 grid ----
-# Materializes to rdq1_v2_c<cohort>_<variant> if RDQ1_MATERIALIZE is not "0" (default: on).
-if (sys.nframe() == 0L && !interactive()) {
-  con <- mc_connect()
-  mat <- !identical(Sys.getenv("RDQ1_MATERIALIZE", "1"), "0")
-  if (mat && !exists("createInPersonalSchema")) {
-    message("createInPersonalSchema() is not loaded — running WITHOUT materialize.")
-    mat <- FALSE
-  }
-  res <- rdq1_run_v2(con, materialize = mat, replace = mat)
-  print(res[, c("cohort", "variant", "step", "n", "n_display", "pct_step1", "pct_prev")],
-        row.names = FALSE)
 }
