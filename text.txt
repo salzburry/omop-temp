@@ -9,7 +9,7 @@ library(dplyr); library(tidyr); library(stringr)
 catalog         <- Sys.getenv("FRA_CATALOG", "hive_metastore")
 schema          <- "clnprw_flatiron_pano_ovar_use"
 drugepisode_tbl <- "t_drugepisode_2026m06"
-biomarker_tbl   <- "t_enh_ovbiomarkers_2026m06"   # confirm this is the FOLR1 snapshot to use
+biomarker_tbl   <- "t_enh_ovbiomarkers_2026m06"   # FOLR1 biomarker snapshot
 biomarker_name  <- "FOLR1/FRalpha"
 index_lines     <- c(2L, 3L, 4L)
 bio_window_days <- 14L
@@ -28,16 +28,23 @@ out_dir <- Sys.getenv("FRA_OUT_DIR", file.path(this_dir, "outputs"))
 
 # ---- load a table into a local data frame ----
 load_tbl <- function(tbl, cols) {
-  if (source_mode == "local") {
+  df <- if (source_mode == "local") {
     stopifnot(nzchar(local_dir))
     pq <- file.path(local_dir, paste0(tbl, ".parquet"))
-    if (file.exists(pq)) return(as_tibble(arrow::read_parquet(pq, col_select = all_of(cols))))
     cs <- file.path(local_dir, paste0(tbl, ".csv"))
-    if (file.exists(cs)) return(as_tibble(readr::read_csv(cs, show_col_types = FALSE))[cols])
-    stop(sprintf("no extract for %s in %s", tbl, local_dir))
+    if      (file.exists(pq)) as_tibble(arrow::read_parquet(pq))
+    else if (file.exists(cs)) as_tibble(readr::read_csv(cs, show_col_types = FALSE))
+    else stop(sprintf("no extract for %s in %s", tbl, local_dir))
+  } else {
+    fqtn <- paste(c(catalog, schema, tbl), collapse = ".")
+    as_tibble(DBI::dbGetQuery(con, sprintf("SELECT %s FROM %s", paste(cols, collapse = ", "), fqtn)))
   }
-  fqtn <- paste(c(catalog, schema, tbl), collapse = ".")
-  as_tibble(DBI::dbGetQuery(con, sprintf("SELECT %s FROM %s", paste(cols, collapse = ", "), fqtn)))
+  # Databricks returns each column in the schema's own case (e.g. PercentStaining), but the
+  # rest of the script uses lowercase names, so normalize here.
+  names(df) <- tolower(names(df))
+  miss <- setdiff(cols, names(df))
+  if (length(miss)) stop(sprintf("%s is missing column(s): %s", tbl, paste(miss, collapse = ", ")))
+  df[, cols, drop = FALSE]
 }
 
 # ---- FRalpha result: percent, intensity, class ----
@@ -214,250 +221,3 @@ run_analysis <- function() {
 }
 
 if (!nzchar(Sys.getenv("FRA_DEFINE_ONLY"))) run_analysis()
-
-
-
-SQLLLLLLLLLLLL
-
--- FRalpha analysis — data profiling + QC (Databricks / Spark SQL).
--- Run these first to check the data; section 10 rebuilds Table 1 as an independent cross-check.
--- Change the catalog below if yours is not hive_metastore.
-USE CATALOG hive_metastore;
-USE SCHEMA  clnprw_flatiron_pano_ovar_use;
-
--- 0. Which FOLR1 biomarker snapshots exist? Pick the one to use.
-SHOW TABLES LIKE 't_enh_ovbiomarkers_*';
-SHOW TABLES LIKE 't_drugepisode_*';
-
--- 1. biomarkername values — confirm the exact string and find any variants/whitespace.
-SELECT biomarkername, count(*) AS n, count(DISTINCT patientid) AS pts
-FROM t_enh_ovbiomarkers_2026m06
-GROUP BY biomarkername
-ORDER BY n DESC;
-
--- 2. FOLR1 record + patient counts (the zero-match guard depends on this being > 0).
-SELECT count(*) AS folr1_rows, count(DISTINCT patientid) AS folr1_pts
-FROM t_enh_ovbiomarkers_2026m06
-WHERE upper(trim(biomarkername)) = 'FOLR1/FRALPHA';
-
--- 3. PercentStaining: parse rate, <=1 vs >1 (mixed => set FRA_PCT_SCALE), negatives, min/max.
-WITH f AS (
-  SELECT try_cast(regexp_replace(percentstaining, '[^0-9.-]', '') AS DOUBLE) AS p, percentstaining
-  FROM t_enh_ovbiomarkers_2026m06
-  WHERE upper(trim(biomarkername)) = 'FOLR1/FRALPHA'
-)
-SELECT count(*)                                   AS folr1_rows,
-       count(p)                                   AS parseable,
-       sum(CASE WHEN p IS NULL THEN 1 ELSE 0 END) AS unparseable_or_null,
-       sum(CASE WHEN p <= 1  THEN 1 ELSE 0 END)   AS le_1,          -- looks fractional
-       sum(CASE WHEN p >  1  THEN 1 ELSE 0 END)   AS gt_1,          -- looks like a percent
-       sum(CASE WHEN p <  0  THEN 1 ELSE 0 END)   AS negatives,     -- expect 0
-       min(p) AS min_p, max(p) AS max_p
-FROM f;
--- distinct raw values, to eyeball formatting ("0.75" vs "75" vs "75%").
-SELECT percentstaining, count(*) AS n
-FROM t_enh_ovbiomarkers_2026m06
-WHERE upper(trim(biomarkername)) = 'FOLR1/FRALPHA'
-GROUP BY percentstaining ORDER BY n DESC LIMIT 50;
-
--- 4. StainingIntensity values — confirm 0 / 1+ / 2+ / 3+ coding; catch surprises.
-SELECT stainingintensity, count(*) AS n
-FROM t_enh_ovbiomarkers_2026m06
-WHERE upper(trim(biomarkername)) = 'FOLR1/FRALPHA'
-GROUP BY stainingintensity ORDER BY n DESC;
-
--- 5. Drug codelist — check the target drugnames (esp. PLD pegylated, nab-paclitaxel).
-SELECT drugname, count(*) AS episodes, count(DISTINCT patientid) AS pts,
-       CASE
-         WHEN lower(drugname) LIKE '%mirvetuximab%' THEN 'Mirvetuximab'
-         WHEN lower(drugname) LIKE '%topotecan%'    THEN 'ICC:topotecan'
-         WHEN lower(drugname) LIKE '%doxil%' OR lower(drugname) LIKE '%lipodox%'
-              OR lower(drugname) LIKE '%caelyx%'    THEN 'ICC:PLD-brand'
-         WHEN lower(drugname) LIKE '%doxorubicin%' AND
-              (lower(drugname) LIKE '%liposom%' OR lower(drugname) LIKE '%pegylat%') THEN 'ICC:PLD-generic'
-         WHEN lower(drugname) LIKE '%paclitaxel%' AND
-              (lower(drugname) LIKE '%nab%' OR lower(drugname) LIKE '%protein%bound%'
-               OR lower(drugname) LIKE '%albumin%' OR lower(drugname) LIKE '%abraxane%') THEN 'nab-paclitaxel (excluded)'
-         WHEN lower(drugname) LIKE '%paclitaxel%' THEN 'ICC:paclitaxel'
-         ELSE 'other' END AS maps_to
-FROM t_drugepisode_2026m06
-WHERE lower(drugname) LIKE '%mirvetuximab%' OR lower(drugname) LIKE '%paclitaxel%'
-   OR lower(drugname) LIKE '%doxorubicin%'  OR lower(drugname) LIKE '%topotecan%'
-   OR lower(drugname) LIKE '%doxil%' OR lower(drugname) LIKE '%lipodox%' OR lower(drugname) LIKE '%caelyx%'
-GROUP BY drugname ORDER BY maps_to, episodes DESC;
--- 5b. Every distinct 2L-4L drugname, so an unknown brand-only name is visible.
-SELECT drugname, count(*) AS episodes, count(DISTINCT patientid) AS pts
-FROM t_drugepisode_2026m06
-WHERE linenumber IN (2,3,4) AND lower(trim(ismaintenancetherapy)) IN ('false','f','n','no','0')
-GROUP BY drugname ORDER BY episodes DESC;
-
--- 6. ismaintenancetherapy values (NULL/blank do not count as non-maintenance).
-SELECT ismaintenancetherapy, count(*) AS n FROM t_drugepisode_2026m06
-GROUP BY ismaintenancetherapy ORDER BY n DESC;
-
--- 7. linesetting values — confirm the exact "Advanced" label used for Table 1b.
-SELECT linesetting, count(*) AS n, count(DISTINCT patientid) AS pts
-FROM t_drugepisode_2026m06
-GROUP BY linesetting ORDER BY n DESC;
-
--- 8. Line composition / single-agent rule.
---    (a) distribution of distinct drugs per line (patient,line).
-WITH la AS (   -- split composite names into agents; drop blanks
-  SELECT patientid, linenumber, count(DISTINCT agent) AS n_agents
-  FROM (SELECT patientid, linenumber,
-               explode(split(regexp_replace(lower(trim(drugname)), '\\s+', ' '), '\\s*[,/+;&|]\\s*')) AS agent
-        FROM t_drugepisode_2026m06
-        WHERE linenumber IN (2,3,4)
-          AND lower(trim(ismaintenancetherapy)) IN ('false','f','n','no','0')
-          AND drugname IS NOT NULL AND trim(drugname) <> '')
-  WHERE agent <> ''
-  GROUP BY patientid, linenumber
-)
-SELECT n_agents, count(*) AS line_instances FROM la GROUP BY n_agents ORDER BY n_agents;
--- (b) any (patient,line) spanning >1 setting? >0 means a line's setting is ambiguous.
-SELECT count(*) AS patient_lines_spanning_settings FROM (
-  SELECT patientid, linenumber FROM t_drugepisode_2026m06
-  WHERE linenumber IN (2,3,4)
-  GROUP BY patientid, linenumber HAVING count(DISTINCT coalesce(linesetting,'')) > 1
-);
-
--- 9. Cohort funnel — patient counts per step; reconcile with the R run summary.
-WITH base AS (
-  SELECT * FROM t_drugepisode_2026m06
-  WHERE linenumber IN (2,3,4)
-    AND lower(trim(ismaintenancetherapy)) IN ('false','f','n','no','0')
-    AND episodedate IS NOT NULL
-), tagged AS (
-  SELECT b.*,
-    CASE
-      WHEN lower(drugname) LIKE '%mirvetuximab%' THEN 'Mirvetuximab'
-      WHEN lower(drugname) LIKE '%topotecan%' THEN 'ICC'
-      WHEN lower(drugname) LIKE '%doxil%' OR lower(drugname) LIKE '%lipodox%' OR lower(drugname) LIKE '%caelyx%' THEN 'ICC'
-      WHEN lower(drugname) LIKE '%doxorubicin%' AND (lower(drugname) LIKE '%liposom%' OR lower(drugname) LIKE '%pegylat%') THEN 'ICC'
-      WHEN lower(drugname) LIKE '%paclitaxel%' THEN 'ICC' ELSE NULL END AS arm,
-    (lower(drugname) LIKE '%paclitaxel%' AND (lower(drugname) LIKE '%nab%' OR lower(drugname) LIKE '%protein%bound%'
-       OR lower(drugname) LIKE '%albumin%' OR lower(drugname) LIKE '%abraxane%')) AS is_nab
-  FROM base b
-), la AS (
-  SELECT patientid, linenumber,
-         count(DISTINCT agent) AS n_agents,
-         count(DISTINCT CASE
-           WHEN agent LIKE '%mirvetuximab%' THEN 'M'
-           WHEN agent LIKE '%paclitaxel%' AND (agent LIKE '%nab%' OR agent LIKE '%protein%bound%'
-                OR agent LIKE '%albumin%' OR agent LIKE '%abraxane%') THEN NULL
-           WHEN agent LIKE '%topotecan%' OR agent LIKE '%doxil%' OR agent LIKE '%lipodox%' OR agent LIKE '%caelyx%'
-             OR (agent LIKE '%doxorubicin%' AND (agent LIKE '%liposom%' OR agent LIKE '%pegylat%'))
-             OR agent LIKE '%paclitaxel%' THEN 'I' END) AS n_arms
-  FROM (SELECT patientid, linenumber,
-               explode(split(regexp_replace(lower(trim(drugname)), '\\s+', ' '), '\\s*[,/+;&|]\\s*')) AS agent
-        FROM t_drugepisode_2026m06
-        WHERE linenumber IN (2,3,4) AND lower(trim(ismaintenancetherapy)) IN ('false','f','n','no','0')
-          AND drugname IS NOT NULL AND trim(drugname) <> '')
-  WHERE agent <> ''
-  GROUP BY patientid, linenumber
-)
-SELECT
-  count(DISTINCT CASE WHEN arm IS NOT NULL THEN patientid END)                                  AS with_target_drug,
-  count(DISTINCT CASE WHEN arm IS NOT NULL AND (arm='Mirvetuximab' OR NOT is_nab) THEN patientid END) AS after_nab_drop,
-  count(DISTINCT CASE WHEN arm IS NOT NULL AND (arm='Mirvetuximab' OR NOT is_nab) AND la.n_arms <= 1
-                       AND (arm='Mirvetuximab' OR la.n_agents = 1) THEN patientid END)          AS single_agent_qualified
-FROM tagged t LEFT JOIN la ON t.patientid=la.patientid AND t.linenumber=la.linenumber;
-
--- 10. Table 1 rebuilt in SQL to cross-check R. Set params.pct_scale from section 3.
---     Produces both cohorts: 'all' (1a) and 'adv' (1b).
-WITH params AS (SELECT 'percent' AS pct_scale),   -- <-- set from Section 3 before trusting cells
-la AS (
-  SELECT patientid, linenumber,
-         count(DISTINCT agent) AS n_agents,
-         count(DISTINCT CASE
-           WHEN agent LIKE '%mirvetuximab%' THEN 'M'
-           WHEN agent LIKE '%paclitaxel%' AND (agent LIKE '%nab%' OR agent LIKE '%protein%bound%'
-                OR agent LIKE '%albumin%' OR agent LIKE '%abraxane%') THEN NULL   -- nab: not a qualifying ICC arm
-           WHEN agent LIKE '%topotecan%' OR agent LIKE '%doxil%' OR agent LIKE '%lipodox%' OR agent LIKE '%caelyx%'
-             OR (agent LIKE '%doxorubicin%' AND (agent LIKE '%liposom%' OR agent LIKE '%pegylat%'))
-             OR agent LIKE '%paclitaxel%' THEN 'I' END) AS n_arms
-  FROM (SELECT patientid, linenumber,
-               explode(split(regexp_replace(lower(trim(drugname)), '\\s+', ' '), '\\s*[,/+;&|]\\s*')) AS agent
-        FROM t_drugepisode_2026m06
-        WHERE linenumber IN (2,3,4) AND lower(trim(ismaintenancetherapy)) IN ('false','f','n','no','0')
-          AND drugname IS NOT NULL AND trim(drugname) <> '')
-  WHERE agent <> ''
-  GROUP BY patientid, linenumber
-),
-qualifying AS (
-  SELECT d.patientid, d.episodedate, d.drugname,
-         regexp_replace(lower(trim(coalesce(d.linesetting,''))), '\\s+', ' ') AS linesetting,
-    CASE
-      WHEN lower(d.drugname) LIKE '%mirvetuximab%' THEN 'Mirvetuximab'
-      ELSE 'ICC (Paclitaxel, PLD, or topotecan)' END AS arm
-  FROM t_drugepisode_2026m06 d JOIN la
-    ON d.patientid=la.patientid AND d.linenumber=la.linenumber
-  WHERE d.linenumber IN (2,3,4)
-    AND lower(trim(d.ismaintenancetherapy)) IN ('false','f','n','no','0')
-    AND d.episodedate IS NOT NULL
-    AND la.n_arms <= 1                                                -- drop cross-arm (mirv + ICC) lines
-    AND (lower(d.drugname) LIKE '%mirvetuximab%' OR la.n_agents = 1)  -- ICC single-agent; mirvetuximab may be combined
-    AND ( lower(d.drugname) LIKE '%mirvetuximab%' OR lower(d.drugname) LIKE '%topotecan%'
-       OR lower(d.drugname) LIKE '%doxil%' OR lower(d.drugname) LIKE '%lipodox%' OR lower(d.drugname) LIKE '%caelyx%'
-       OR (lower(d.drugname) LIKE '%doxorubicin%' AND (lower(d.drugname) LIKE '%liposom%' OR lower(d.drugname) LIKE '%pegylat%'))
-       OR lower(d.drugname) LIKE '%paclitaxel%' )
-    AND (lower(d.drugname) LIKE '%mirvetuximab%'                      -- nab disqualifies ICC only
-         OR NOT (lower(d.drugname) LIKE '%paclitaxel%' AND (lower(d.drugname) LIKE '%nab%' OR lower(d.drugname) LIKE '%protein%bound%'
-                 OR lower(d.drugname) LIKE '%albumin%' OR lower(d.drugname) LIKE '%abraxane%')))
-),
-qual_c AS (   -- both cohorts: 'all' (any setting), 'adv' (advanced only)
-  SELECT 'all' AS cohort, q.* FROM qualifying q
-  UNION ALL
-  SELECT 'adv' AS cohort, q.* FROM qualifying q WHERE lower(trim(q.linesetting)) = 'advanced'
-),
-first_dt AS (SELECT cohort, patientid, min(episodedate) AS idx FROM qual_c GROUP BY cohort, patientid),
-conflict AS (   -- earliest qualifying date carries both arms -> drop the patient
-  SELECT q.cohort, q.patientid FROM qual_c q JOIN first_dt f
-    ON q.cohort=f.cohort AND q.patientid=f.patientid AND q.episodedate=f.idx
-  GROUP BY q.cohort, q.patientid HAVING count(DISTINCT q.arm) > 1
-),
-picked AS (   -- first qualifying dose per (cohort, patient), conflicts removed
-  SELECT cohort, patientid, arm, index_date FROM (
-    SELECT q.cohort, q.patientid, q.arm, q.episodedate AS index_date,
-           row_number() OVER (PARTITION BY q.cohort, q.patientid ORDER BY q.episodedate, q.drugname) AS rn
-    FROM qual_c q LEFT ANTI JOIN conflict c ON q.cohort=c.cohort AND q.patientid=c.patientid
-  ) WHERE rn = 1
-),
-scored AS (   -- FOLR1 record class + biomarker date
-  SELECT b.patientid,
-    greatest(b.specimenreceiveddate, b.resultdate) AS test_date,
-    CASE
-      WHEN pct >= 75 AND inten IN (2,3) THEN 1                 -- rank 1 = high
-      WHEN pct >= 50 AND pct < 75 AND inten IN (2,3) THEN 2    -- moderate
-      WHEN pct < 50 OR inten <= 1 THEN 3                       -- low
-      ELSE 4 END AS rk
-  FROM (
-    SELECT patientid, specimenreceiveddate, resultdate,
-      (CASE WHEN (SELECT pct_scale FROM params)='fraction'
-            THEN try_cast(regexp_replace(percentstaining,'[^0-9.-]','') AS DOUBLE)*100
-            ELSE try_cast(regexp_replace(percentstaining,'[^0-9.-]','') AS DOUBLE) END) AS pct,
-      (CASE WHEN lower(stainingintensity) RLIKE '3\\s*\\+|strong'   THEN 3
-            WHEN lower(stainingintensity) RLIKE '2\\s*\\+|moderate' THEN 2
-            WHEN lower(stainingintensity) RLIKE '1\\s*\\+|weak'     THEN 1
-            WHEN lower(stainingintensity) LIKE '%negative%' OR lower(stainingintensity) LIKE '%no staining%' THEN 0
-            WHEN lower(stainingintensity) RLIKE '(^|[^0-9])3([^0-9]|$)' THEN 3
-            WHEN lower(stainingintensity) RLIKE '(^|[^0-9])2([^0-9]|$)' THEN 2
-            WHEN lower(stainingintensity) RLIKE '(^|[^0-9])1([^0-9]|$)' THEN 1
-            WHEN lower(stainingintensity) RLIKE '(^|[^0-9])0([^0-9]|$)' THEN 0
-            ELSE NULL END) AS inten
-    FROM t_enh_ovbiomarkers_2026m06 WHERE upper(trim(biomarkername))='FOLR1/FRALPHA'
-  ) b
-),
-fra AS (   -- highest class within window, per (cohort, patient)
-  SELECT p.cohort, p.patientid,
-         CASE min(s.rk) WHEN 1 THEN 'FRa high' WHEN 2 THEN 'FRa moderate' WHEN 3 THEN 'FRa low' ELSE 'Unknown/untested' END AS fra
-  FROM picked p JOIN scored s ON p.patientid=s.patientid
-  WHERE s.test_date IS NOT NULL AND s.test_date <= date_add(p.index_date, 14)
-  GROUP BY p.cohort, p.patientid
-)
-SELECT pk.cohort, pk.arm,
-       coalesce(fra.fra, 'Unknown/untested') AS fra_status,
-       count(*) AS n
-FROM picked pk LEFT JOIN fra ON pk.cohort=fra.cohort AND pk.patientid=fra.patientid
-GROUP BY pk.cohort, pk.arm, coalesce(fra.fra, 'Unknown/untested')
-ORDER BY pk.cohort, pk.arm, fra_status;
