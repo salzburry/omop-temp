@@ -1,5 +1,6 @@
-# FRalpha status at index by treatment (Mirvetuximab vs ICC), for ovarian patients on
-# 2L-4L lines (ICC restricted to single-agent). Builds Table 1 (counts and within-arm %).
+# FRalpha status at index by treatment (Mirvetuximab vs ICC), for ovarian patients on 2L-4L
+# lines. A patient can be in both arms; each arm uses its own first dose date. ICC must be a
+# single drug, unless the line also has mirvetuximab. Builds Table 1 (counts and %).
 # Pulls from Databricks over ODBC, then works on local data frames with dplyr:
 #   DATABRICKS_DSN=RWDE DATABRICKS_PWD=... Rscript fralpha_by_treatment.R
 
@@ -39,8 +40,8 @@ load_tbl <- function(tbl, cols) {
     fqtn <- paste(c(catalog, schema, tbl), collapse = ".")
     as_tibble(DBI::dbGetQuery(con, sprintf("SELECT %s FROM %s", paste(cols, collapse = ", "), fqtn)))
   }
-  # Databricks returns each column in the schema's own case (e.g. PercentStaining), but the
-  # rest of the script uses lowercase names, so normalize here.
+  # Databricks may hand back a column in mixed case (e.g. PercentStaining). The script uses
+  # lowercase names, so make them lowercase here.
   names(df) <- tolower(names(df))
   miss <- setdiff(cols, names(df))
   if (length(miss)) stop(sprintf("%s is missing column(s): %s", tbl, paste(miss, collapse = ", ")))
@@ -121,7 +122,7 @@ run_analysis <- function() {
     if (!nzchar(pwd))
       stop("set DATABRICKS_PWD, or provide a DBI `con`, or use FRA_SOURCE_MODE=local.")
     # Databricks over ODBC. bigint = "numeric" keeps counts and line numbers as plain
-    # numbers (not integer64), which the filters and percentage math need.
+    # numbers (not integer64), so the filters and math work.
     con <<- DBI::dbConnect(odbc::odbc(), dsn = Sys.getenv("DATABRICKS_DSN", "RWDE"),
                            pwd = pwd, timeout = 120, bigint = "numeric")
   }
@@ -134,31 +135,41 @@ run_analysis <- function() {
   drugep <- drugep %>% filter(!is.na(patientid))    # valid patient rows only
   biomk  <- biomk  %>% filter(!is.na(patientid))
 
-  # ---- qualifying treatment episodes ----
-  # Per patient+line: count distinct drugs (n_agents) and distinct arms (n_arms).
-  # Combo names are split; blanks and nab-paclitaxel don't count as an arm.
+  # ---- qualifying episodes, per arm (a patient can be in both) ----
+  # Per line: how many drugs, and does it include mirvetuximab (needed for the ICC rule).
   line_comp <- drugep %>%
     filter(linenumber %in% index_lines, is_nonmaint(ismaintenancetherapy)) %>%
     mutate(agent = str_split(str_squish(str_to_lower(drugname)), "\\s*[,/+;&|]\\s*")) %>%
     tidyr::unnest(agent) %>%
     filter(!is.na(agent), agent != "") %>%
-    mutate(agent_arm = if_else(is_nab(agent), NA_character_, arm_of(agent))) %>%
     group_by(patientid, linenumber) %>%
     summarise(n_agents = n_distinct(agent),
-              n_arms   = n_distinct(agent_arm[!is.na(agent_arm)]), .groups = "drop")
+              has_mirv = any(str_detect(agent, "mirvetuximab")), .groups = "drop")
 
   base_ep <- drugep %>% mutate(episodedate = as.Date(episodedate)) %>%
-    filter(linenumber %in% index_lines, is_nonmaint(ismaintenancetherapy), !is.na(episodedate))
-  cand    <- base_ep %>% mutate(arm = arm_of(drugname)) %>% filter(!is.na(arm))   # any target drug (incl. nab)
-  cand_nn <- cand %>% filter(arm == "Mirvetuximab" | !is_nab(drugname))           # nab disqualifies ICC only
-  in_line <- cand_nn %>% left_join(line_comp, by = c("patientid","linenumber"))
-  no_xarm <- in_line %>% filter(n_arms <= 1)                                      # drop cross-arm (mirv + ICC) lines
-  qual    <- no_xarm %>% filter(arm == "Mirvetuximab" | n_agents == 1)            # ICC must be single-agent
-  n_nab_excl   <- n_distinct(cand$patientid)    - n_distinct(cand_nn$patientid)   # nab-only patients
-  n_xarm_excl  <- n_distinct(cand_nn$patientid) - n_distinct(no_xarm$patientid)   # cross-arm-line-only patients
-  n_combo_excl <- n_distinct(no_xarm$patientid) - n_distinct(qual$patientid)      # ICC-combination-only patients
+    filter(linenumber %in% index_lines, is_nonmaint(ismaintenancetherapy))
+  # Split each drug name so a single "mirve + ICC" value can feed both arms.
+  agent_ep <- base_ep %>% filter(!is.na(episodedate)) %>%
+    mutate(agent = str_split(str_squish(str_to_lower(drugname)), "\\s*[,/+;&|]\\s*")) %>%
+    tidyr::unnest(agent) %>% filter(agent != "") %>%
+    mutate(arm = arm_of(agent)) %>%
+    left_join(line_comp, by = c("patientid","linenumber"))
 
-  # ---- FRalpha per patient (score once; apply the window per cohort) ----
+  # Mirvetuximab arm: any line with mirvetuximab (combinations are fine).
+  mirv_ep <- agent_ep %>% filter(arm == "Mirvetuximab")
+  # ICC arm: an ICC drug (not nab) that is the only drug on the line, or on a line that also
+  # has mirvetuximab (that line counts in both arms).
+  icc_ep  <- agent_ep %>% filter(arm == ARM_ICC, !is_nab(agent), n_agents == 1 | has_mirv)
+  # Missing dates: an undated dose can't set the index, so an arm can shift to a later date
+  # or be missed. Report the total dropped, and how many patients this may affect per arm.
+  n_nodate <- base_ep %>% filter(is.na(episodedate), !is.na(arm_of(drugname))) %>% nrow()
+  undated_ag <- base_ep %>% filter(is.na(episodedate)) %>%
+    mutate(agent = str_split(str_squish(str_to_lower(drugname)), "\\s*[,/+;&|]\\s*")) %>%
+    tidyr::unnest(agent) %>% filter(agent != "") %>% mutate(arm = arm_of(agent))
+  n_mirv_nd <- n_distinct(undated_ag$patientid[undated_ag$arm == "Mirvetuximab"])
+  n_icc_nd  <- n_distinct(undated_ag$patientid[undated_ag$arm == ARM_ICC & !is_nab(undated_ag$agent)])
+
+  # ---- FRalpha per patient (score once, apply the window per arm) ----
   folr1 <- biomk %>% filter(str_to_upper(str_trim(biomarkername)) == str_to_upper(biomarker_name))
   if (nrow(folr1) == 0)
     stop(sprintf("no records match biomarkername='%s' in %s — check the table and name.", biomarker_name, biomarker_tbl))
@@ -176,40 +187,44 @@ run_analysis <- function() {
     mutate(test_date = pmax(as.Date(specimenreceiveddate), as.Date(resultdate), na.rm = TRUE),
            rec = fra_class(pct_norm, to_intensity(stainingintensity)))
 
-  # highest FRalpha among a patient's records inside the window; none -> Unknown
-  attach_fra <- function(pop) {
-    f <- scored %>% inner_join(select(pop, patientid, index_date), by = "patientid") %>%
+  # best FRalpha among the patient's tests inside that arm's window; none -> Unknown
+  attach_fra <- function(pop1) {   # pop1 = one arm, one row per patient
+    f <- scored %>% inner_join(select(pop1, patientid, index_date), by = "patientid") %>%
       filter(!is.na(test_date), test_date <= index_date + bio_window_days) %>%
       mutate(rank = match(rec, FRA_RANK)) %>%
       group_by(patientid) %>% summarise(rank = min(rank), .groups = "drop") %>%
       transmute(patientid, fra = FRA_RANK[rank])
-    pop %>% left_join(f, by = "patientid") %>% mutate(fra = coalesce(fra, "Unknown/untested"))
+    pop1 %>% left_join(f, by = "patientid") %>% mutate(fra = coalesce(fra, "Unknown/untested"))
   }
 
-  # first qualifying dose sets arm and index; drop ties where the first date has both arms
-  build_cohort <- function(q) {
-    conflict <- q %>% group_by(patientid) %>% filter(episodedate == min(episodedate)) %>%
-      summarise(n = n_distinct(arm), .groups = "drop") %>% filter(n > 1) %>% pull(patientid)
-    pop <- q %>% filter(!patientid %in% conflict) %>%
-      arrange(patientid, episodedate, drugname) %>% group_by(patientid) %>% slice(1L) %>% ungroup() %>%
-      transmute(patientid, arm, index_date = episodedate, linesetting)
-    list(pop = attach_fra(pop), n_conflict = length(conflict))
+  # each arm on its own: one row per patient, index = first qualifying dose of that arm
+  arm_pop <- function(ep, arm_label, advanced_only = FALSE) {
+    if (advanced_only) ep <- ep %>% filter(is_advanced(linesetting))
+    p <- ep %>% group_by(patientid) %>% slice_min(episodedate, n = 1, with_ties = FALSE) %>% ungroup() %>%
+      transmute(patientid, arm = arm_label, index_date = episodedate)
+    attach_fra(p)
   }
+  build_pop <- function(advanced_only)
+    bind_rows(arm_pop(mirv_ep, "Mirvetuximab", advanced_only), arm_pop(icc_ep, ARM_ICC, advanced_only))
 
-  all_c <- build_cohort(qual)                                     # any setting
-  adv_c <- build_cohort(qual %>% filter(is_advanced(linesetting)))# advanced only, chosen independently
+  all_pop <- build_pop(FALSE)   # any setting
+  adv_pop <- build_pop(TRUE)    # advanced only, chosen independently
 
-  t_all <- table1_md(all_c$pop, "Table 1a — all 2L-4L lines (any setting)")
-  t_adv <- table1_md(adv_c$pop, "Table 1b — advanced setting only (first qualifying advanced dose)")
+  t_all <- table1_md(all_pop, "Table 1a — all 2L-4L lines (any setting)")
+  t_adv <- table1_md(adv_pop, "Table 1b — advanced setting only")
+  both_of <- function(p) length(intersect(p$patientid[p$arm == "Mirvetuximab"], p$patientid[p$arm == ARM_ICC]))
   summary <- paste(
-    sprintf("Cohort 1a: %d patients (Mirv %d, ICC %d); same-day conflicts excluded %d.",
-            nrow(all_c$pop), sum(all_c$pop$arm == "Mirvetuximab"), sum(all_c$pop$arm == ARM_ICC), all_c$n_conflict),
-    sprintf("Cohort 1b (advanced): %d patients (Mirv %d, ICC %d); same-day conflicts excluded %d.",
-            nrow(adv_c$pop), sum(adv_c$pop$arm == "Mirvetuximab"), sum(adv_c$pop$arm == ARM_ICC), adv_c$n_conflict),
-    sprintf("Excluded: %d nab-only, %d cross-arm-line-only, %d ICC-combination-only patients.",
-            n_nab_excl, n_xarm_excl, n_combo_excl),
+    "A patient can be in both arms. Each arm uses its own first dose date.",
+    sprintf("Cohort 1a: Mirv %d, ICC %d patients (%d counted in both).",
+            n_distinct(all_pop$patientid[all_pop$arm == "Mirvetuximab"]),
+            n_distinct(all_pop$patientid[all_pop$arm == ARM_ICC]), both_of(all_pop)),
+    sprintf("Cohort 1b (advanced): Mirv %d, ICC %d patients (%d counted in both).",
+            n_distinct(adv_pop$patientid[adv_pop$arm == "Mirvetuximab"]),
+            n_distinct(adv_pop$patientid[adv_pop$arm == ARM_ICC]), both_of(adv_pop)),
     sprintf("FOLR1 records: %d rows, %d patients. PercentStaining scale=%s (range %s).",
             nrow(folr1), n_distinct(folr1$patientid), scale, pct_rng),
+    sprintf("Target episodes dropped for missing date: %d (undated qualifying agents, review if >0: %d mirvetuximab, %d ICC patients).",
+            n_nodate, n_mirv_nd, n_icc_nd),
     sprintf("Source: %s / %s.%s.", drugepisode_tbl, biomarker_tbl, biomarker_name),
     sep = "\n")
 
@@ -217,7 +232,396 @@ run_analysis <- function() {
   dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
   writeLines(c(summary, "", t_all, "", t_adv), file.path(out_dir, "fralpha_by_treatment.md"))
   message(sprintf("wrote %s", file.path(out_dir, "fralpha_by_treatment.md")))
-  invisible(list(all = all_c$pop, adv = adv_c$pop, table1_all = t_all, table1_adv = t_adv))
+  invisible(list(all = all_pop, adv = adv_pop, table1_all = t_all, table1_adv = t_adv))
 }
 
 if (!nzchar(Sys.getenv("FRA_DEFINE_ONLY"))) run_analysis()
+
+
+SQLL!!
+
+-- FRalpha analysis — data profiling + QC (Databricks / Spark SQL).
+-- Run these first to check the data; section 10 rebuilds Table 1 as an independent cross-check.
+-- Change the catalog below if yours is not hive_metastore.
+USE CATALOG hive_metastore;
+USE SCHEMA  clnprw_flatiron_pano_ovar_use;
+
+-- 0. Which FOLR1 biomarker snapshots exist? Pick the one to use.
+SHOW TABLES LIKE 't_enh_ovbiomarkers_*';
+SHOW TABLES LIKE 't_drugepisode_*';
+
+-- 1. biomarkername values — confirm the exact string and find any variants/whitespace.
+SELECT biomarkername, count(*) AS n, count(DISTINCT patientid) AS pts
+FROM t_enh_ovbiomarkers_2026m06
+GROUP BY biomarkername
+ORDER BY n DESC;
+
+-- 2. FOLR1 record + patient counts (the zero-match guard depends on this being > 0).
+SELECT count(*) AS folr1_rows, count(DISTINCT patientid) AS folr1_pts
+FROM t_enh_ovbiomarkers_2026m06
+WHERE upper(trim(biomarkername)) = 'FOLR1/FRALPHA';
+
+-- 3. PercentStaining: parse rate, <=1 vs >1 (mixed => set FRA_PCT_SCALE), negatives, min/max.
+WITH f AS (
+  SELECT try_cast(regexp_replace(percentstaining, '[^0-9.-]', '') AS DOUBLE) AS p, percentstaining
+  FROM t_enh_ovbiomarkers_2026m06
+  WHERE upper(trim(biomarkername)) = 'FOLR1/FRALPHA'
+)
+SELECT count(*)                                   AS folr1_rows,
+       count(p)                                   AS parseable,
+       sum(CASE WHEN p IS NULL THEN 1 ELSE 0 END) AS unparseable_or_null,
+       sum(CASE WHEN p <= 1  THEN 1 ELSE 0 END)   AS le_1,          -- looks fractional
+       sum(CASE WHEN p >  1  THEN 1 ELSE 0 END)   AS gt_1,          -- looks like a percent
+       sum(CASE WHEN p <  0  THEN 1 ELSE 0 END)   AS negatives,     -- expect 0
+       min(p) AS min_p, max(p) AS max_p
+FROM f;
+-- distinct raw values, to check formatting ("0.75" vs "75" vs "75%").
+SELECT percentstaining, count(*) AS n
+FROM t_enh_ovbiomarkers_2026m06
+WHERE upper(trim(biomarkername)) = 'FOLR1/FRALPHA'
+GROUP BY percentstaining ORDER BY n DESC LIMIT 50;
+
+-- 4. StainingIntensity values — confirm 0 / 1+ / 2+ / 3+ coding; catch surprises.
+SELECT stainingintensity, count(*) AS n
+FROM t_enh_ovbiomarkers_2026m06
+WHERE upper(trim(biomarkername)) = 'FOLR1/FRALPHA'
+GROUP BY stainingintensity ORDER BY n DESC;
+
+-- 5. Drug codelist — check the target drugnames (esp. PLD pegylated, nab-paclitaxel).
+SELECT drugname, count(*) AS episodes, count(DISTINCT patientid) AS pts,
+       CASE
+         WHEN lower(drugname) LIKE '%mirvetuximab%' THEN 'Mirvetuximab'
+         WHEN lower(drugname) LIKE '%topotecan%'    THEN 'ICC:topotecan'
+         WHEN lower(drugname) LIKE '%doxil%' OR lower(drugname) LIKE '%lipodox%'
+              OR lower(drugname) LIKE '%caelyx%'    THEN 'ICC:PLD-brand'
+         WHEN lower(drugname) LIKE '%doxorubicin%' AND
+              (lower(drugname) LIKE '%liposom%' OR lower(drugname) LIKE '%pegylat%') THEN 'ICC:PLD-generic'
+         WHEN lower(drugname) LIKE '%paclitaxel%' AND
+              (lower(drugname) LIKE '%nab%' OR lower(drugname) LIKE '%protein%bound%'
+               OR lower(drugname) LIKE '%albumin%' OR lower(drugname) LIKE '%abraxane%') THEN 'nab-paclitaxel (excluded)'
+         WHEN lower(drugname) LIKE '%paclitaxel%' THEN 'ICC:paclitaxel'
+         ELSE 'other' END AS maps_to
+FROM t_drugepisode_2026m06
+WHERE lower(drugname) LIKE '%mirvetuximab%' OR lower(drugname) LIKE '%paclitaxel%'
+   OR lower(drugname) LIKE '%doxorubicin%'  OR lower(drugname) LIKE '%topotecan%'
+   OR lower(drugname) LIKE '%doxil%' OR lower(drugname) LIKE '%lipodox%' OR lower(drugname) LIKE '%caelyx%'
+GROUP BY drugname ORDER BY maps_to, episodes DESC;
+-- 5b. Every distinct 2L-4L drugname, so an unknown brand-only name is visible.
+SELECT drugname, count(*) AS episodes, count(DISTINCT patientid) AS pts
+FROM t_drugepisode_2026m06
+WHERE linenumber IN (2,3,4) AND lower(trim(ismaintenancetherapy)) IN ('false','f','n','no','0')
+GROUP BY drugname ORDER BY episodes DESC;
+
+-- 6. ismaintenancetherapy values (NULL/blank do not count as non-maintenance).
+SELECT ismaintenancetherapy, count(*) AS n FROM t_drugepisode_2026m06
+GROUP BY ismaintenancetherapy ORDER BY n DESC;
+
+-- 7. linesetting values — confirm the exact "Advanced" label used for Table 1b.
+SELECT linesetting, count(*) AS n, count(DISTINCT patientid) AS pts
+FROM t_drugepisode_2026m06
+GROUP BY linesetting ORDER BY n DESC;
+
+-- 8. Line composition / single-agent rule.
+--    (a) distribution of distinct drugs per line (patient,line).
+WITH la AS (   -- split combined drug names into single drugs; drop blanks
+  SELECT patientid, linenumber, count(DISTINCT agent) AS n_agents
+  FROM (SELECT patientid, linenumber,
+               explode(split(regexp_replace(lower(trim(drugname)), '\\s+', ' '), '\\s*[,/+;&|]\\s*')) AS agent
+        FROM t_drugepisode_2026m06
+        WHERE linenumber IN (2,3,4)
+          AND lower(trim(ismaintenancetherapy)) IN ('false','f','n','no','0')
+          AND drugname IS NOT NULL AND trim(drugname) <> '')
+  WHERE agent <> ''
+  GROUP BY patientid, linenumber
+)
+SELECT n_agents, count(*) AS line_instances FROM la GROUP BY n_agents ORDER BY n_agents;
+-- (b) any line with more than one setting? >0 means a line's setting is unclear.
+SELECT count(*) AS patient_lines_spanning_settings FROM (
+  SELECT patientid, linenumber FROM t_drugepisode_2026m06
+  WHERE linenumber IN (2,3,4)
+  GROUP BY patientid, linenumber HAVING count(DISTINCT coalesce(linesetting,'')) > 1
+);
+
+-- 9. Cohort funnel — patient counts per arm (a patient can be in both); check against the R summary.
+--    Splits drug names first, like section 10, so a combined value feeds both arms.
+WITH agent AS (   -- split drugname into single drugs (keep the date; don't filter on it here)
+  SELECT patientid, linenumber, episodedate,
+         explode(split(regexp_replace(lower(trim(drugname)), '\\s+', ' '), '\\s*[,/+;&|]\\s*')) AS ag
+  FROM t_drugepisode_2026m06
+  WHERE linenumber IN (2,3,4) AND lower(trim(ismaintenancetherapy)) IN ('false','f','n','no','0')
+    AND drugname IS NOT NULL AND trim(drugname) <> ''
+), comp AS (   -- count drugs over ALL of them (undated ones count too), matching the R line rule
+  SELECT patientid, linenumber, count(DISTINCT ag) AS n_agents,
+         max(CASE WHEN ag LIKE '%mirvetuximab%' THEN 1 ELSE 0 END) AS has_mirv
+  FROM agent WHERE ag <> '' GROUP BY patientid, linenumber
+), tagged AS (   -- per drug: arm + nab; only dated drugs put a patient in an arm (need a date to index)
+  SELECT a.patientid,
+         CASE WHEN a.ag LIKE '%mirvetuximab%' THEN 'M'
+              WHEN a.ag LIKE '%topotecan%' OR a.ag LIKE '%doxil%' OR a.ag LIKE '%lipodox%' OR a.ag LIKE '%caelyx%'
+                OR (a.ag LIKE '%doxorubicin%' AND (a.ag LIKE '%liposom%' OR a.ag LIKE '%pegylat%'))
+                OR a.ag LIKE '%paclitaxel%' THEN 'I' END AS arm,
+         (a.ag LIKE '%paclitaxel%' AND (a.ag LIKE '%nab%' OR a.ag LIKE '%protein%bound%'
+                 OR a.ag LIKE '%albumin%' OR a.ag LIKE '%abraxane%')) AS is_nab,
+         c.n_agents, c.has_mirv
+  FROM agent a JOIN comp c ON a.patientid=c.patientid AND a.linenumber=c.linenumber
+  WHERE a.ag <> '' AND a.episodedate IS NOT NULL
+), pat AS (   -- per patient: in the mirve arm? in the ICC arm? (can be both)
+  SELECT patientid,
+         max(CASE WHEN arm = 'M' THEN 1 ELSE 0 END) AS in_mirv,
+         max(CASE WHEN arm = 'I' AND NOT is_nab AND (n_agents = 1 OR has_mirv = 1) THEN 1 ELSE 0 END) AS in_icc
+  FROM tagged GROUP BY patientid
+)
+SELECT sum(CASE WHEN in_mirv = 1 OR in_icc = 1 THEN 1 ELSE 0 END)   AS with_target_drug,
+       sum(in_mirv)                                                 AS mirv_arm,
+       sum(in_icc)                                                  AS icc_arm,
+       sum(CASE WHEN in_mirv = 1 AND in_icc = 1 THEN 1 ELSE 0 END)  AS in_both
+FROM pat;
+
+-- 10. Table 1 rebuilt in SQL to cross-check R. Set params.pct_scale from section 3.
+--     A patient can be in both arms; each arm uses its own first dose date. A line with both
+--     mirve and an ICC drug counts in both arms. Groups: 'all' (1a), 'adv' (1b).
+WITH params AS (SELECT 'percent' AS pct_scale),   -- <-- set from Section 3 before trusting cells
+la AS (   -- per line: how many drugs + does it include mirvetuximab
+  SELECT patientid, linenumber,
+         count(DISTINCT agent) AS n_agents,
+         max(CASE WHEN agent LIKE '%mirvetuximab%' THEN 1 ELSE 0 END) AS has_mirv
+  FROM (SELECT patientid, linenumber,
+               explode(split(regexp_replace(lower(trim(drugname)), '\\s+', ' '), '\\s*[,/+;&|]\\s*')) AS agent
+        FROM t_drugepisode_2026m06
+        WHERE linenumber IN (2,3,4) AND lower(trim(ismaintenancetherapy)) IN ('false','f','n','no','0')
+          AND drugname IS NOT NULL AND trim(drugname) <> '')
+  WHERE agent <> ''
+  GROUP BY patientid, linenumber
+),
+dep_agent AS (   -- split each drug name into single drugs (a combined value feeds both arms)
+  SELECT patientid, linenumber, episodedate,
+         regexp_replace(lower(trim(coalesce(linesetting,''))), '\\s+', ' ') AS linesetting,
+         explode(split(regexp_replace(lower(trim(drugname)), '\\s+', ' '), '\\s*[,/+;&|]\\s*')) AS agent
+  FROM t_drugepisode_2026m06
+  WHERE linenumber IN (2,3,4) AND lower(trim(ismaintenancetherapy)) IN ('false','f','n','no','0')
+    AND episodedate IS NOT NULL AND drugname IS NOT NULL AND trim(drugname) <> ''
+),
+ep AS (   -- per drug: arm + line makeup
+  SELECT a.patientid, a.episodedate, a.linesetting,
+         CASE WHEN a.agent LIKE '%mirvetuximab%' THEN 'M'
+              WHEN a.agent LIKE '%topotecan%' OR a.agent LIKE '%doxil%'
+                OR a.agent LIKE '%lipodox%' OR a.agent LIKE '%caelyx%'
+                OR (a.agent LIKE '%doxorubicin%' AND (a.agent LIKE '%liposom%' OR a.agent LIKE '%pegylat%'))
+                OR a.agent LIKE '%paclitaxel%' THEN 'I' END AS arm,
+         (a.agent LIKE '%paclitaxel%' AND (a.agent LIKE '%nab%' OR a.agent LIKE '%protein%bound%'
+                 OR a.agent LIKE '%albumin%' OR a.agent LIKE '%abraxane%')) AS is_nab,
+         la.n_agents, la.has_mirv
+  FROM dep_agent a JOIN la ON a.patientid=la.patientid AND a.linenumber=la.linenumber
+  WHERE a.agent <> ''
+),
+arm_ep AS (   -- mirve arm: any mirve drug; ICC arm: ICC alone, or an ICC drug on a line that also has mirve
+  SELECT 'Mirvetuximab' AS arm, patientid, episodedate, linesetting FROM ep WHERE arm = 'M'
+  UNION ALL
+  SELECT 'ICC (Paclitaxel, PLD, or topotecan)' AS arm, patientid, episodedate, linesetting
+    FROM ep WHERE arm = 'I' AND NOT is_nab AND (n_agents = 1 OR has_mirv = 1)
+),
+cohort_ep AS (   -- both groups: all settings, and advanced only
+  SELECT 'all' AS cohort, a.* FROM arm_ep a
+  UNION ALL
+  SELECT 'adv' AS cohort, a.* FROM arm_ep a WHERE a.linesetting = 'advanced'
+),
+picked AS (   -- per (arm, cohort, patient): index = first qualifying dose of that arm
+  SELECT arm, cohort, patientid, min(episodedate) AS index_date
+  FROM cohort_ep GROUP BY arm, cohort, patientid
+),
+scored AS (   -- FOLR1 record class + biomarker date
+  SELECT b.patientid,
+    greatest(b.specimenreceiveddate, b.resultdate) AS test_date,
+    CASE
+      WHEN pct >= 75 AND inten IN (2,3) THEN 1                 -- rank 1 = high
+      WHEN pct >= 50 AND pct < 75 AND inten IN (2,3) THEN 2    -- moderate
+      WHEN pct < 50 OR inten <= 1 THEN 3                       -- low
+      ELSE 4 END AS rk
+  FROM (
+    SELECT patientid, specimenreceiveddate, resultdate,
+      (CASE WHEN (SELECT pct_scale FROM params)='fraction'
+            THEN try_cast(regexp_replace(percentstaining,'[^0-9.-]','') AS DOUBLE)*100
+            ELSE try_cast(regexp_replace(percentstaining,'[^0-9.-]','') AS DOUBLE) END) AS pct,
+      (CASE WHEN lower(stainingintensity) RLIKE '3\\s*\\+|strong'   THEN 3
+            WHEN lower(stainingintensity) RLIKE '2\\s*\\+|moderate' THEN 2
+            WHEN lower(stainingintensity) RLIKE '1\\s*\\+|weak'     THEN 1
+            WHEN lower(stainingintensity) LIKE '%negative%' OR lower(stainingintensity) LIKE '%no staining%' THEN 0
+            WHEN lower(stainingintensity) RLIKE '(^|[^0-9])3([^0-9]|$)' THEN 3
+            WHEN lower(stainingintensity) RLIKE '(^|[^0-9])2([^0-9]|$)' THEN 2
+            WHEN lower(stainingintensity) RLIKE '(^|[^0-9])1([^0-9]|$)' THEN 1
+            WHEN lower(stainingintensity) RLIKE '(^|[^0-9])0([^0-9]|$)' THEN 0
+            ELSE NULL END) AS inten
+    FROM t_enh_ovbiomarkers_2026m06 WHERE upper(trim(biomarkername))='FOLR1/FRALPHA'
+  ) b
+),
+fra AS (   -- best class within that arm's window, per (arm, cohort, patient)
+  SELECT p.arm, p.cohort, p.patientid,
+         CASE min(s.rk) WHEN 1 THEN 'FRa high' WHEN 2 THEN 'FRa moderate' WHEN 3 THEN 'FRa low' ELSE 'Unknown/untested' END AS fra
+  FROM picked p JOIN scored s ON p.patientid=s.patientid
+  WHERE s.test_date IS NOT NULL AND s.test_date <= date_add(p.index_date, 14)
+  GROUP BY p.arm, p.cohort, p.patientid
+)
+SELECT pk.cohort, pk.arm,
+       coalesce(fra.fra, 'Unknown/untested') AS fra_status,
+       count(*) AS n
+FROM picked pk LEFT JOIN fra ON pk.arm=fra.arm AND pk.cohort=fra.cohort AND pk.patientid=fra.patientid
+GROUP BY pk.cohort, pk.arm, coalesce(fra.fra, 'Unknown/untested')
+ORDER BY pk.cohort, pk.arm, fra_status;
+
+
+SQL###
+-- OC exploration — LOT & platinum items in SQL (mirrors oc_exploration.R). Run top to bottom.
+-- Each numbered block returns one result set. Sources:
+--   t_drugepisode_2026m06        — lines, settings, drugs (items 2a-2d, 3a)
+--   t_enh_ov_2026m06             — recurrence date (item 2e; may lag the dictionary)
+--   t_enh_ov_platstatus_2026m06  — platinum status (items 3b/3c; one row per platinum line)
+USE CATALOG hive_metastore;
+USE SCHEMA  clnprw_flatiron_pano_ovar_use;
+
+-- Shared view: one row per non-maintenance line, with a title-cased setting, its regimen,
+-- and its start date. Setting is normalized so it doesn't depend on the feed's casing.
+CREATE OR REPLACE TEMP VIEW oc_lines AS
+SELECT patientid, linenumber,
+       CASE WHEN s = 'neoadjuvant' THEN 'Neoadjuvant'
+            WHEN s = 'adjuvant'    THEN 'Adjuvant'
+            WHEN s = 'advanced'    THEN 'Advanced'
+            WHEN s LIKE 'off%systemic%' THEN 'Off-Systemic-Therapy'
+            ELSE initcap(s) END AS setting,
+       regimen, start_date
+FROM (
+  SELECT patientid, linenumber,
+         lower(trim(max(nullif(trim(linesetting), '')))) AS s,
+         max(nullif(trim(linename), '')) AS regimen,
+         min(linestartdate)              AS start_date
+  FROM t_drugepisode_2026m06
+  WHERE lower(trim(ismaintenancetherapy)) IN ('false','f','n','no','0')
+  GROUP BY patientid, linenumber
+);
+
+-- 2a. Patients by non-maintenance treatment setting combination (Neoadjuvant/Adjuvant/Advanced).
+WITH pc AS (
+  SELECT patientid, concat_ws(' + ', sort_array(collect_set(setting))) AS combo
+  FROM oc_lines WHERE setting IN ('Neoadjuvant','Adjuvant','Advanced')
+  GROUP BY patientid
+)
+SELECT combo, count(*) AS patients, round(100.0 * count(*) / sum(count(*)) OVER (), 1) AS pct
+FROM pc GROUP BY combo ORDER BY patients DESC;
+
+-- 2b. Patients with more than one non-maintenance adjuvant line.
+SELECT count(*) AS patients_with_multiple_adjuvant_lines FROM (
+  SELECT patientid FROM oc_lines WHERE setting = 'Adjuvant'
+  GROUP BY patientid HAVING count(DISTINCT linenumber) > 1
+);
+
+-- 2c. Advanced-setting patients by total number of lines (all settings, non-maintenance).
+WITH adv AS (SELECT DISTINCT patientid FROM oc_lines WHERE setting = 'Advanced'),
+lot AS (
+  SELECT l.patientid, count(DISTINCT l.linenumber) AS n_lot
+  FROM oc_lines l JOIN adv a ON l.patientid = a.patientid
+  GROUP BY l.patientid
+)
+SELECT n_lot, count(*) AS patients, round(100.0 * count(*) / sum(count(*)) OVER (), 1) AS pct
+FROM lot GROUP BY n_lot ORDER BY n_lot;
+
+-- 2d. Patients whose last adjuvant regimen matches their first-line Advanced regimen.
+--     L1 = first Advanced line; adjuvant = the last one starting before it; regimens are
+--     compared as drug sets (order-independent, blanks excluded).
+WITH fa AS (   -- first Advanced line per patient
+  SELECT patientid, regimen AS adv_regimen, start_date AS adv_start FROM (
+    SELECT patientid, regimen, start_date,
+           row_number() OVER (PARTITION BY patientid ORDER BY linenumber) AS rn
+    FROM oc_lines WHERE setting = 'Advanced'
+  ) WHERE rn = 1
+),
+la AS (   -- last adjuvant line starting before the first Advanced line
+  SELECT patientid, adj_regimen, adv_regimen FROM (
+    SELECT o.patientid, o.regimen AS adj_regimen, fa.adv_regimen,
+           row_number() OVER (PARTITION BY o.patientid ORDER BY o.start_date DESC) AS rn
+    FROM oc_lines o JOIN fa ON o.patientid = fa.patientid
+    WHERE o.setting = 'Adjuvant' AND o.start_date IS NOT NULL AND fa.adv_start IS NOT NULL
+      AND o.start_date < fa.adv_start
+  ) WHERE rn = 1
+),
+cmp AS (
+  SELECT patientid,
+    array_join(array_sort(array_distinct(filter(
+      split(regexp_replace(lower(trim(coalesce(adj_regimen,''))),'\\s+',' '), '\\s*[,/+;&|]\\s*'), x -> x <> ''))), '|') AS a,
+    array_join(array_sort(array_distinct(filter(
+      split(regexp_replace(lower(trim(coalesce(adv_regimen,''))),'\\s+',' '), '\\s*[,/+;&|]\\s*'), x -> x <> ''))), '|') AS b
+  FROM la
+)
+SELECT count(*) AS patients_with_adjuvant_before_first_advanced,
+       sum(CASE WHEN a <> '' AND a = b THEN 1 ELSE 0 END) AS same_regimen
+FROM cmp;
+
+-- 2e. Patients with 1L start date < recurrence date  (needs recurrencedate in t_enh_ov_2026m06).
+--     1L = line number 1. Row 1 minus row 2 = patients with no recurrence date.
+WITH l1  AS (SELECT patientid, start_date AS l1_start FROM oc_lines WHERE linenumber = 1),
+rec AS (SELECT patientid, min(recurrencedate) AS recur FROM t_enh_ov_2026m06 GROUP BY patientid)
+SELECT
+  count(CASE WHEN l1.l1_start IS NOT NULL THEN 1 END)                                                     AS l1_patients,
+  count(CASE WHEN l1.l1_start IS NOT NULL AND r.recur IS NOT NULL THEN 1 END)                             AS with_recurrence_date,
+  count(CASE WHEN l1.l1_start IS NOT NULL AND r.recur IS NOT NULL AND l1.l1_start < r.recur THEN 1 END)   AS l1_start_before_recurrence
+FROM l1 LEFT JOIN rec r ON l1.patientid = r.patientid;
+
+-- 3a. Adjuvant-setting patients who received platinum chemo (carboplatin/cisplatin/oxaliplatin).
+WITH adj AS (SELECT DISTINCT patientid, linenumber FROM oc_lines WHERE setting = 'Adjuvant'),
+plat AS (
+  SELECT DISTINCT d.patientid
+  FROM t_drugepisode_2026m06 d JOIN adj a ON d.patientid = a.patientid AND d.linenumber = a.linenumber
+  WHERE lower(trim(d.ismaintenancetherapy)) IN ('false','f','n','no','0')
+    AND (lower(d.drugname) LIKE '%carboplatin%' OR lower(d.drugname) LIKE '%cisplatin%'
+      OR lower(d.drugname) LIKE '%oxaliplatin%')
+)
+SELECT (SELECT count(DISTINCT patientid) FROM adj)  AS adjuvant_patients,
+       (SELECT count(*) FROM plat)                  AS received_platinum,
+       round(100.0 * (SELECT count(*) FROM plat) / nullif((SELECT count(DISTINCT patientid) FROM adj), 0), 1) AS pct;
+
+-- 3b. Platinum status in the adjuvant setting (patients). Checks all of a patient's adjuvant
+--     lines; a conflict (>1 distinct status) is flagged; a non-platinum line has no status row.
+WITH adj AS (SELECT DISTINCT patientid, linenumber FROM oc_lines WHERE setting = 'Adjuvant'),
+ps  AS (SELECT patientid, linenumber, nullif(trim(platinumstatus), '') AS status, 1 AS in_ps
+        FROM t_enh_ov_platstatus_2026m06),
+j AS (
+  SELECT a.patientid, count(DISTINCT ps.status) AS n_stat,
+         max(coalesce(ps.in_ps, 0)) AS has_row, max(ps.status) AS any_status
+  FROM adj a LEFT JOIN ps ON a.patientid = ps.patientid AND a.linenumber = ps.linenumber
+  GROUP BY a.patientid
+),
+cls AS (
+  SELECT patientid,
+    CASE WHEN n_stat = 1 THEN any_status
+         WHEN n_stat > 1 THEN 'Conflicting status (multiple rows)'
+         WHEN has_row = 1 THEN 'Status row present but blank'
+         ELSE 'No status row' END AS status
+  FROM j
+)
+SELECT status, count(*) AS patients, round(100.0 * count(*) / sum(count(*)) OVER (), 1) AS pct
+FROM cls GROUP BY status ORDER BY patients DESC;
+
+-- 3c. Platinum status in the first-line advanced setting (patients). Uses each patient's
+--     earliest Advanced line.
+WITH fa AS (
+  SELECT patientid, linenumber FROM (
+    SELECT patientid, linenumber, row_number() OVER (PARTITION BY patientid ORDER BY linenumber) AS rn
+    FROM oc_lines WHERE setting = 'Advanced'
+  ) WHERE rn = 1
+),
+ps AS (SELECT patientid, linenumber, nullif(trim(platinumstatus), '') AS status, 1 AS in_ps
+       FROM t_enh_ov_platstatus_2026m06),
+j AS (
+  SELECT f.patientid, count(DISTINCT ps.status) AS n_stat,
+         max(coalesce(ps.in_ps, 0)) AS has_row, max(ps.status) AS any_status
+  FROM fa f LEFT JOIN ps ON f.patientid = ps.patientid AND f.linenumber = ps.linenumber
+  GROUP BY f.patientid
+),
+cls AS (
+  SELECT patientid,
+    CASE WHEN n_stat = 1 THEN any_status
+         WHEN n_stat > 1 THEN 'Conflicting status (multiple rows)'
+         WHEN has_row = 1 THEN 'Status row present but blank'
+         ELSE 'No status row' END AS status
+  FROM j
+)
+SELECT status, count(*) AS patients, round(100.0 * count(*) / sum(count(*)) OVER (), 1) AS pct
+FROM cls GROUP BY status ORDER BY patients DESC;
