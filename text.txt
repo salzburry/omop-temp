@@ -1,14 +1,437 @@
-#==RWDBUNDLE==# v1  UTF-8; unpack with: python unpack_bundle.py (writes Windows CRLF, no BOM)
-#==FILE==# data_profiler.R
-# Data characterization — a standalone, tumor/product-agnostic profiler. Point it at ANY
-# Databricks schema (or local extracts) and it writes a stakeholder report: per-column
-# distribution and missingness for every table. Nothing here is tumor-specific.
+intake/oncology/oc/202606/exploratory/code/compare_snapshots.R
+# Snapshot comparison — diff two profile_<cut>.tsv files (from data_profiler.R) into a drift
+# report: what changed in the data between an OLD and a NEW snapshot, not just which columns were
+# added or dropped. Standalone, works for any tumor/product. dplyr only, no Spark or Databricks —
+# it just reads the two metrics files the profiler already wrote, so it never re-queries the
+# database and never overwrites those files.
+#
+# TO RUN: point it at the two profiles (edit CFG, or pass them as arguments):
+#   Rscript compare_snapshots.R outputs/2026m03/profile_2026m03.tsv outputs/2026m06/profile_2026m06.tsv
+# Any CFG value can also be set with its CMP_* env var (env wins).
+#
+# For each column in both snapshots it reports:
+#   - missingness drift as a rate (pct_missing), with n_rows / n_missing shown so you can tell
+#     whether the shift came from the count or the row total (raw counts don't compare across
+#     row-count changes);
+#   - continuous drift via SMD = (mean_new - mean_old) / pooled_sd (the usual "Table 1" effect
+#     size; |SMD|<0.1 is negligible), plus per-quantile shifts for shape and tails;
+#   - categorical drift: top values that entered or left the top list, or changed share;
+#   - cardinality drift (distinct per non-missing, so more rows alone don't trigger it);
+#   - kind/type changes, and added/dropped tables and columns.
+# Flags are size-based CANDIDATES to review — whether a change matters clinically is a human call.
+
+library(dplyr); library(stringr)
+
+# ============================ CONFIG — edit these, then run ============================
+CFG <- list(
+  old = "",       # path to the OLD snapshot's profile_<cut>.tsv   (or 1st CLI arg / CMP_OLD)
+  new = "",       # path to the NEW snapshot's profile_<cut>.tsv   (or 2nd CLI arg / CMP_NEW)
+  out_dir = "",   # where the report is written; "" = ./outputs next to this script   (CMP_OUT)
+  # -- flag thresholds: what counts as a shift worth reviewing --
+  miss_pts     = 5,     # flag |Δ % missing| >= this many percentage points        (CMP_MISS_PTS)
+  rows_pct     = 10,    # note |Δ table row count| >= this %                        (CMP_ROWS_PCT)
+  distinct_pct = 20,    # flag |Δ distinct-per-non-missing| >= this %               (CMP_DISTINCT_PCT)
+  smd          = 0.10,  # flag continuous |SMD| >= this                             (CMP_SMD)
+  cat_pts      = 10,    # flag categorical |Δ share| >= this many points, or a top  (CMP_CAT_PTS)
+                        #   value entering/leaving the top list
+  cat_min      = 1      # ignore categories below this % share                      (CMP_CAT_MIN)
+)
+# ======================================================================================
+
+getcfg  <- function(env, default) { v <- Sys.getenv(env, ""); if (nzchar(v)) v else default }
+getcfgn <- function(env, default) { v <- Sys.getenv(env, ""); if (nzchar(v)) as.numeric(v) else as.numeric(default) }
+args <- commandArgs(trailingOnly = TRUE)
+old_path <- if (length(args) >= 1) args[1] else getcfg("CMP_OLD", CFG$old)
+new_path <- if (length(args) >= 2) args[2] else getcfg("CMP_NEW", CFG$new)
+miss_pts     <- getcfgn("CMP_MISS_PTS",     CFG$miss_pts)
+rows_pct     <- getcfgn("CMP_ROWS_PCT",     CFG$rows_pct)
+distinct_pct <- getcfgn("CMP_DISTINCT_PCT", CFG$distinct_pct)
+smd_thresh   <- getcfgn("CMP_SMD",          CFG$smd)
+cat_pts      <- getcfgn("CMP_CAT_PTS",      CFG$cat_pts)
+cat_min      <- getcfgn("CMP_CAT_MIN",      CFG$cat_min)
+
+this_dir <- tryCatch(dirname(sub("^--file=", "", grep("^--file=", commandArgs(FALSE), value = TRUE))),
+                     error = function(e) ".")
+if (!length(this_dir) || this_dir == "") this_dir <- "."
+out_dir <- { v <- getcfg("CMP_OUT", CFG$out_dir); if (nzchar(v)) v else file.path(this_dir, "outputs") }
+
+# ---- read ----
+NUM_COLS <- c("n_rows","n_rows_total","n_nonmissing","n_missing","pct_missing","distinct",
+              "mean","sd","min","p1","p5","p10","p25","p50","p75","p90","p95","p99","max","unparseable")
+read_profile <- function(path, label) {
+  if (!nzchar(path)) stop(sprintf("%s profile path is empty — set it in CFG, CMP_%s, or as a CLI arg.",
+                                  label, toupper(label)))
+  if (!file.exists(path)) stop(sprintf("%s profile not found: %s", label, path))
+  # A profile_new_<cut>.tsv is the partial (new-columns-only) profile from DC_NEW_ONLY. Comparing it
+  # would give a bogus diff — every column it skipped would look "dropped" — so reject it loudly,
+  # the same as qc_runner does before calling this.
+  if (grepl("profile_new", basename(path), fixed = TRUE))
+    stop(sprintf("%s is a PARTIAL profile (profile_new_*, new columns only) — drift needs a COMPLETE profile_<cut>.tsv, not a subset: %s",
+                 label, path))
+  df <- utils::read.delim(path, sep = "\t", quote = "", na.strings = "",
+                          stringsAsFactors = FALSE, check.names = FALSE, colClasses = "character")
+  need <- c("table_base","column","kind")
+  if (!all(need %in% names(df)))
+    stop(sprintf("%s (%s) doesn't look like a profile_<cut>.tsv — missing %s",
+                 label, path, paste(setdiff(need, names(df)), collapse = ", ")))
+  # Need one row per (table_base, column): the two profiles are joined on that key, so a duplicate
+  # (a cut=all profile, or a hand-edited/merged file) would fan the join out and quietly break every
+  # per-column delta. Reject it loudly instead of comparing bad input.
+  dup <- unique(paste(df$table_base, df$column, sep = "|")[duplicated(paste(df$table_base, df$column, sep = "|"))])
+  if (length(dup))
+    stop(sprintf("%s (%s) has duplicate table_base|column rows (%s) — a full profile_<cut>.tsv must be one row per column (not a cut=all or merged file).",
+                 label, path, paste(utils::head(dup, 10), collapse = ", ")))
+  for (c in intersect(NUM_COLS, names(df))) df[[c]] <- suppressWarnings(as.numeric(df[[c]]))
+  as_tibble(df)
+}
+# CMP_DEFINE_ONLY: parse-check only. By this line R has already parsed the whole file (a syntax error
+# anywhere would have stopped it earlier), so quit before we touch any input file.
+if (nzchar(Sys.getenv("CMP_DEFINE_ONLY"))) { message("CMP_DEFINE_ONLY: parsed OK"); quit(save = "no", status = 0L) }
+old <- read_profile(old_path, "old")
+new <- read_profile(new_path, "new")
+samp_note <- {
+  os <- "sampled" %in% names(old) && any(toupper(as.character(old$sampled)) == "TRUE")
+  ns <- "sampled" %in% names(new) && any(toupper(as.character(new$sampled)) == "TRUE")
+  if (os || ns) sprintf("%s%s%s profiled from a sample — a flagged difference may be sampling variation; re-run the profiler with DC_SAMPLE_N=0 for exact metrics.",
+    if (os) "OLD" else "", if (os && ns) " and " else "", if (ns) "NEW" else "") else ""
+}
+
+# ---- schema diff ----
+o_tbls <- unique(old$table_base); n_tbls <- unique(new$table_base)
+added_tbls   <- sort(setdiff(n_tbls, o_tbls))
+dropped_tbls <- sort(setdiff(o_tbls, n_tbls))
+o_keys <- paste(old$table_base, old$column, sep = "|")
+n_keys <- paste(new$table_base, new$column, sep = "|")
+added_cols   <- sort(n_keys[!(n_keys %in% o_keys)])
+dropped_cols <- sort(o_keys[!(o_keys %in% n_keys)])
+
+# ---- per-column deltas (columns present in both) ----
+j <- inner_join(old, new, by = c("table_base","column"), suffix = c(".o",".n"))
+j <- j %>% mutate(
+  colname   = paste(table_base, column, sep = "."),
+  d_miss    = pct_missing.n - pct_missing.o,
+  ratio.o   = distinct.o / pmax(1, n_nonmissing.o),
+  ratio.n   = distinct.n / pmax(1, n_nonmissing.n),
+  d_distinct_rel    = ifelse(ratio.o > 0, abs(ratio.n - ratio.o) / ratio.o, NA_real_),  # magnitude -> flag
+  d_distinct_signed = ifelse(ratio.o > 0, (ratio.n - ratio.o) / ratio.o, NA_real_),     # signed  -> display
+  pooled_sd = sqrt((sd.o^2 + sd.n^2) / 2),
+  smd       = ifelse(is.na(pooled_sd) | pooled_sd == 0, NA_real_, (mean.n - mean.o) / pooled_sd),
+  # Catches shape/tail drift the mean-based SMD misses: the biggest standardized shift across
+  # p5..p95 (a steady mean can still hide a fatter tail). Same pooled-SD denominator as SMD.
+  q_shift_max = ifelse(is.na(pooled_sd) | pooled_sd == 0, NA_real_,   # suppress the all-NA pmax warning on categorical rows (result discarded by the ifelse)
+                suppressWarnings(pmax(abs(p5.n - p5.o), abs(p10.n - p10.o), abs(p25.n - p25.o), abs(p50.n - p50.o),
+                     abs(p75.n - p75.o), abs(p90.n - p90.o), abs(p95.n - p95.o), na.rm = TRUE)) / pooled_sd),
+  kind_change     = kind.o != kind.n,
+  date_min_change = kind.o == "date" & kind.n == "date" &
+                    (coalesce(date_min.o, "") != coalesce(date_min.n, "")),
+  d_unparse        = coalesce(unparseable.n, 0) - coalesce(unparseable.o, 0),
+  unparse_up       = coalesce(unparseable.n, 0) > coalesce(unparseable.o, 0),   # more parse failures = QA regression
+  date_max_regress = kind.o == "date" & kind.n == "date" & !is.na(date_max.o) & !is.na(date_max.n) &
+                     (date_max.n < date_max.o),   # max moved backwards = truncated history (an advance is expected, not flagged)
+  type_change      = type.o != type.n & kind.o == kind.n,   # same-kind storage change (e.g. integer -> double)
+  const_shift      = kind.o == "numeric" & kind.n == "numeric" & is.na(smd) &
+                     !is.na(mean.o) & !is.na(mean.n) & (mean.o != mean.n))  # zero-variance column whose value moved (SMD undefined)
+
+# Categorical drift: parse "count:value|..." into per-value shares and compare the two snapshots.
+parse_topv <- function(s, nn) {
+  if (is.na(s) || !nzchar(s) || is.na(nn) || nn <= 0) return(setNames(numeric(0), character(0)))
+  items <- str_split(s, "\\|")[[1]]
+  cnts  <- suppressWarnings(as.numeric(sub(":.*$", "", items)))   # count = before the first ':'
+  vals  <- sub("^[0-9]+:", "", items)                            # value = after the first ':'
+  ok <- !is.na(cnts) & nzchar(vals)
+  setNames(100 * cnts[ok] / nn, vals[ok])
+}
+cat_compare <- function(tv_o, nn_o, tv_n, nn_n) {
+  so <- parse_topv(tv_o, nn_o); sn <- parse_topv(tv_n, nn_n)
+  msgs <- character(0)
+  for (v in union(names(so), names(sn))) {
+    a <- if (v %in% names(so)) so[[v]] else NA_real_
+    b <- if (v %in% names(sn)) sn[[v]] else NA_real_
+    if (is.na(a)) { if (!is.na(b) && b >= cat_min) msgs <- c(msgs, sprintf("+%s (%.0f%%)", v, b)) }
+    else if (is.na(b)) { if (a >= cat_min) msgs <- c(msgs, sprintf("-%s (%.0f%%)", v, a)) }
+    else if (abs(b - a) >= cat_pts) msgs <- c(msgs, sprintf("%s %.0f%%->%.0f%%", v, a, b))
+  }
+  list(flag = length(msgs) > 0, desc = paste(msgs, collapse = "; "))
+}
+cat_flag <- rep(FALSE, nrow(j)); cat_desc <- rep("", nrow(j))
+is_cat <- j$kind.o == "categorical" & j$kind.n == "categorical"
+for (i in which(is_cat)) {
+  cc <- cat_compare(j$top_values.o[i], j$n_nonmissing.o[i], j$top_values.n[i], j$n_nonmissing.n[i])
+  cat_flag[i] <- cc$flag; cat_desc[i] <- cc$desc
+}
+j$cat_flag <- cat_flag; j$cat_desc <- cat_desc
+
+j <- j %>% mutate(
+  flag_miss     = !is.na(d_miss) & abs(d_miss) >= miss_pts,
+  flag_smd      = !is.na(smd) & abs(smd) >= smd_thresh,
+  flag_quantile = !is.na(q_shift_max) & q_shift_max >= smd_thresh,
+  flag_distinct = !is.na(d_distinct_rel) & d_distinct_rel >= distinct_pct / 100,
+  flag_kind     = kind_change,
+  flag_type     = type_change,
+  flag_const    = const_shift,
+  flag_date     = date_min_change | unparse_up | date_max_regress,
+  any_flag      = flag_miss | flag_smd | flag_quantile | flag_distinct | flag_kind | flag_type | flag_const | flag_date | cat_flag)
+
+# Table-level row-count change ("change in numbers"): n_rows_total is constant within a table.
+tbl_rows <- j %>% group_by(table_base) %>%
+  summarise(rows_o = dplyr::first(n_rows_total.o), rows_n = dplyr::first(n_rows_total.n), .groups = "drop") %>%
+  mutate(d_rel = ifelse(rows_o > 0, 100 * (rows_n - rows_o) / rows_o, NA_real_),
+         flag  = !is.na(d_rel) & abs(d_rel) >= rows_pct) %>%
+  arrange(desc(abs(d_rel)))
+
+# ---- assemble the flagged rows (what changed, most-shifted first) ----
+fmtn <- function(v) ifelse(is.na(v), "", ifelse(abs(v - round(v)) < 1e-9,
+                    formatC(v, format = "f", digits = 0, big.mark = ","), formatC(v, format = "f", digits = 2, big.mark = ",")))
+note_for <- function(r) {
+  m <- character(0)
+  if (r$flag_kind)  m <- c(m, sprintf("kind %s->%s", r$kind.o, r$kind.n))
+  if (isTRUE(r$flag_type))  m <- c(m, sprintf("type %s->%s", r$type.o, r$type.n))
+  if (isTRUE(r$flag_const)) m <- c(m, sprintf("constant value %s->%s", fmtn(r$mean.o), fmtn(r$mean.n)))
+  if (r$flag_miss)  m <- c(m, sprintf("missing %.1f%%->%.1f%% (%+.1fpt)", r$pct_missing.o, r$pct_missing.n, r$d_miss))
+  if (r$flag_smd)   m <- c(m, sprintf("SMD %+.2f (mean %s->%s)", r$smd, fmtn(r$mean.o), fmtn(r$mean.n)))
+  if (isTRUE(r$flag_quantile) || isTRUE(r$flag_smd))
+    m <- c(m, sprintf("quantiles p25/p50/p75: %s->%s / %s->%s / %s->%s (max shift %.2f SD)",
+      fmtn(r$p25.o), fmtn(r$p25.n), fmtn(r$p50.o), fmtn(r$p50.n), fmtn(r$p75.o), fmtn(r$p75.n), r$q_shift_max))
+  if (r$flag_distinct) m <- c(m, sprintf("distinct/nonmiss %+.0f%%", 100 * r$d_distinct_signed))
+  if (r$flag_date) m <- c(m, sprintf("date range %s..%s -> %s..%s%s",
+    coalesce(r$date_min.o, "n/a"), coalesce(r$date_max.o, "n/a"),
+    coalesce(r$date_min.n, "n/a"), coalesce(r$date_max.n, "n/a"),
+    if (isTRUE(r$unparse_up)) sprintf("; unparseable %s->%s", fmtn(coalesce(r$unparseable.o, 0)), fmtn(coalesce(r$unparseable.n, 0))) else ""))
+  if (nzchar(r$cat_desc)) m <- c(m, sprintf("categories: %s", r$cat_desc))
+  paste(m, collapse = " | ")
+}
+flagged <- j %>% filter(any_flag) %>%
+  arrange(desc(abs(coalesce(smd, 0)) + coalesce(q_shift_max, 0) + abs(coalesce(d_miss, 0)) / 10 + flag_kind * 100))
+flag_rows <- if (nrow(flagged)) lapply(seq_len(nrow(flagged)), function(i) {
+  r <- flagged[i, ]
+  list(col = r$colname, kind = r$kind.n,
+       miss = sprintf("%.1f%% -> %.1f%%", r$pct_missing.o, r$pct_missing.n),
+       n = sprintf("%s -> %s", fmtn(r$n_rows.o), fmtn(r$n_rows.n)),
+       note = note_for(r))
+}) else list()
+
+# ---- render ----
+esc <- function(x) { x <- as.character(x); x <- gsub("&","&amp;",x,fixed=TRUE)
+  x <- gsub("<","&lt;",x,fixed=TRUE); gsub(">","&gt;",x,fixed=TRUE) }
+li  <- function(v) if (length(v)) esc(paste(v, collapse = ", ")) else "&mdash;"
+gen_time <- format(Sys.time(), "%Y-%m-%d %H:%M")
+sub_txt  <- sprintf("old: %s  |  new: %s  |  generated %s", basename(old_path), basename(new_path), gen_time)
+thr_txt  <- sprintf("Flag thresholds: missing >=%gpt, SMD >=%g, distinct >=%g%%, category share >=%gpt (>=%g%% share), row count >=%g%%.",
+                    miss_pts, smd_thresh, distinct_pct, cat_pts, cat_min, rows_pct)
+
+# ---- HTML report (stakeholder-facing); the MD output above stays the complete technical record ----
+cut_of <- function(p) sub("^profile_(new_)?", "", sub("\\.tsv$", "", basename(p)))   # profile_2026m06.tsv -> 2026m06
+report_css <- '<style>
+:root{
+  --accent:#C4441C; --accent-bar:#F36633; --accent-soft:#FDE7DD; --accent-ink:#7A2A10;
+  --amber:#CA8A04; --amber-soft:#EAB308; --amber-bg:#FEF3C7; --amber-ink:#8A6D09; --fail:#C8102E;
+  --ink:#2A1A47; --ink-2:#3F3A4A; --muted:#6B6A78; --faint:#A3A1AD;
+  --line:#E7E3EF; --line-2:#D6D1E0; --surface:#FFFFFF; --page:#F2F0F7; --panel:#F8F6FB; --panel-edge:#ECE8F3;
+  --track:#ECEAF2;
+  --mono:ui-monospace,"Cascadia Code","Source Code Pro",Menlo,Consolas,monospace;
+  --sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+}
+*{box-sizing:border-box}
+body{font:15px/1.55 var(--sans);color:var(--ink-2);background:var(--page);margin:0;padding:28px}
+.sheet{max-width:1180px;margin:0 auto;background:var(--surface);border:1px solid var(--line);border-radius:12px;box-shadow:0 1px 3px rgba(15,23,42,.06);padding:34px 38px 30px}
+.eyebrow{font-size:11px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:var(--accent);margin:0 0 4px}
+h1{font-size:27px;line-height:1.15;font-weight:700;color:var(--ink);margin:0 0 8px;letter-spacing:-.01em}
+.runmeta{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:13px;color:var(--muted);margin:0 0 4px}
+.runmeta b{color:var(--ink-2);font-weight:600}
+.conf{display:inline-block;font-size:10.5px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--amber-ink);background:var(--amber-bg);border:1px solid #FCD34D;border-radius:5px;padding:2px 8px;margin-top:6px}
+.caveat{color:var(--amber-ink);font-size:12.5px;margin:8px 0 0}
+h2{font-size:12px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);margin:30px 0 12px;padding-bottom:7px;border-bottom:1px solid var(--line)}
+h2 .n{color:var(--accent);margin-left:6px}
+.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:2px 0 4px}
+.card{background:var(--panel);border:1px solid var(--panel-edge);border-left:3px solid var(--accent);border-radius:10px;padding:14px 16px}
+.card.warn{border-left-color:var(--amber)}
+.card .val{font-size:30px;font-weight:700;color:var(--ink);line-height:1.05;letter-spacing:-.02em}
+.card.warn .val{color:var(--amber-ink)}
+.card .lab{font-size:12.5px;font-weight:600;color:var(--ink-2);margin-top:3px}
+.card .sub{font-size:11.5px;color:var(--muted);margin-top:2px}
+.table-wrap{width:100%;overflow-x:auto}
+table{border-collapse:collapse;width:100%;margin:2px 0 6px;font-size:14px}
+thead th{position:sticky;top:0;background:var(--panel);text-align:left;font-weight:600;color:var(--ink-2);font-size:12.5px;padding:9px 12px;border-bottom:2px solid var(--line-2);white-space:nowrap}
+th.num,td.num{text-align:right;font-variant-numeric:tabular-nums}
+tbody td{padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+tbody tr:nth-child(even){background:#FBFAFC}
+tbody tr:hover{background:#FAF5F1}
+.col{font-family:var(--mono);font-size:13px;color:var(--ink);font-weight:600;word-break:break-word}
+.tbl{font-family:var(--mono);font-size:12.5px;color:var(--muted);word-break:break-word}
+.chip{display:inline-block;font-size:11px;font-weight:600;padding:2px 8px;border-radius:20px;white-space:nowrap}
+.chip.kind{background:#EEF0F5;color:#4B5563;border:1px solid #E3E1EA}
+.chip.alert{background:var(--amber-bg);color:var(--amber-ink);border:1px solid #FCD34D}
+.sigcell{min-width:210px}
+.sig{display:inline-block;font-family:var(--mono);font-size:10.5px;font-weight:600;padding:2px 7px;border-radius:5px;background:#EEF0F5;color:#3F3A4A;border:1px solid #E3E1EA;margin:1px 3px 1px 0;white-space:nowrap}
+.sig.sig-warn{background:var(--amber-bg);color:var(--amber-ink);border-color:#FCD34D}
+.note{font-size:12.5px;color:var(--ink-2);white-space:normal;word-break:break-word}
+.na{color:var(--faint);font-size:13px}
+.adds{display:grid;grid-template-columns:repeat(2,1fr);gap:8px 26px;margin:2px 0 6px}
+.adds .grp{padding:8px 0;break-inside:avoid}
+.adds .gt{font-family:var(--mono);font-size:13px;font-weight:600;color:var(--ink)}
+.adds .gt .newtab{font-family:var(--sans);font-size:10.5px;font-weight:700;color:#fff;background:var(--accent);border-radius:10px;padding:1px 7px;margin-left:6px;vertical-align:1px}
+.adds .gt .droptab{font-family:var(--sans);font-size:10.5px;font-weight:700;color:#fff;background:var(--muted);border-radius:10px;padding:1px 7px;margin-left:6px;vertical-align:1px}
+.adds ul{margin:5px 0 0;padding:0 0 0 4px;list-style:none}
+.adds li{font-family:var(--mono);font-size:12.5px;color:var(--ink-2);padding:1px 0}
+.adds li .plus{color:var(--accent);font-weight:700;margin-right:6px}
+.adds li .minus{color:var(--muted);font-weight:700;margin-right:6px}
+.subh{font-size:12.5px;font-weight:700;color:var(--ink-2);margin:10px 0 2px}
+.panel{background:var(--panel);border:1px solid var(--panel-edge);border-radius:10px;padding:14px 18px;font-size:13px;color:var(--muted)}
+.panel p{margin:0 0 7px}.panel p:last-child{margin:0}
+.foot{display:flex;flex-wrap:wrap;justify-content:space-between;gap:8px;margin-top:26px;padding-top:14px;border-top:1px solid var(--line);font-size:11.5px;color:var(--faint)}
+.foot b{color:var(--muted);font-weight:600}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.printfoot{display:none}
+@media (max-width:820px){.cards{grid-template-columns:repeat(2,1fr)}.adds{grid-template-columns:1fr}}
+@media print{
+  @page{size:A4 landscape;margin:12mm 12mm 15mm}
+  *{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+  body{background:#fff;padding:0;font-size:10pt}
+  .sheet{border:0;box-shadow:none;border-radius:0;max-width:none;padding:0}
+  thead{display:table-header-group}
+  tr,.card,.adds .grp{break-inside:avoid}
+  .panel{break-inside:auto}h2{margin-top:18px}h2{break-after:avoid}
+  .schema-section{break-before:page}
+  .printfoot{display:block;position:fixed;bottom:0;left:0;right:0;font-size:8pt;color:var(--muted);border-top:1px solid var(--line);padding-top:3px;background:#fff}
+}
+</style>'
+kind_chip <- function(k) sprintf('<span class="chip kind">%s</span>', esc(if (nzchar(k)) paste0(toupper(substr(k, 1, 1)), substr(k, 2, nchar(k))) else k))
+sig <- function(txt, warn = FALSE) sprintf('<span class="sig%s">%s</span>', if (warn) " sig-warn" else "", esc(txt))
+# Change-signal chips: one compact chip per flagged dimension (missingness/unparseable tinted, the rest neutral).
+sig_chips <- function(r) {
+  s <- character(0)
+  if (isTRUE(r$flag_kind))  s <- c(s, sig(sprintf("KIND %s → %s", r$kind.o, r$kind.n)))
+  if (isTRUE(r$flag_type))  s <- c(s, sig(sprintf("TYPE %s → %s", r$type.o, r$type.n)))
+  if (isTRUE(r$flag_const)) s <- c(s, sig(sprintf("CONSTANT %s → %s", fmtn(r$mean.o), fmtn(r$mean.n))))
+  if (isTRUE(r$flag_miss))  s <- c(s, sig(sprintf("MISSING %+.1fpt", r$d_miss), warn = r$d_miss > 0))
+  if (isTRUE(r$flag_smd))   s <- c(s, sig(sprintf("SMD %+.2f", r$smd)))
+  if (isTRUE(r$flag_quantile)) s <- c(s, sig(sprintf("QUANTILE %.2f SD", r$q_shift_max)))
+  if (isTRUE(r$flag_distinct)) s <- c(s, sig(sprintf("DISTINCT/N %+.0f%%", 100 * r$d_distinct_signed)))
+  if (isTRUE(r$cat_flag))   s <- c(s, sig("TOP CATEGORY CHANGED"))
+  if (isTRUE(r$unparse_up)) s <- c(s, sig(sprintf("UNPARSEABLE %+d", as.integer(r$d_unparse)), warn = TRUE))
+  if (isTRUE(r$flag_date) && !isTRUE(r$unparse_up)) s <- c(s, sig("DATE RANGE"))
+  paste(s, collapse = "")
+}
+cards_html <- function(cards) paste0('<div class="cards">', paste(vapply(cards, function(c)
+  sprintf('<div class="card%s"><div class="val">%s</div><div class="lab">%s</div><div class="sub">%s</div></div>',
+    if (isTRUE(c$warn)) " warn" else "", esc(c$val), esc(c$lab), esc(c$sub)), character(1)), collapse = ""), '</div>')
+# Group "tablebase|column" schema changes by table (special tables — new/dropped — badged).
+group_cols_html <- function(cols, special, sign_cls, sign_ch, tag) {
+  if (!length(cols)) return('<p class="na">None.</p>')
+  tb <- sub("\\|.*$", "", cols); cl <- sub("^[^|]*\\|", "", cols)
+  tabs <- unique(tb); tabs <- c(intersect(special, tabs), setdiff(tabs, special))
+  grp <- vapply(tabs, function(t) {
+    lis <- paste(sprintf('<li><span class="%s">%s</span>%s</li>', sign_cls, sign_ch, esc(cl[tb == t])), collapse = "")
+    bd  <- if (t %in% special) sprintf(' <span class="%s">%s</span>', if (identical(sign_cls, "plus")) "newtab" else "droptab", tag) else ""
+    sprintf('<div class="grp"><div class="gt">%s%s</div><ul>%s</ul></div>', esc(t), bd, lis) }, character(1))
+  paste0('<div class="adds">', paste(grp, collapse = ""), '</div>')
+}
+
+render_html <- function() {
+  n_shared <- nrow(j); n_flag <- nrow(flagged); n_tbl_alert <- sum(tbl_rows$flag, na.rm = TRUE)
+  cut_o <- cut_of(old_path); cut_n <- cut_of(new_path)
+  ident <- sprintf("%s → %s · generated %s", esc(cut_o), esc(cut_n), esc(gen_time))
+  runmeta <- paste0('<div class="runmeta">',
+    sprintf('<span>old <b>%s</b></span>', esc(basename(old_path))),
+    sprintf('<span>new <b>%s</b></span>', esc(basename(new_path))),
+    sprintf('<span><b>%d</b> shared columns compared</span>', n_shared),
+    sprintf('<span>generated <b>%s</b></span>', esc(gen_time)), '</div>')
+  conf <- sprintf('<span class="conf">Restricted RWD output · %s → %s</span>', esc(cut_o), esc(cut_n))
+  cards <- cards_html(list(
+    list(val = length(added_cols),   lab = "Added columns",     sub = sprintf("%d added tables", length(added_tbls))),
+    list(val = length(dropped_cols), lab = "Dropped columns",   sub = sprintf("%d dropped tables", length(dropped_tbls)), warn = length(dropped_cols) > 0),
+    list(val = n_flag,               lab = "Flagged shifts",    sub = sprintf("of %d shared columns", n_shared), warn = n_flag > 0),
+    list(val = n_tbl_alert,          lab = "Table-size alerts",  sub = sprintf("|Δ rows| ≥ %g%%", rows_pct), warn = n_tbl_alert > 0)))
+
+  # Changes requiring review — priority-sorted (already), signals + supporting detail.
+  ftbl <- if (n_flag) paste(vapply(seq_len(n_flag), function(i) { r <- flagged[i, ]
+    sprintf('<tr><td class="col">%s</td><td>%s</td><td class="sigcell">%s</td><td class="note">%s</td></tr>',
+      esc(r$colname), kind_chip(r$kind.n), sig_chips(r), esc(note_for(r))) }, character(1)), collapse = "") else ""
+  changes_sec <- if (n_flag) paste0(
+    sprintf('<h2>Changes requiring review <span class="n">· %d of %d</span></h2>', n_flag, n_shared),
+    '<div class="table-wrap"><table><caption class="sr-only">Columns flagged for review, most-shifted first</caption>',
+    '<thead><tr><th>Column</th><th>Kind</th><th>Change signals</th><th>Supporting detail</th></tr></thead><tbody>',
+    ftbl, '</tbody></table></div>')
+  else '<h2>Changes requiring review</h2><p class="na">No shared column crossed a flag threshold.</p>'
+
+  # Row-count changes.
+  rc <- if (nrow(tbl_rows)) paste(vapply(seq_len(nrow(tbl_rows)), function(i) { t <- tbl_rows[i, ]
+    sprintf('<tr><td class="tbl">%s</td><td class="num">%s</td><td class="num">%s</td><td class="num">%s</td><td>%s</td></tr>',
+      esc(t$table_base), esc(fmtn(t$rows_o)), esc(fmtn(t$rows_n)),
+      if (is.na(t$d_rel)) "n/a" else sprintf("%+.1f%%", t$d_rel),
+      if (isTRUE(t$flag)) '<span class="chip alert">alert</span>' else "") }, character(1)), collapse = "") else ""
+  rc_sec <- paste0('<h2>Row-count changes <span class="n">· by table</span></h2><div class="table-wrap"><table>',
+    '<caption class="sr-only">Table row-count change old vs new</caption>',
+    '<thead><tr><th>Table</th><th class="num">Old rows</th><th class="num">New rows</th><th class="num">Δ%</th><th>Flag</th></tr></thead><tbody>',
+    rc, '</tbody></table></div>')
+
+  # Schema additions / removals grouped by table.
+  schema_sec <- paste0('<section class="schema-section"><h2>Schema additions &amp; removals <span class="n">· by table</span></h2>',
+    sprintf('<p class="subh">Added <span class="n">· %d columns%s</span></p>', length(added_cols),
+            if (length(added_tbls)) sprintf(", %d new tables", length(added_tbls)) else ""),
+    group_cols_html(added_cols, added_tbls, "plus", "+", "new table"),
+    sprintf('<p class="subh">Removed <span class="n">· %d columns%s</span></p>', length(dropped_cols),
+            if (length(dropped_tbls)) sprintf(", %d dropped tables", length(dropped_tbls)) else ""),
+    group_cols_html(dropped_cols, dropped_tbls, "minus", "−", "dropped table"), '</section>')
+
+  method_sec <- paste0('<h2>Thresholds &amp; methodology</h2><div class="panel">',
+    sprintf('<p>%s</p>', esc(thr_txt)),
+    '<p>Flags are magnitude-based <b>candidates to review</b> — clinical significance is a human judgment. Missingness drift is a rate (comparable across differing row counts); continuous drift is SMD = (mean_new − mean_old) / pooled SD, with a max per-quantile shift for tail/shape; cardinality is distinct-per-nonmissing.</p>',
+    if (nzchar(samp_note)) sprintf('<p class="caveat">%s</p>', esc(samp_note)) else "", '</div>')
+
+  paste0('<!doctype html><html lang="en"><head><meta charset="utf-8">',
+    '<meta name="viewport" content="width=device-width, initial-scale=1">',
+    sprintf('<title>Snapshot comparison — %s → %s</title>', esc(cut_o), esc(cut_n)), report_css,
+    '</head><body><div class="sheet">',
+    '<p class="eyebrow">Snapshot comparison</p>',
+    sprintf('<h1>Drift review — %s → %s</h1>', esc(cut_o), esc(cut_n)), runmeta, conf,
+    '<h2>Executive summary</h2>', cards,
+    changes_sec, rc_sec, schema_sec, method_sec,
+    sprintf('<div class="foot"><span><b>%s → %s</b></span><span>Restricted RWD output · generated %s</span></div>', esc(cut_o), esc(cut_n), esc(gen_time)),
+    '</div>', sprintf('<div class="printfoot">Restricted RWD output · %s</div>', ident), '</body></html>')
+}
+render_md <- function() {
+  c(sprintf("# Snapshot comparison\n\n%s\n%s\n_%s_\n\n_%s_\n", sub_txt,
+            if (nzchar(samp_note)) sprintf("\n**%s**\n", samp_note) else "",
+            "Flags are magnitude-based candidates to review — clinical significance is a human judgment.", thr_txt),
+    "## Schema changes\n",
+    sprintf("- **Added tables (%d):** %s", length(added_tbls), if (length(added_tbls)) paste(added_tbls, collapse=", ") else "—"),
+    sprintf("- **Dropped tables (%d):** %s", length(dropped_tbls), if (length(dropped_tbls)) paste(dropped_tbls, collapse=", ") else "—"),
+    sprintf("- **Added columns (%d):** %s", length(added_cols), if (length(added_cols)) paste(added_cols, collapse=", ") else "—"),
+    sprintf("- **Dropped columns (%d):** %s", length(dropped_cols), if (length(dropped_cols)) paste(dropped_cols, collapse=", ") else "—"),
+    "\n## Row counts by table\n", "| table | old rows | new rows | Δ% |", "|---|---:|---:|---:|",
+    if (nrow(tbl_rows)) apply(tbl_rows, 1, function(t) sprintf("| %s | %s | %s | %+.1f%%%s |", t[["table_base"]],
+      fmtn(as.numeric(t[["rows_o"]])), fmtn(as.numeric(t[["rows_n"]])), as.numeric(t[["d_rel"]]),
+      if (as.logical(t[["flag"]])) " ⚠" else "")) else character(0),
+    sprintf("\n## Flagged shifts (%d of %d shared columns)\n", length(flag_rows), nrow(j)),
+    if (length(flag_rows)) c("| table.column | kind | missing (old→new) | n (old→new) | what changed |",
+                             "|---|---|---|---:|---|",
+      vapply(flag_rows, function(r) sprintf("| %s | %s | %s | %s | %s |", r$col, r$kind, r$miss, r$n,
+             gsub("|","\\|", r$note, fixed = TRUE)), character(1)))
+    else "_No column crossed a flag threshold._")
+}
+
+run <- function() {
+  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+  html <- file.path(out_dir, "snapshot_comparison.html")
+  md   <- file.path(out_dir, "snapshot_comparison.md")
+  writeLines(render_html(), html)
+  writeLines(paste(render_md(), collapse = "\n"), md)
+  message(sprintf("compared %d shared columns; %d flagged. wrote %s",
+                  nrow(j), length(flag_rows), html))
+  invisible(list(flagged = flagged, tbl_rows = tbl_rows))
+}
+if (!nzchar(Sys.getenv("CMP_DEFINE_ONLY"))) run()
+
+intake/oncology/oc/202606/exploratory/code/data_profiler.R
+# Data characterization — a standalone profiler that works for any tumor/product. Point it at ANY
+# Databricks schema (or local extracts) and it writes a stakeholder report: per-column distribution
+# and missingness for every table. Nothing here is tumor-specific.
 #
 # TO RUN: edit the CONFIG block just below (at least catalog + schema for your product), then
 #   DATABRICKS_DSN=RWDE DATABRICKS_PWD=... Rscript data_profiler.R
-# Every CONFIG value is also overridable by its DC_* environment variable (env wins), so
-# automation keeps working — but editing the block and running is all a person needs.
-# tidyverse/dplyr over ODBC, no Spark.
+# Any CONFIG value can also be set with its DC_* env var (env wins), so automation keeps working —
+# but for a person, editing the block and running is all it takes. dplyr over ODBC, no Spark.
 
 library(dplyr); library(stringr)
 
@@ -68,11 +491,11 @@ product_id       <- getcfg("DC_PRODUCT_ID", CFG$product_id)   # optional stable 
 new_only         <- tolower(getcfg("DC_NEW_ONLY",       as.character(CFG$new_only)))       %in% c("true","1","yes","t")
 inventory_only   <- tolower(getcfg("DC_INVENTORY_ONLY", as.character(CFG$inventory_only))) %in% c("true","1","yes","t")
 
-# "New" detection. Best way: compare against the prior feed. Set DC_BASELINE_COLS to a file
-# of "tablebase|column" lines (base = table name without the _YYYYmMM cut); a column is new
-# if it isn't in that list. Without a baseline, nothing is flagged unless you name known
-# additions yourself via DC_KNOWN_NEW_TABLES / DC_KNOWN_NEW_COLS — kept generic (no tumor or
-# data product baked in) so the one script is reusable everywhere. Prefer a baseline; these are a hint.
+# "New" detection. Best way: compare against the prior feed. Set DC_BASELINE_COLS to a file of
+# "tablebase|column" lines (base = table name without the _YYYYmMM cut); a column is new if it isn't
+# in that list. With no baseline, nothing is flagged unless you name the additions yourself via
+# DC_KNOWN_NEW_TABLES / DC_KNOWN_NEW_COLS — kept generic (no tumor or product baked in) so the one
+# script works everywhere. Prefer a baseline; the manual hints are just a fallback.
 env_list <- function(env, default) { v <- str_trim(getcfg(env, default))
   if (!nzchar(v)) character(0) else str_to_lower(str_split(v, "\\s*,\\s*")[[1]]) }
 KNOWN_NEW_TABLES <- env_list("DC_KNOWN_NEW_TABLES", CFG$known_new_tables)   # base names; default none
@@ -89,13 +512,20 @@ for (.nm in c("sample_seed", "top_n")) { .v <- get(.nm)
     stop(sprintf("config %s must resolve to a positive integer (check its DC_* override).", .nm)) }
 if (!source_mode %in% c("dbi", "local"))
   stop(sprintf("DC_SOURCE_MODE must be 'dbi' or 'local', got '%s'.", source_mode))
-# per-column kind override "col=categorical,col2=numeric" -> named char vector (names/values lowercased)
+# per-column kind override "col=categorical,col2=numeric" -> named char vector (names/values lowercased).
+# Fail loud on a malformed entry (no '=', empty column, unsupported kind like a "numerci" typo) instead of
+# silently falling back to inference — only "numeric" and "categorical" are supported overrides.
 kind_overrides <- local({
   s <- str_trim(getcfg("DC_KIND_OVERRIDES", CFG$kind_overrides))
   if (!nzchar(s)) return(character(0))
-  kv <- str_split(str_split(s, "\\s*,\\s*")[[1]], "\\s*=\\s*")
-  setNames(vapply(kv, function(p) str_to_lower(p[2]), character(1)),
-           vapply(kv, function(p) str_to_lower(p[1]), character(1)))
+  kv  <- str_split(str_split(s, "\\s*,\\s*")[[1]], "\\s*=\\s*")
+  bad <- vapply(kv, function(p) length(p) != 2L || !nzchar(str_trim(p[1])) ||
+                  !str_to_lower(str_trim(p[2])) %in% c("numeric", "categorical"), logical(1))
+  if (any(bad))
+    stop(sprintf("DC_KIND_OVERRIDES: each entry must be 'column=numeric' or 'column=categorical' — bad: %s",
+                 paste(vapply(kv[bad], function(p) paste(p, collapse = "="), character(1)), collapse = ", ")))
+  setNames(vapply(kv, function(p) str_to_lower(str_trim(p[2])), character(1)),
+           vapply(kv, function(p) str_to_lower(str_trim(p[1])), character(1)))
 })
 # Strip the snapshot cut so tables match across drops. Default covers _YYYYmMM, _YYYYqN, _YYYYMM,
 # _YYYY; set CFG$cut_regex (or DC_CUT_REGEX) for a data product that suffixes snapshots differently.
@@ -255,10 +685,10 @@ is_new_col   <- function(tbl, col) if (have_baseline) !(paste(base_name(tbl), st
                                    str_to_lower(col) %in% KNOWN_NEW_COLS
 
 # ---- connection (Databricks over ODBC) ----
-# bigint = "character": a profiler reads arbitrary columns, and a large 64-bit id as an R double can lose
-# exact precision (collapsing distinct ids / understating distinct counts). As character, ids stay exact and
-# read as high-cardinality categoricals (the correct treatment); a genuine numeric measure delivered as a
-# big integer can be forced back with DC_KIND_OVERRIDES=col=numeric (which coerces a character column).
+# bigint = "character": the profiler reads arbitrary columns, and a large 64-bit id read as a double can
+# lose precision (collapsing distinct ids and understating distinct counts). As text, ids stay exact and
+# read as high-cardinality categoricals, which is the right treatment. If a real numeric measure arrives
+# as a big integer, force it back with DC_KIND_OVERRIDES=col=numeric (it coerces the character column).
 get_con <- function() {
   if (exists("con", envir = .GlobalEnv)) return(get("con", envir = .GlobalEnv))
   pwd <- Sys.getenv("DATABRICKS_PWD", "")
@@ -410,9 +840,9 @@ profile_table <- function(df, tbl, n_total, sampled) {
 }
 
 # One row per (table, column) of machine-readable metrics -> profile_<cut>.tsv, the input to
-# compare_snapshots.R. Carries counts AND rates: missingness is stored as a rate (pct_missing) so it
-# is comparable across snapshots with different row counts, with n_rows/n_missing alongside so a rate
-# shift can be traced to numerator vs denominator. Plus the full numeric quantile grid and top values.
+# compare_snapshots.R. Keeps both counts and rates: missingness is stored as a rate (pct_missing) so it
+# compares across snapshots with different row counts, with n_rows/n_missing beside it so you can tell
+# whether a shift came from the count or the row total. Plus the full quantile grid and top values.
 profile_tsv_df <- function(results) {
   bind_rows(lapply(results, function(r)
     r$prof %>% mutate(table = r$meta$table, table_base = base_name(r$meta$table),
@@ -427,11 +857,102 @@ profile_tsv_df <- function(results) {
 esc <- function(x) { x <- as.character(x)
   x <- gsub("&", "&amp;", x, fixed = TRUE); x <- gsub("<", "&lt;", x, fixed = TRUE)
   gsub(">", "&gt;", x, fixed = TRUE) }
-badge    <- function(new) if (isTRUE(new)) ' <span class="badge">new</span>' else ""
-miss_bar <- function(pct) if (is.na(pct)) "n/a (no rows)" else
-  sprintf('<div class="bar"><div class="fill" style="width:%.0f%%"></div></div> %.1f%%', pct, pct)
 pctfmt   <- function(p) if (is.na(p)) "n/a" else sprintf("%.1f%%", p)   # % missing, "n/a" when no rows
 fmi      <- function(n) format(n, big.mark = ",", scientific = FALSE)   # count -> "1,234,567" (never 1e+06)
+
+# ============================ HTML report (stakeholder-facing) ============================
+# The MD/TSV outputs above remain the complete technical record; the HTML is the polished
+# stakeholder report — exec-summary cards, a summary-first "New variables" table with small
+# categorical/date/numeric visuals, a technical appendix, and print CSS. Every value is read
+# from the same profile object, so counts and scope cannot drift between sections.
+cap1     <- function(s) if (!length(s) || !nzchar(s)) s else paste0(toupper(substr(s, 1, 1)), substr(s, 2, nchar(s)))
+disp_tbl <- function(t) base_name(t)                                    # strip the cut suffix for display
+kind_chip <- function(k) sprintf('<span class="chip kind">%s</span>', esc(cap1(k)))
+alert_chip <- function(pct) if (!is.na(pct) && pct > 20) ' <span class="chip alert">&gt;20% missing</span>' else ""
+miss_band <- function(pct) if (is.na(pct)) "na" else if (pct < 5) "lo" else if (pct <= 20) "mid" else "hi"
+# Missing cell: severity bar (width = the ACTUAL %, capped 0-100) + "count (pct%)".
+miss_cell <- function(pct, cnt) {
+  if (is.na(pct)) return('<span class="na">n/a (no rows)</span>')
+  sprintf('<div class="miss %s"><span class="bar"><span class="fill" style="width:%.1f%%"></span></span><span class="val"><b>%s</b> (%.1f%%)</span></div>',
+          miss_band(pct), max(0, min(100, pct)), fmi(cnt), pct)
+}
+miss_rate_cell <- function(pct) {   # rate-only variant (tables-with-additions)
+  if (is.na(pct)) return('<span class="na">n/a</span>')
+  sprintf('<div class="miss %s"><span class="bar"><span class="fill" style="width:%.1f%%"></span></span><span class="val"><b>%.1f%%</b></span></div>',
+          miss_band(pct), max(0, min(100, pct)), pct)
+}
+# Parse the machine-readable "count:value|count:value" (split each item on its FIRST colon).
+parse_topv <- function(enc) {
+  if (length(enc) != 1 || is.na(enc) || !nzchar(enc)) return(NULL)
+  items <- strsplit(enc, "|", fixed = TRUE)[[1]]; items <- items[nzchar(items)]
+  cnt <- numeric(0); val <- character(0)
+  for (it in items) { pos <- regexpr(":", it, fixed = TRUE)
+    if (pos < 1) next
+    cnt <- c(cnt, suppressWarnings(as.numeric(substr(it, 1, pos - 1))))
+    val <- c(val, substr(it, pos + 1, nchar(it))) }
+  if (!length(cnt) || any(is.na(cnt))) return(NULL)
+  data.frame(count = cnt, value = val, stringsAsFactors = FALSE)
+}
+# Categorical mini-bars: top N by ACTUAL share of non-missing, plus an "Other" bar for the rest.
+cat_bars <- function(enc, n_nonmiss, distinct, topN = 5) {
+  tv <- parse_topv(enc)
+  if (is.null(tv) || is.na(n_nonmiss) || n_nonmiss <= 0) return("")
+  shown <- utils::head(tv, topN)
+  bar <- function(v, c) { pc <- 100 * c / n_nonmiss
+    sprintf('<div class="catrow"><span class="lbl">%s</span><span class="tk"><span class="fl" style="width:%.1f%%"></span></span><span class="vp">%.1f%%</span></div>',
+            esc(v), max(0, min(100, pc)), pc) }
+  rows <- vapply(seq_len(nrow(shown)), function(i) bar(shown$value[i], shown$count[i]), character(1))
+  other <- n_nonmiss - sum(shown$count)
+  if (!is.na(distinct) && distinct > nrow(shown) && other > 0.5) { pc <- 100 * other / n_nonmiss
+    rows <- c(rows, sprintf('<div class="catrow"><span class="lbl" style="color:var(--faint)">Other</span><span class="tk"><span class="fl" style="width:%.1f%%;background:var(--faint)"></span></span><span class="vp">%.1f%%</span></div>',
+                            max(0, min(100, pc)), pc)) }
+  paste0('<div class="cat">', paste(rows, collapse = ""), '</div>')
+}
+# Categorical values as one line each (appendix summary cell).
+cat_lines <- function(enc, n_nonmiss) {
+  tv <- parse_topv(enc)
+  if (is.null(tv) || is.na(n_nonmiss) || n_nonmiss <= 0) return(NULL)
+  sp <- vapply(seq_len(nrow(tv)), function(i)
+    sprintf('<span>%s (%s, %.1f%%)</span>', esc(tv$value[i]), fmi(tv$count[i]), 100 * tv$count[i] / n_nonmiss), character(1))
+  paste0('<span class="catlines">', paste(sp, collapse = ""), '</span>')
+}
+# Inline SVG boxplot from min/p25/median/p75/max (styled by CSS classes so palette swaps propagate).
+box_svg <- function(mn, q1, md, q3, mx) {
+  if (any(is.na(c(mn, q1, md, q3, mx)))) return("")
+  L <- 22; W <- 196; span <- mx - mn
+  sx <- function(v) if (span > 0) L + (v - mn) / span * W else L + W / 2
+  sprintf(paste0('<svg class="box" width="240" height="34" viewBox="0 0 240 34" aria-label="boxplot min %s to max %s">',
+    '<line class="bx-axis" x1="%.1f" y1="13" x2="%.1f" y2="13"/>',
+    '<line class="bx-whisk" x1="%.1f" y1="8" x2="%.1f" y2="18"/><line class="bx-whisk" x1="%.1f" y1="8" x2="%.1f" y2="18"/>',
+    '<rect class="bx-box" x="%.1f" y="5" width="%.1f" height="16" rx="3"/>',
+    '<line class="bx-med" x1="%.1f" y1="4" x2="%.1f" y2="22"/>',
+    '<text class="bx-lab" x="%.1f" y="32" text-anchor="middle">%s</text>',
+    '<text class="bx-lab" x="%.1f" y="32" text-anchor="middle">%s</text></svg>'),
+    esc(fmt_num(mn)), esc(fmt_num(mx)), sx(mn), sx(mx), sx(mn), sx(mn), sx(mx), sx(mx),
+    sx(q1), max(1, sx(q3) - sx(q1)), sx(md), sx(md), sx(mn), esc(fmt_num(mn)), sx(mx), esc(fmt_num(mx)))
+}
+num_cell <- function(p) {
+  # Surface forced-numeric (DC_KIND_OVERRIDES) coercion failures here, not only in the appendix/TSV — a
+  # character/BIGINT measure whose values don't parse as numbers would otherwise look clean (or bare n/a).
+  unp <- if (!is.na(p$unparseable) && p$unparseable > 0) sprintf('<div class="warnnote">%s unparseable</div>', fmi(p$unparseable)) else ""
+  if (is.na(p$p50)) return(if (nzchar(unp)) sprintf('<div class="cont"><span class="na">n/a — all values failed to parse</span>%s</div>', unp)
+                           else '<span class="na">n/a</span>')
+  sprintf('<div class="cont"><div class="stat">Median <b>%s</b> · IQR <b>%s–%s</b> · Mean <b>%s</b> · SD <b>%s</b> · Range <b>%s–%s</b></div>%s%s</div>',
+    fmt_num(p$p50), fmt_num(p$p25), fmt_num(p$p75), fmt_num(p$mean), fmt_num(p$sd), fmt_num(p$min), fmt_num(p$max),
+    box_svg(p$min, p$p25, p$p50, p$p75, p$max), unp)
+}
+date_cell <- function(p) {
+  if (is.na(p$date_min)) return('<span class="na">n/a</span>')
+  warn <- if (!is.na(p$unparseable) && p$unparseable > 0) sprintf('<div class="warnnote">%s unparseable</div>', fmi(p$unparseable)) else ""
+  sprintf('<div class="dr"><div class="span"><span class="d">%s</span><span class="line"></span><span class="d">%s</span></div>%s</div>',
+          esc(p$date_min), esc(p$date_max), warn)
+}
+dist_cell <- function(p) {
+  if (identical(p$kind, "numeric")) num_cell(p)
+  else if (identical(p$kind, "date")) date_cell(p)
+  else { cb <- cat_bars(p$top_values, p$n_nonmissing, p$distinct)
+         if (nzchar(cb)) cb else sprintf('<span class="summ">%s</span>', esc(p$summary)) }
+}
 
 # Added / dropped tables and columns vs the baseline feed (the comparison deliverable).
 # cur_cols is the FULL current inventory (tablebase|column for every column), so added/dropped stay
@@ -448,13 +969,188 @@ changes_caveats <- function() {
   c("Added/dropped only — not type, category, missingness or distribution changes.",
     if (nzchar(tables_env)) "This run profiled a table subset (DC_TABLES), so \"dropped\" may reflect the subset, not a real drop. Compare like-for-like table scope." else NULL)
 }
-render_changes_html <- function(ch) {
-  it <- function(lab, v) sprintf("<li><b>%s (%d):</b> %s</li>", lab, length(v),
-    if (length(v)) esc(paste(v, collapse = ", ")) else "&mdash;")
-  cav <- paste(sprintf("<p class='caveat'>%s</p>", esc(changes_caveats())), collapse = "")
-  paste0("<div class='changes'><h2>Changes vs baseline</h2><ul>",
-    it("Added tables", ch$added_tbls), it("Dropped tables", ch$dropped_tbls),
-    it("Added columns", ch$added_cols), it("Dropped columns", ch$dropped_cols), "</ul>", cav, "</div>")
+# ---- HTML report: stylesheet (GSK palette — swap the hex values in the :root block) ----
+report_css <- '<style>
+:root{
+  --accent:#C4441C; --accent-bar:#F36633; --accent-soft:#FDE7DD; --accent-ink:#7A2A10;
+  --amber:#CA8A04; --amber-soft:#EAB308; --amber-bg:#FEF3C7; --amber-ink:#8A6D09; --fail:#C8102E;
+  --ink:#2A1A47; --ink-2:#3F3A4A; --muted:#6B6A78; --faint:#A3A1AD;
+  --line:#E7E3EF; --line-2:#D6D1E0; --surface:#FFFFFF; --page:#F2F0F7; --panel:#F8F6FB; --panel-edge:#ECE8F3;
+  --neutral-bar:#9AA2B1; --track:#ECEAF2; --newrow:#FEF5F0; --newrow-alt:#FDEEE6; --row-hover:#FAF5F1;
+  --mono:ui-monospace,"Cascadia Code","Source Code Pro",Menlo,Consolas,monospace;
+  --sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+}
+*{box-sizing:border-box}
+body{font:15px/1.55 var(--sans);color:var(--ink-2);background:var(--page);margin:0;padding:28px}
+.sheet{max-width:1180px;margin:0 auto;background:var(--surface);border:1px solid var(--line);border-radius:12px;box-shadow:0 1px 3px rgba(15,23,42,.06);padding:34px 38px 30px}
+.eyebrow{font-size:11px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:var(--accent);margin:0 0 4px}
+h1{font-size:27px;line-height:1.15;font-weight:700;color:var(--ink);margin:0 0 8px;letter-spacing:-.01em}
+.runmeta{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:13px;color:var(--muted);margin:0 0 4px}
+.runmeta b{color:var(--ink-2);font-weight:600}
+.conf{display:inline-block;font-size:10.5px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--amber-ink);background:var(--amber-bg);border:1px solid #FCD34D;border-radius:5px;padding:2px 8px;margin-top:6px}
+h2{font-size:12px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);margin:30px 0 12px;padding-bottom:7px;border-bottom:1px solid var(--line)}
+h2 .n{color:var(--accent);margin-left:6px}
+.lead-wrap{margin:6px 0 8px}
+.lead{font-size:19px;font-weight:700;color:var(--ink);letter-spacing:-.01em;margin:0;display:flex;align-items:baseline;gap:10px;white-space:nowrap}
+.lead .count{font-size:13px;font-weight:600;color:#fff;background:var(--accent);border-radius:20px;padding:2px 11px}
+.legend{font-size:12px;color:var(--muted);margin:5px 0 0}
+.legend .sw{display:inline-block;width:9px;height:9px;border-radius:2px;vertical-align:0;margin:0 3px 0 10px}
+.legend .sw:first-child{margin-left:0}
+.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:2px 0 4px}
+.card{background:var(--panel);border:1px solid var(--panel-edge);border-left:3px solid var(--accent);border-radius:10px;padding:14px 16px}
+.card.warn{border-left-color:var(--amber)}
+.card .val{font-size:30px;font-weight:700;color:var(--ink);line-height:1.05;letter-spacing:-.02em}
+.card.warn .val{color:var(--amber-ink)}
+.card .lab{font-size:12.5px;font-weight:600;color:var(--ink-2);margin-top:3px}
+.card .sub{font-size:11.5px;color:var(--muted);margin-top:2px}
+.table-wrap{width:100%;overflow-x:auto}
+table{border-collapse:collapse;width:100%;margin:2px 0 6px;font-size:14px}
+thead th{position:sticky;top:0;background:var(--panel);text-align:left;font-weight:600;color:var(--ink-2);font-size:12.5px;padding:9px 12px;border-bottom:2px solid var(--line-2);white-space:nowrap}
+th.num,td.num{text-align:right;font-variant-numeric:tabular-nums}
+tbody td{padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:middle}
+tbody tr:nth-child(even){background:#FBFAFC}
+tbody tr:hover{background:var(--row-hover)}
+tr.newrow{background:var(--newrow)}
+tr.newrow:nth-child(even){background:var(--newrow-alt)}
+.col{font-family:var(--mono);font-size:13px;color:var(--ink);font-weight:600;word-break:break-word}
+.tbl{font-family:var(--mono);font-size:12.5px;color:var(--muted);word-break:break-word}
+td .summ{white-space:normal;word-break:break-word}
+.chip{display:inline-block;font-size:11px;font-weight:600;padding:2px 8px;border-radius:20px;white-space:nowrap}
+.chip.kind{background:#EEF0F5;color:#4B5563;border:1px solid #E3E1EA}
+.chip.alert{background:var(--amber-bg);color:var(--amber-ink);border:1px solid #FCD34D}
+.miss{display:flex;align-items:center;gap:9px;min-width:150px}
+.miss .bar{flex:1;height:7px;background:var(--track);border-radius:4px;overflow:hidden;max-width:74px}
+.miss .fill{display:block;height:100%;border-radius:4px}
+.miss .val{font-variant-numeric:tabular-nums;font-size:13px;white-space:nowrap}
+.miss .val b{font-weight:600}
+.lo .fill{background:var(--neutral-bar)} .lo .val{color:var(--muted)}
+.mid .fill{background:var(--amber-soft)} .mid .val b{color:var(--amber-ink)}
+.hi .fill{background:var(--amber)} .hi .val b{color:var(--amber-ink)}
+.na{color:var(--faint);font-size:13px}
+.cat{display:flex;flex-direction:column;gap:3px;min-width:230px}
+.catrow{display:grid;grid-template-columns:96px 1fr 46px;align-items:center;gap:8px;font-size:12.5px}
+.catrow .lbl{color:var(--ink-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.catrow .tk{height:9px;background:var(--track);border-radius:3px;overflow:hidden}
+.catrow .fl{display:block;height:100%;background:var(--accent-bar);border-radius:3px}
+.catrow .vp{color:var(--muted);text-align:right;font-variant-numeric:tabular-nums}
+.cont{display:flex;flex-direction:column;gap:2px;min-width:250px}
+.cont .stat{font-size:12.5px;color:var(--ink-2)}
+.cont .stat b{color:var(--ink);font-weight:600}
+.cont svg{display:block}
+.bx-axis{stroke:#CBC7D6;stroke-width:2}.bx-whisk{stroke:var(--neutral-bar);stroke-width:2}
+.bx-box{fill:var(--accent-soft);stroke:var(--accent-bar);stroke-width:1.5}.bx-med{stroke:var(--accent);stroke-width:2.5}
+.bx-lab{fill:var(--faint);font-size:9px;font-family:var(--sans)}
+.dr{display:flex;flex-direction:column;gap:2px;min-width:230px;font-size:12.5px}
+.dr .span{display:flex;align-items:center;gap:8px;color:var(--ink-2)}
+.dr .line{flex:1;height:2px;background:linear-gradient(90deg,var(--accent-bar),#FBB89B);border-radius:2px;position:relative}
+.dr .line::before,.dr .line::after{content:"";position:absolute;top:-2px;width:6px;height:6px;border-radius:50%;background:var(--accent)}
+.dr .line::before{left:0}.dr .line::after{right:0}
+.dr .d{font-variant-numeric:tabular-nums;font-weight:600;color:var(--ink)}
+.warnnote{color:var(--amber-ink);font-size:12px;margin-top:1px}
+.adds{display:grid;grid-template-columns:repeat(2,1fr);gap:8px 26px;margin:2px 0 6px}
+.adds .grp{padding:8px 0;break-inside:avoid}
+.adds .gt{font-family:var(--mono);font-size:13px;font-weight:600;color:var(--ink)}
+.adds .gt .newtab{font-family:var(--sans);font-size:10.5px;font-weight:700;color:#fff;background:var(--accent);border-radius:10px;padding:1px 7px;margin-left:6px;vertical-align:1px}
+.adds ul{margin:5px 0 0;padding:0 0 0 4px;list-style:none}
+.adds li{font-family:var(--mono);font-size:12.5px;color:var(--ink-2);padding:1px 0}
+.adds li .plus{color:var(--accent);font-weight:700;margin-right:6px}
+.panel{background:var(--panel);border:1px solid var(--panel-edge);border-radius:10px;padding:14px 18px;font-size:13px;color:var(--muted)}
+.panel p{margin:0 0 7px}.panel p:last-child{margin:0}
+.panel.removed{color:var(--ink-2)}.panel.removed .rc-cav{color:var(--muted);font-size:12px}
+.appendix-note{font-size:13px;color:var(--muted);margin:4px 0 14px}
+.appendix h2{color:var(--ink-2)}
+.app-table{font-size:12.5px}
+.app-table thead th{font-size:11.5px;padding:7px 10px}
+.app-table tbody td{padding:6px 10px;vertical-align:top}
+.catlines span{display:block}
+.foot{display:flex;flex-wrap:wrap;justify-content:space-between;gap:8px;margin-top:26px;padding-top:14px;border-top:1px solid var(--line);font-size:11.5px;color:var(--faint)}
+.foot b{color:var(--muted);font-weight:600}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.printfoot{display:none}
+@media (max-width:820px){.cards{grid-template-columns:repeat(2,1fr)}.adds{grid-template-columns:1fr}}
+@media print{
+  @page{size:A4 landscape;margin:12mm 12mm 15mm}
+  *{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+  body{background:#fff;padding:0;font-size:10pt}
+  .sheet{border:0;box-shadow:none;border-radius:0;max-width:none;padding:0}
+  thead{display:table-header-group}
+  tr,.card,.adds .grp,.catrow{break-inside:avoid}
+  .panel{break-inside:auto}
+  h2{margin-top:18px}h2,.lead-wrap{break-after:avoid}
+  .schema-section{break-before:page}.appendix{break-before:page}
+  .printfoot{display:block;position:fixed;bottom:0;left:0;right:0;font-size:8pt;color:var(--muted);border-top:1px solid var(--line);padding-top:3px;background:#fff}
+}
+</style>'
+
+# Executive-summary cards. `cards` = list of list(val, lab, sub, warn).
+cards_html <- function(cards) paste0('<div class="cards">', paste(vapply(cards, function(c)
+  sprintf('<div class="card%s"><div class="val">%s</div><div class="lab">%s</div><div class="sub">%s</div></div>',
+    if (isTRUE(c$warn)) " warn" else "", esc(c$val), esc(c$lab), esc(c$sub)), character(1)), collapse = ""), '</div>')
+
+# Schema additions grouped by table (new tables first). ch$added_cols are "tablebase|column".
+schema_html <- function(ch) {
+  if (!length(ch$added_cols)) return("")
+  tb <- sub("\\|.*$", "", ch$added_cols); cl <- sub("^[^|]*\\|", "", ch$added_cols)
+  tabs <- unique(tb); tabs <- c(intersect(ch$added_tbls, tabs), setdiff(tabs, ch$added_tbls))
+  grp <- vapply(tabs, function(t) {
+    lis <- paste(sprintf('<li><span class="plus">+</span>%s</li>', esc(cl[tb == t])), collapse = "")
+    nt  <- if (t %in% ch$added_tbls) ' <span class="newtab">new table</span>' else ""
+    sprintf('<div class="grp"><div class="gt">%s%s</div><ul>%s</ul></div>', esc(t), nt, lis) }, character(1))
+  paste0('<section class="schema-section"><h2>Schema additions <span class="n">· by table</span></h2><div class="adds">',
+         paste(grp, collapse = ""), '</div></section>')
+}
+
+# "Removed since baseline" — shown only when the baseline had tables/columns absent now.
+removed_html <- function(ch) {
+  if (!length(ch$dropped_tbls) && !length(ch$dropped_cols)) return("")
+  p <- character(0)
+  if (length(ch$dropped_tbls)) p <- c(p, sprintf('<p><b>Tables (%d):</b> %s</p>', length(ch$dropped_tbls), esc(paste(ch$dropped_tbls, collapse = ", "))))
+  if (length(ch$dropped_cols)) p <- c(p, sprintf('<p><b>Columns (%d):</b> %s</p>', length(ch$dropped_cols), esc(paste(ch$dropped_cols, collapse = ", "))))
+  cav <- if (nzchar(tables_env)) '<p class="rc-cav">This run profiled a table subset (DC_TABLES), so a “dropped” item may reflect the subset, not a real drop — compare like-for-like scope.</p>' else ""
+  paste0('<h2>Removed since baseline</h2><div class="panel removed">', paste(p, collapse = ""), cav, '</div>')
+}
+
+# Tables containing additions (new-only contract: total rows, new-col count, missingness across new cols).
+tables_add_html <- function(results, nr, n_assessed) {
+  tabs <- unique(nr$.table)
+  info <- lapply(tabs, function(t) { sub <- nr[nr$.table == t, ]
+    m <- results[[which(vapply(results, function(r) r$meta$table == t, logical(1)))[1]]]$meta
+    list(t = t, rows = m$n_rows_total, ncols = nrow(sub), newt = m$new_table, sampled = m$sampled,
+         miss = if (sum(sub$n) > 0) 100 * sum(sub$missing) / sum(sub$n) else NA_real_) })
+  info <- info[order(-vapply(info, function(x) if (is.na(x$miss)) -1 else x$miss, numeric(1)))]
+  tr <- vapply(info, function(x) sprintf(
+    '<tr><td class="tbl">%s%s</td><td class="num">%s</td><td class="num">%d</td><td>%s</td><td>%s</td></tr>',
+    esc(disp_tbl(x$t)), if (isTRUE(x$newt)) ' <span class="chip kind">new</span>' else "", fmi(x$rows), x$ncols,
+    miss_rate_cell(x$miss), if (isTRUE(x$sampled)) '<span class="chip kind">Sampled</span>' else '<span class="chip kind">Exact</span>'), character(1))
+  paste0('<h2>Tables containing additions <span class="n">· ', length(tabs), ' of ', n_assessed,
+    '</span></h2><div class="table-wrap"><table><caption class="sr-only">Tables containing schema additions</caption>',
+    '<thead><tr><th>Table</th><th class="num">Total rows</th><th class="num">New cols</th><th>Missingness across new columns</th><th>Coverage</th></tr></thead><tbody>',
+    paste(tr, collapse = ""), '</tbody></table></div>')
+}
+
+method_notes_html <- paste0('<h2>Method &amp; interpretation notes</h2><div class="panel">',
+  '<p><b>New = schema-new</b> — present now, absent from the baseline; a rename = one drop + one add; a re-derived or newly-populated existing column is not flagged.</p>',
+  '<p><b>Counts</b> — Rows = total profiled rows at the table’s grain (not unique patients); Missing % = missing ÷ rows; category shares are of non-missing rows.</p>',
+  '<p><b>Missingness bands</b> — display cues (&lt;5% neutral · 5–20% gold · &gt;20% deep gold), not pass/fail; expected for conditionally-recorded fields. Red = failed QC only.</p>',
+  '<p><b>Before distribution</b> — reconcile inferred kinds and cues against the product data dictionary.</p></div>')
+
+# Technical appendix: every profiled column (new-columns-only in that mode), with a Table column.
+appendix_html <- function(results) {
+  allr <- bind_rows(lapply(results, function(r) r$prof %>% mutate(.table = r$meta$table)))
+  if (!nrow(allr)) return("")
+  tr <- vapply(seq_len(nrow(allr)), function(i) { p <- allr[i, ]
+    summ <- if (identical(p$kind, "categorical")) { cl <- cat_lines(p$top_values, p$n_nonmissing); if (!is.null(cl)) cl else esc(p$summary) } else esc(p$summary)
+    sprintf('<tr class="%s"><td class="tbl">%s</td><td class="col">%s</td><td>%s</td><td class="num">%s</td><td class="num">%s</td><td class="num">%s</td><td class="num">%s</td><td class="num">%s</td><td>%s</td></tr>',
+      if (isTRUE(as.logical(p$new))) "newrow" else "", esc(disp_tbl(p$.table)), esc(p$column), esc(p$kind),
+      fmi(p$n), fmi(p$n_nonmissing), fmi(p$distinct), fmi(p$missing), pctfmt(p$pct_missing), summ) }, character(1))
+  fn <- if (identical(profile_mode, "new-columns-only")) sprintf("profile_new_%s.tsv", cut_filter)
+        else sprintf("profile_%s.tsv", if (nzchar(cut_filter)) cut_filter else "all")
+  partial <- if (identical(profile_mode, "new-columns-only")) " It is a <b>partial</b> profile (new columns only) and must not be used as a temporal-drift input." else ""
+  paste0('<div class="appendix"><h2>Technical appendix <span class="n">· columns profiled in this run</span></h2>',
+    sprintf('<p class="appendix-note">Full per-column detail for the columns read this run. The machine-readable <span class="tbl">%s</span> carries the complete metrics, including the p1–p99 quantile grid.%s</p>', fn, partial),
+    '<div class="table-wrap"><table class="app-table"><caption class="sr-only">Technical appendix — per-column profile</caption>',
+    '<thead><tr><th>Table</th><th>Column</th><th>Kind</th><th class="num">Rows</th><th class="num">Nonmissing</th><th class="num">Distinct</th><th class="num">Missing</th><th class="num">% miss</th><th>Summary</th></tr></thead><tbody>',
+    paste(tr, collapse = ""), '</tbody></table></div></div>')
 }
 render_changes_md <- function(ch) {
   it <- function(lab, v) sprintf("- **%s (%d):** %s", lab, length(v), if (length(v)) paste(v, collapse = ", ") else "—")
@@ -478,17 +1174,33 @@ new_vars_caveat <- paste0("New = schema-new (present now, absent from the baseli
   "dropped + one added, and a changed derivation or a newly-populated existing column is NOT flagged. ",
   "n = table rows profiled (episode-level or patient-level per the table's grain), not unique patients; ",
   "category percentages are of non-missing rows.")
-render_new_vars_html <- function(results) {
-  d <- new_vars_df(results)
-  if (is.null(d) || !nrow(d)) return("<div class='changes'><h2>New variables</h2><p>None vs baseline.</p></div>")
-  tr <- apply(d, 1, function(t) sprintf(
-    "<tr><td>%s</td><td><b>%s</b></td><td>%s</td><td class='num'>%s</td><td class='num'>%s</td><td class='num'>%s</td><td class='summ'>%s</td></tr>",
-    esc(t[["table"]]), esc(t[["column"]]), esc(t[["kind"]]), esc(fmi(as.numeric(t[["n"]]))),
-    esc(fmi(as.numeric(t[["missing"]]))), pctfmt(as.numeric(t[["pct"]])), esc(t[["summary"]])))
-  paste0("<div class='changes'><h2>New variables (", nrow(d), ")</h2>",
-    "<table><thead><tr><th>table</th><th>new variable</th><th>kind</th><th class='num'>n</th>",
-    "<th class='num'>missing</th><th class='num'>% missing</th><th>distribution</th></tr></thead><tbody>",
-    paste(tr, collapse = ""), "</tbody></table><p class='caveat'>", esc(new_vars_caveat), "</p></div>")
+# All new-variable profile rows (every field), tagged with their table — the full object the
+# principal HTML table and its cards read from (unlike new_vars_df, which keeps only 7 columns for MD).
+new_rows <- function(results) {
+  bind_rows(lapply(results, function(r) { idx <- which(as.logical(r$prof$new))
+    if (!length(idx)) return(NULL)
+    r$prof[idx, , drop = FALSE] %>% mutate(.table = r$meta$table) }))
+}
+# Principal result: the "New variables" table, priority-sorted (unparseable, then high missingness),
+# with the small categorical/date/numeric visuals and a missing count + %.
+render_new_vars_html <- function(nr) {
+  lead <- function(nrow_) paste0('<div class="lead-wrap"><p class="lead">New variables <span class="count">', nrow_,
+    '</span></p><p class="legend">Missingness display cue:',
+    '<span class="sw" style="background:var(--neutral-bar)"></span>&lt;5%',
+    '<span class="sw" style="background:var(--amber-soft)"></span>5–20%',
+    '<span class="sw" style="background:var(--amber)"></span>&gt;20% review &nbsp;· sorted by review priority</p></div>')
+  if (is.null(nr) || !nrow(nr)) return(paste0('<div class="lead-wrap"><p class="lead">New variables <span class="count">0</span></p></div><p class="na">None vs baseline.</p>'))
+  pm  <- ifelse(is.na(nr$pct_missing), -1, nr$pct_missing)
+  unp <- ifelse(is.na(nr$unparseable), 0, nr$unparseable) > 0
+  nr  <- nr[order(-as.integer(unp), -pm, nr$.table, nr$column), , drop = FALSE]
+  tr  <- vapply(seq_len(nrow(nr)), function(i) { p <- nr[i, ]
+    sprintf('<tr class="newrow"><td class="col">%s</td><td class="tbl">%s</td><td>%s%s</td><td class="num">%s</td><td>%s</td><td>%s</td></tr>',
+      esc(p$column), esc(disp_tbl(p$.table)), kind_chip(p$kind), alert_chip(p$pct_missing),
+      fmi(p$n), miss_cell(p$pct_missing, p$missing), dist_cell(p)) }, character(1))
+  paste0(lead(nrow(nr)), '<div class="table-wrap"><table>',
+    '<caption class="sr-only">New variables — distribution and missingness</caption>',
+    '<thead><tr><th>New variable</th><th>Table</th><th>Kind</th><th class="num">Rows</th><th>Missing</th><th>Distribution</th></tr></thead><tbody>',
+    paste(tr, collapse = ""), '</tbody></table></div>')
 }
 render_new_vars_md <- function(results) {
   d <- new_vars_df(results)
@@ -502,65 +1214,68 @@ render_new_vars_md <- function(results) {
 }
 
 render_html <- function(results, gen_time, cur_inv) {
-  ov <- lapply(results, function(r) with(r$meta, sprintf(
-    '<tr><td><a href="#%s">%s</a>%s</td><td class="num">%s</td><td class="num">%d</td><td>%s</td><td>%s</td></tr>',
-    table, esc(table), badge(new_table), fmi(n_rows_total), n_cols,
-    miss_bar(pct_cells_missing), if (sampled) sprintf("sampled %s", fmi(n_rows_profiled)) else "full")))
-  secs <- lapply(results, function(r) {
-    rows <- apply(r$prof, 1, function(p) sprintf(
-      '<tr class="%s"><td>%s%s</td><td>%s</td><td class="num">%s</td><td class="num">%s</td><td>%s (%s)</td><td class="summ">%s</td></tr>',
-      if (as.logical(p[["new"]])) "newrow" else "", esc(p[["column"]]),
-      badge(as.logical(p[["new"]])), esc(p[["kind"]]),
-      fmi(as.numeric(p[["n"]])), fmi(as.integer(p[["distinct"]])),
-      miss_bar(as.numeric(p[["pct_missing"]])), fmi(as.numeric(p[["missing"]])), esc(p[["summary"]])))
-    caveat <- if (r$meta$sampled) sprintf(
-      '<p class="caveat">Estimated from a reproducible random sample of ~%s rows; distinct, %% missing and top values are approximate. Set DC_SAMPLE_N=0 for exact counts.</p>',
-      fmi(r$meta$n_rows_profiled)) else ""
-    with(r$meta, sprintf(paste0(
-      '<h2 id="%s">%s%s</h2><p class="meta">%s rows',
-      '%s &middot; %d columns &middot; %s cells missing</p>%s',
-      '<table><thead><tr><th>column</th><th>kind</th><th class="num">n</th><th class="num">distinct</th>',
-      '<th>missing (count)</th><th>distribution (top values / range)</th></tr></thead><tbody>%s</tbody></table>'),
-      table, esc(table), badge(new_table), fmi(n_rows_total),
-      if (sampled) sprintf(" (profiled a %s-row sample)", fmi(n_rows_profiled)) else "",
-      n_cols, pctfmt(pct_cells_missing), caveat, paste(rows, collapse = "\n")))
-  })
-  paste0(
-    "<!doctype html><html><head><meta charset='utf-8'><title>Data characterization</title><style>",
-    "body{font:14px/1.5 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#1a1a1a;margin:0;padding:32px;max-width:1200px}",
-    "h1{font-size:22px;margin:0 0 4px}h2{font-size:17px;margin:32px 0 4px;border-top:1px solid #e5e5e5;padding-top:20px}",
-    ".sub{color:#666;margin:0 0 24px}.meta{color:#666;margin:0 0 10px;font-size:13px}",
-    ".caveat{color:#b45309;font-size:12px;margin:0 0 10px}",
-    ".changes{background:#f6f8fa;border:1px solid #e5e5e5;border-radius:8px;padding:8px 18px;margin:0 0 20px}",
-    ".changes ul{margin:8px 0;padding-left:18px}.changes li{margin:3px 0}",
-    "table{border-collapse:collapse;width:100%;margin:6px 0 4px}th,td{text-align:left;padding:6px 10px;border-bottom:1px solid #eee;vertical-align:top}",
-    "th{font-size:12px;text-transform:uppercase;letter-spacing:.03em;color:#555;background:#fafafa}",
-    "td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}.summ{font-size:13px;color:#333}",
-    ".bar{display:inline-block;width:70px;height:8px;background:#eee;border-radius:4px;overflow:hidden;vertical-align:middle;margin-right:6px}",
-    ".fill{height:100%;background:#d98a3d}.newrow{background:#fff8ef}",
-    ".badge{font-size:10px;background:#d98a3d;color:#fff;padding:1px 6px;border-radius:10px;vertical-align:middle}",
-    "a{color:#1a56db;text-decoration:none}a:hover{text-decoration:underline}</style></head><body>",
-    "<h1>Data characterization</h1>",
-    sprintf("<p class='sub'>%s &middot; %d tables &middot; generated %s</p>", esc(source_label), length(results), esc(gen_time)),
-    sprintf("<p class='meta'>mode: %s &middot; cut: %s &middot; baseline: %s &middot; %s &middot; scope: %s &middot; new-column flag: %s</p>",
-            esc(profile_mode), esc(if (nzchar(cut_filter)) cut_filter else "all"),
-            esc(if (nzchar(baseline_file)) basename(baseline_file) else "none"),
-            esc(if (sample_n > 0) sprintf("sampling: ~%s rows/table (TABLESAMPLE, approximate)", fmi(sample_n)) else "exact (all rows)"),
-            esc(if (nzchar(tables_env)) "DC_TABLES subset" else "all tables"), esc(new_detection)),
-    sprintf("<p class='meta'>settings: %s</p>", esc(settings_txt)),
-    if (have_baseline) render_new_vars_html(results) else "",
-    if (have_baseline) render_changes_html(compute_changes(cur_inv)) else "",
-    "<table><thead><tr><th>table</th><th class='num'>rows</th><th class='num'>cols</th><th>cells missing</th><th>coverage</th></tr></thead><tbody>",
-    paste(unlist(ov), collapse = "\n"), "</tbody></table>",
-    paste(unlist(secs), collapse = "\n"), "</body></html>")
+  n_assessed <- length(unique(sub("\\|.*$", "", cur_inv)))
+  # Label coverage from whether any table was ACTUALLY sampled (meta$sampled = n_rows > sample_n), not from
+  # the DC_SAMPLE_N config: if the threshold sits above every table's row count, all rows are read, so
+  # calling it "sampled" would mislead. Exact per-table coverage is in the tables section.
+  any_sampled <- any(vapply(results, function(r) isTRUE(r$meta$sampled), logical(1)))
+  cov_txt <- if (any_sampled) sprintf("sampled ~%s rows/table (tables above the threshold)", fmi(sample_n))
+             else if (identical(profile_mode, "new-columns-only")) "exact — all rows, selected columns"
+             else "exact — all rows"
+  runmeta <- paste0('<div class="runmeta">',
+    sprintf('<span>source <b>%s</b></span>', esc(source_label)),
+    if (nzchar(cut_filter)) sprintf('<span>cut <b>%s</b></span>', esc(cut_filter)) else "",
+    if (nzchar(baseline_file)) sprintf('<span>baseline <b>%s</b></span>', esc(basename(baseline_file))) else "",
+    sprintf('<span>mode <b>%s</b></span>', esc(profile_mode)),
+    sprintf('<span>coverage <b>%s</b></span>', esc(cov_txt)),
+    if (have_baseline) sprintf('<span><b>%d</b> tables assessed for schema changes</span>', n_assessed)
+    else sprintf('<span><b>%d</b> tables profiled</span>', length(results)),
+    sprintf('<span>generated <b>%s</b></span>', esc(gen_time)), '</div>')
+  conf <- sprintf('<span class="conf">Restricted RWD output%s</span>', if (nzchar(cut_filter)) paste0(" · ", esc(cut_filter)) else "")
+  h1   <- paste0(if (have_baseline) "New-variable review" else "Data characterization",
+                 if (nzchar(cut_filter)) paste0(" — ", esc(cut_filter)) else "")
+  ident <- paste0(esc(source_label), if (nzchar(cut_filter)) paste0(" · ", esc(cut_filter)) else "",
+                  " · generated ", esc(gen_time))
+  foot <- sprintf('<div class="foot"><span><b>%s</b>%s%s</span><span>Restricted RWD output · generated %s</span></div>',
+    esc(source_label), if (nzchar(cut_filter)) paste0(" · cut ", esc(cut_filter)) else "",
+    if (nzchar(baseline_file)) paste0(" · baseline ", esc(basename(baseline_file))) else "", esc(gen_time))
+  printfoot <- sprintf('<div class="printfoot">Restricted RWD output · %s</div>', ident)
+
+  body <- if (have_baseline) {
+    nr <- new_rows(results); ch <- compute_changes(cur_inv)
+    n_himiss <- sum(!is.na(nr$pct_missing) & nr$pct_missing > 20)
+    cards <- list(
+      list(val = nrow(nr),                  lab = "New variables",           sub = "schema-new vs baseline"),
+      list(val = length(ch$added_tbls),     lab = "New tables",              sub = "every column is new"),
+      list(val = n_himiss,                  lab = "High-missingness review", sub = "new vars > 20% · display cue, not QC", warn = TRUE),
+      list(val = length(unique(nr$.table)), lab = "Tables with additions",   sub = sprintf("of %d assessed", n_assessed)))
+    paste0('<h2>Executive summary</h2>', cards_html(cards),
+      render_new_vars_html(nr), schema_html(ch), removed_html(ch),
+      tables_add_html(results, nr, n_assessed), method_notes_html, appendix_html(results))
+  } else {
+    tot_cols <- sum(vapply(results, function(r) as.integer(r$meta$n_cols), integer(1)))
+    cards <- list(
+      list(val = length(results), lab = "Tables profiled", sub = if (any_sampled) "sampled" else "exact"),
+      list(val = tot_cols,        lab = "Columns",         sub = "across all tables"),
+      list(val = if (any_sampled) "Sampled" else "Exact", lab = "Coverage", sub = "profiling mode"))
+    paste0('<h2>Executive summary</h2>', cards_html(cards), method_notes_html, appendix_html(results))
+  }
+
+  paste0('<!doctype html><html lang="en"><head><meta charset="utf-8">',
+    '<meta name="viewport" content="width=device-width, initial-scale=1">',
+    sprintf('<title>%s%s</title>', esc(source_label), if (nzchar(cut_filter)) paste0(" — ", esc(cut_filter)) else ""),
+    report_css, '</head><body><div class="sheet">',
+    '<p class="eyebrow">Data characterization</p>', sprintf('<h1>%s</h1>', h1), runmeta, conf,
+    body, foot, '</div>', printfoot, '</body></html>')
 }
 
 render_md <- function(results, gen_time, cur_inv) {
+  any_sampled <- any(vapply(results, function(r) isTRUE(r$meta$sampled), logical(1)))  # actual, not the DC_SAMPLE_N config
   head <- sprintf("# Data characterization\n\n%s — %d tables — generated %s\n\nmode: %s · cut: %s · baseline: %s · %s · scope: %s · new-column flag: %s.\n\nsettings: %s\n",
                   source_label, length(results), gen_time, profile_mode,
                   if (nzchar(cut_filter)) cut_filter else "all",
                   if (nzchar(baseline_file)) basename(baseline_file) else "none",
-                  if (sample_n > 0) sprintf("sampling: ~%s rows/table (TABLESAMPLE, approximate)", fmi(sample_n)) else "exact (all rows)",
+                  if (any_sampled) sprintf("sampling: ~%s rows/table (TABLESAMPLE, approximate)", fmi(sample_n)) else "exact (all rows)",
                   if (nzchar(tables_env)) "DC_TABLES subset" else "all tables", new_detection, settings_txt)
   ov <- c("\n## Overview\n", "| table | rows | cols | % cells missing | coverage |",
           "|---|---:|---:|---:|---|",
@@ -586,8 +1301,8 @@ render_md <- function(results, gen_time, cur_inv) {
 
 # ---- run ----
 run <- function() {
-  # Prostate, OC, endometrial, ... each live in their own catalog + schema, so an empty one
-  # would profile the wrong feed. Fail loud if the CONFIG block (or DC_* override) left them blank.
+  # Each tumor/product lives in its own catalog + schema, so a blank one would profile the wrong
+  # feed. Fail loud if the CONFIG block (or a DC_* override) left them empty.
   if (source_mode == "dbi" && (!nzchar(catalog) || !nzchar(schema)))
     stop("catalog/schema are empty — set them in the CONFIG block at the top of this script ",
          "(or via DC_CATALOG / DC_SCHEMA). They differ per tumor/product.")
@@ -669,22 +1384,309 @@ run <- function() {
   invisible(results)
 }
 if (!nzchar(Sys.getenv("DC_DEFINE_ONLY"))) run()
-#==FILE==# qc_runner.R
+
+intake/oncology/oc/202606/exploratory/code/oc_exploration.R
+# OC Panoramic — LOT and platinum. Builds one HTML + md report: patient counts by treatment
+# setting, lines of therapy, and platinum use. dplyr over ODBC, no Spark.
+#   DATABRICKS_DSN=RWDE DATABRICKS_PWD=... Rscript oc_exploration.R
+# Lines come from the non-maintenance drug episodes. Items 2e (recurrence date) and 3b/3c
+# (platinum-status table) need extra columns — set them below; if they're missing, those items
+# are marked pending instead of run.
+
+library(dplyr); library(tidyr); library(stringr)
+
+# ---- config ----
+catalog         <- Sys.getenv("OC_CATALOG", "hive_metastore")
+schema          <- Sys.getenv("OC_SCHEMA",  "clnprw_flatiron_pano_ovar_use")
+drugepisode_tbl <- Sys.getenv("OC_DRUGEP",  "t_drugepisode_2026m06")
+platinum_drugs  <- "carboplatin|cisplatin|oxaliplatin"     # platinum drugs
+settings_keep   <- c("Neoadjuvant", "Adjuvant", "Advanced")
+
+# Column names for 2e / 3b / 3c. Two things to watch: recurrence date may not be delivered yet
+# (check it's there, and how null it is, on a new feed); the platinum table has one row per
+# platinum line (Sensitive/Resistant/Refractory/null), so a non-platinum line has no row.
+recur_tbl   <- Sys.getenv("OC_RECUR_TBL",   "t_enh_ov_2026m06")
+recur_col   <- Sys.getenv("OC_RECUR_COL",   "recurrencedate")
+plat_tbl    <- Sys.getenv("OC_PLAT_TBL",    "t_enh_ov_platstatus_2026m06")
+plat_line   <- Sys.getenv("OC_PLAT_LINE",   "linenumber")
+plat_status <- Sys.getenv("OC_PLAT_STATUS", "platinumstatus")
+
+this_dir <- tryCatch(dirname(sub("^--file=", "", grep("^--file=", commandArgs(FALSE), value = TRUE))),
+                     error = function(e) ".")
+if (!length(this_dir) || this_dir == "") this_dir <- "."
+out_dir <- Sys.getenv("OC_OUT_DIR", file.path(this_dir, "outputs"))
+
+is_nonmaint <- function(x) str_to_lower(str_trim(as.character(x))) %in% c("false","f","n","no","0")
+# linesetting arrives uppercase (ADVANCED/...); title-case it so comparisons ignore casing.
+canon_setting <- function(x) { s <- str_squish(as.character(x))
+  ifelse(is.na(s) | s == "", NA_character_, str_to_title(s)) }
+# A segment's drugs as a sorted, de-duplicated set, so order and repeats don't matter
+# ("Carbo, Pac" == "Pac + Carbo"). Returns one "a|b" string from all the segment's drug names.
+drug_set <- function(v) {
+  toks <- unlist(str_split(str_squish(str_to_lower(as.character(v))), "\\s*[,/+;&|]\\s*"))
+  toks <- toks[!is.na(toks) & toks != ""]
+  paste(sort(unique(toks)), collapse = "|") }
+
+# ---- connection ----
+get_con <- function() {
+  if (exists("con", envir = .GlobalEnv)) return(get("con", envir = .GlobalEnv))
+  pwd <- Sys.getenv("DATABRICKS_PWD", "")
+  if (!nzchar(pwd)) stop("set DATABRICKS_PWD, or provide a DBI `con`.")
+  # bigint = "character" keeps 64-bit ids (patientid) EXACT — a true BIGINT beyond R's ~2^53 exact-double
+  # range would otherwise lose precision and two distinct ids could collide in a join/distinct count. Small
+  # numeric fields (linenumber) are coerced back to numeric at load, so ordering/arithmetic still works.
+  DBI::dbConnect(odbc::odbc(), dsn = Sys.getenv("DATABRICKS_DSN", "RWDE"),
+                 pwd = pwd, timeout = 120, bigint = "character")
+}
+fqtn <- function(tbl) paste(c(catalog, schema, tbl), collapse = ".")
+load_tbl <- function(con, tbl, cols = NULL) {
+  sel <- if (is.null(cols)) "*" else paste(cols, collapse = ", ")
+  df <- as_tibble(DBI::dbGetQuery(con, sprintf("SELECT %s FROM %s", sel, fqtn(tbl))))
+  names(df) <- tolower(names(df)); df
+}
+
+# ---- analysis ----
+run_analysis <- function(con) {
+  # Drop rows with no patient or line key — they can't be placed on a line, and dropping them up
+  # front keeps the R and SQL counts in step (the two handle missing keys differently).
+  drugep <- load_tbl(con, drugepisode_tbl,
+    c("patientid","linenumber","linesetting","ismaintenancetherapy","linename","linestartdate","episodedate","drugname")) %>%
+    mutate(linenumber = suppressWarnings(as.numeric(linenumber))) %>%   # patientid stays exact (character); linenumber -> numeric for ordering/joins
+    filter(!is.na(patientid), !is.na(linenumber))
+
+  # Non-maintenance episodes, setting title-cased per episode. One line can span settings
+  # (neoadjuvant then adjuvant on line 1), so setting isn't one-per-line.
+  ep <- drugep %>% filter(is_nonmaint(ismaintenancetherapy)) %>%
+    mutate(setting = canon_setting(linesetting),
+           linestartdate = as.Date(linestartdate), episodedate = as.Date(episodedate))
+
+  # One row per line-segment (patient, line, setting). Since a line can span settings, build the
+  # regimen and start from this segment's own episodes — its drug names, and its first episode.
+  seg <- ep %>% filter(!is.na(setting)) %>%
+    group_by(patientid, linenumber, setting) %>%
+    summarise(regimen = drug_set(drugname),
+              start   = suppressWarnings(min(episodedate, na.rm = TRUE)), .groups = "drop") %>%
+    mutate(start = as.Date(ifelse(is.finite(start), start, NA), origin = "1970-01-01"))
+
+  # Lines that span more than one setting. The platinum table is line-level, so their status
+  # can't be tied to a single setting — flagged as a QC caveat in 3b/3c.
+  span_lines <- seg %>% distinct(patientid, linenumber, setting) %>%
+    count(patientid, linenumber, name = "n_set") %>% filter(n_set > 1) %>%
+    distinct(patientid, linenumber)
+
+  out <- list()   # each element: list(title, note, table)
+
+  # 2a. patients by non-maintenance setting combination
+  combo <- seg %>% filter(setting %in% settings_keep) %>% distinct(patientid, setting) %>%
+    group_by(patientid) %>% summarise(combo = paste(sort(unique(setting)), collapse = " + "), .groups = "drop")
+  out$q2a <- list(
+    title = "2a. Patients by non-maintenance treatment setting combination",
+    note  = sprintf("Denominator = %d patients with >=1 non-maintenance line in Neoadjuvant/Adjuvant/Advanced (Off-Systemic-Therapy and missing settings excluded).",
+                    n_distinct(combo$patientid)),
+    table = combo %>% count(combo, name = "patients") %>%
+      mutate(pct = sprintf("%.1f%%", 100 * patients / sum(patients))) %>% arrange(desc(patients)))
+
+  # 2b. patients with >1 non-maintenance adjuvant line
+  adj_lines <- seg %>% filter(setting == "Adjuvant") %>% distinct(patientid, linenumber)
+  n_multi_adj <- adj_lines %>% count(patientid, name = "n") %>% filter(n > 1) %>% nrow()
+  out$q2b <- list(title = "2b. Patients with multiple non-maintenance adjuvant lines", note = "",
+    table = tibble(metric = "patients with >1 adjuvant line", patients = n_multi_adj))
+
+  # 2c. advanced-setting patients by total LOT count. Count only treatment settings (Neo/Adj/Adv),
+  # like 2a, so Off-Systemic-Therapy doesn't inflate the line count.
+  adv_pts <- seg %>% filter(setting == "Advanced") %>% distinct(patientid) %>% pull(patientid)
+  lot_ct  <- seg %>% filter(patientid %in% adv_pts, setting %in% settings_keep) %>%
+    distinct(patientid, linenumber) %>% count(patientid, name = "n_lot")
+  out$q2c <- list(
+    title = "2c. Advanced-setting patients by total number of lines of therapy",
+    note  = sprintf("Denominator = %d patients with >=1 Advanced line. LOT = distinct non-maintenance lines in Neoadjuvant/Adjuvant/Advanced (Off-Systemic-Therapy excluded), not Advanced-only. Confirm whether Advanced-only is intended instead.", length(adv_pts)),
+    table = lot_ct %>% count(n_lot, name = "patients") %>%
+      mutate(pct = sprintf("%.1f%%", 100 * patients / sum(patients))) %>% arrange(n_lot))
+
+  # 2d. last adjuvant regimen vs first-line Advanced regimen. regimen is a sorted drug set, so
+  # equality ignores order. L1 = first Advanced line (line 1 is the earliest, so "prior to L1"
+  # would be vacuous).
+  first_adv <- seg %>% filter(setting == "Advanced") %>%
+    arrange(patientid, linenumber) %>% group_by(patientid) %>% slice(1L) %>% ungroup() %>%
+    transmute(patientid, adv_regimen = regimen, adv_start = start)
+  # last adjuvant line starting before the first Advanced line ("last prior to L1"). Ties on
+  # start break by higher line number, so R and SQL pick the same one.
+  adj_last_pre <- seg %>% filter(setting == "Adjuvant") %>% inner_join(first_adv, by = "patientid") %>%
+    filter(!is.na(start), !is.na(adv_start), start < adv_start) %>%
+    arrange(patientid, desc(start), desc(linenumber)) %>%
+    group_by(patientid) %>% slice(1L) %>% ungroup()
+  n_same <- adj_last_pre %>% filter(nzchar(regimen) & regimen == adv_regimen) %>% nrow()
+  out$q2d <- list(
+    title = "2d. Patients whose last adjuvant regimen matches their first-line Advanced regimen",
+    note  = "L1 = first Advanced line; adjuvant line = the last one starting before it; regimens compared as drug sets (blanks excluded). (2e uses line number 1; 2d can't, since nothing starts before line 1.)",
+    table = tibble(metric = c("patients with an adjuvant line before their first-Advanced line", "same regimen"),
+                   patients = c(nrow(adj_last_pre), n_same)))
+
+  # 2e. L1 start < recurrence date  (needs recurrence date). L1 = line number 1. This uses
+  # linestartdate (the line-start field), since the ask says "1L start date" — not the per-episode
+  # date 2d uses. A line can span settings, so take the earliest line start across them. Built from `ep`
+  # (BEFORE the setting filter), because 2e is setting-independent — a line-1 row with a missing setting
+  # still counts; the SQL mirrors this by building l1 from the drug episodes directly, not from oc_lines.
+  l1 <- ep %>% filter(linenumber == 1) %>% group_by(patientid) %>%
+    summarise(l1_start = suppressWarnings(min(linestartdate, na.rm = TRUE)), .groups = "drop") %>%
+    mutate(l1_start = as.Date(ifelse(is.finite(l1_start), l1_start, NA), origin = "1970-01-01"))
+  rec <- tryCatch(load_tbl(con, recur_tbl, c("patientid", recur_col)), error = function(e) e)
+  out$q2e <- if (inherits(rec, "error")) list(title = "2e. Patients with 1L start date < recurrence date",
+      note = sprintf("PENDING: confirm recurrence date column (tried %s.%s). %s", recur_tbl, recur_col, conditionMessage(rec)),
+      table = NULL)
+    else {
+      names(rec)[2] <- "recur"
+      # One recurrence date per patient (earliest), so a table with >1 row per patient can't
+      # fan out the join and overcount — matches the SQL's min(recurrencedate).
+      rec <- rec %>% mutate(recur = as.Date(recur)) %>% filter(!is.na(recur)) %>%
+        group_by(patientid) %>% summarise(recur = min(recur), .groups = "drop")
+      n_l1 <- l1 %>% filter(!is.na(l1_start)) %>% nrow()
+      j <- l1 %>% inner_join(rec, by = "patientid") %>% filter(!is.na(l1_start))
+      list(title = "2e. Patients with 1L start date < recurrence date",
+           note = "1L = line number 1, the first line of therapy (confirmed). The drop from row 1 to row 2 is patients with no recurrence date.",
+           table = tibble(metric = c("patients with an L1 start", "of those, have a recurrence date", "L1 start < recurrence"),
+                          patients = c(n_l1, nrow(j), sum(j$l1_start < j$recur))))
+    }
+
+  # 3a. among adjuvant-setting patients, % who received platinum chemo. The platinum has to be
+  # on an adjuvant episode itself: a line can span settings, so joining on the line number would
+  # wrongly credit platinum given in the neoadjuvant part of the same line.
+  adj_pts  <- seg %>% filter(setting == "Adjuvant") %>% distinct(patientid) %>% pull(patientid)
+  plat_adj <- ep %>% filter(setting == "Adjuvant", str_detect(str_to_lower(drugname), platinum_drugs)) %>%
+    distinct(patientid) %>% pull(patientid)
+  out$q3a <- list(
+    title = "3a. Adjuvant-setting patients who received platinum-based chemotherapy",
+    note  = sprintf("Platinum = drug name contains %s, on an adjuvant non-maintenance episode.", platinum_drugs),
+    table = tibble(metric = c("adjuvant-setting patients", "received platinum", "%"),
+                   value  = c(as.character(length(adj_pts)), as.character(length(plat_adj)),
+                              # n/a (not 0.0%) when there are no adjuvant patients — matches the SQL's nullif(denominator,0)
+                              if (length(adj_pts) > 0) sprintf("%.1f%%", 100 * length(plat_adj) / length(adj_pts)) else "n/a")))
+
+  # 3b/3c. platinum status by setting  (needs the Panoramic platinum-status table)
+  # Patient-level: one line per patient. A conflict (line with >1 distinct status) is flagged,
+  # not silently resolved; matched-but-blank and no-matching-row are shown separately, so the
+  # denominator stays all patients in the setting.
+  plat_status_block <- function(pt_lines, title, note) {
+    ps <- tryCatch(load_tbl(con, plat_tbl, c("patientid", plat_line, plat_status)), error = function(e) e)
+    if (inherits(ps, "error")) return(list(title = title, table = NULL,
+      note = sprintf("PENDING: confirm platinum-status table/columns (tried %s: %s, %s). %s",
+                     plat_tbl, plat_line, plat_status, conditionMessage(ps))))
+    names(ps) <- c("patientid", "linenumber", "status")
+    # Trim before comparing (keep the trimmed text, not the raw), so " Sensitive " and "Sensitive"
+    # are one status — same as the SQL's nullif(trim(platinumstatus),'').
+    ps <- ps %>% mutate(linenumber = suppressWarnings(as.numeric(linenumber)),   # match drugep's numeric linenumber for the join
+                        status = str_trim(status),
+                        status = ifelse(is.na(status) | status == "", NA_character_, status),
+                        matched = TRUE)
+    cls <- pt_lines %>% left_join(ps, by = c("patientid","linenumber")) %>%
+      group_by(patientid) %>%
+      summarise(matched = any(!is.na(matched)),
+                n_stat  = n_distinct(status[!is.na(status)]),
+                one     = { s <- unique(status[!is.na(status)]); if (length(s) == 1) s else NA_character_ },
+                .groups = "drop") %>%
+      mutate(status = case_when(n_stat == 1 ~ one,
+                                n_stat >  1 ~ "Conflicting status (multiple rows)",
+                                matched     ~ "Status row present but blank",
+                                TRUE        ~ "No status row"))
+    # The status table has one row per line, but a line can cover more than one setting. Count how
+    # many of these lines do, so that risk is shown, not hidden.
+    n_span <- pt_lines %>% distinct(patientid, linenumber) %>%
+      semi_join(span_lines, by = c("patientid","linenumber")) %>% nrow()
+    if (n_span > 0) note <- sprintf(
+      "%s QC: %d of these lines also have episodes in another setting, so their status can't be tied to just one setting — confirm how to count those.",
+      note, n_span)
+    list(title = title, note = note,
+         table = cls %>% count(status, name = "patients") %>%
+           mutate(pct = sprintf("%.1f%%", 100 * patients / sum(patients))) %>% arrange(desc(patients)))
+  }
+
+  # All adjuvant lines: the status table only has platinum lines, so the last adjuvant line
+  # may not be the one with a status. The block aggregates per patient and flags conflicts.
+  adj_all <- seg %>% filter(setting == "Adjuvant") %>% distinct(patientid, linenumber)
+  out$q3b <- plat_status_block(adj_all, "3b. Platinum status in the adjuvant setting (patients)",
+    "Panoramic PlatinumStatus across a patient's adjuvant lines; denominator = all adjuvant-setting patients (non-platinum lines have no status row).")
+
+  first_adv_line <- seg %>% filter(setting == "Advanced") %>%
+    arrange(patientid, linenumber) %>% group_by(patientid) %>% slice(1L) %>% ungroup() %>%
+    distinct(patientid, linenumber)
+  out$q3c <- plat_status_block(first_adv_line, "3c. Platinum status in the first-line advanced setting (patients)",
+    "Panoramic PlatinumStatus. One row per patient = their earliest Advanced line; denominator = all first-line-advanced patients.")
+
+  out
+}
+
+# ---- rendering ----
+esc <- function(x) { x <- as.character(x); x <- gsub("&","&amp;",x,fixed=TRUE)
+  x <- gsub("<","&lt;",x,fixed=TRUE); gsub(">","&gt;",x,fixed=TRUE) }
+df_to_md <- function(df) {
+  if (is.null(df) || !nrow(df)) return("_no rows_")
+  head <- paste0("| ", paste(names(df), collapse = " | "), " |")
+  sep  <- paste0("| ", paste(rep("---", ncol(df)), collapse = " | "), " |")
+  body <- apply(df, 1, function(r) paste0("| ", paste(r, collapse = " | "), " |"))
+  paste(c(head, sep, body), collapse = "\n")
+}
+df_to_html <- function(df) {
+  if (is.null(df) || !nrow(df)) return("<p class='pending'>no rows</p>")
+  th <- paste0("<th>", paste(esc(names(df)), collapse = "</th><th>"), "</th>")
+  tr <- apply(df, 1, function(r) paste0("<tr><td>", paste(esc(r), collapse = "</td><td>"), "</td></tr>"))
+  paste0("<table><thead><tr>", th, "</tr></thead><tbody>", paste(tr, collapse = ""), "</tbody></table>")
+}
+render <- function(out, gen_time) {
+  md <- c(sprintf("# OC Panoramic exploration — LOT & platinum\n\n%s.%s — generated %s\n",
+                  catalog, schema, gen_time))
+  html_secs <- character()
+  for (s in out) {
+    note_md <- if (nzchar(s$note)) paste0("\n", s$note, "\n") else ""
+    md <- c(md, sprintf("\n## %s\n%s", s$title, note_md), df_to_md(s$table))
+    pend <- grepl("^PENDING", s$note)
+    html_secs <- c(html_secs, sprintf("<h2%s>%s</h2>%s%s",
+      if (pend) " class='pend'" else "", esc(s$title),
+      if (nzchar(s$note)) sprintf("<p class='note'>%s</p>", esc(s$note)) else "",
+      df_to_html(s$table)))
+  }
+  html <- paste0(
+    "<!doctype html><html><head><meta charset='utf-8'><title>OC exploration — LOT &amp; platinum</title><style>",
+    "body{font:14px/1.5 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#1a1a1a;margin:0;padding:32px;max-width:900px}",
+    "h1{font-size:22px;margin:0 0 4px}h2{font-size:17px;margin:28px 0 6px;border-top:1px solid #e5e5e5;padding-top:18px}",
+    "h2.pend{color:#b45309}.sub{color:#666;margin:0 0 20px}.note{color:#666;font-size:13px;margin:0 0 8px}",
+    "table{border-collapse:collapse;margin:6px 0}th,td{text-align:left;padding:6px 12px;border-bottom:1px solid #eee}",
+    "th{font-size:12px;text-transform:uppercase;letter-spacing:.03em;color:#555;background:#fafafa}",
+    "td{font-variant-numeric:tabular-nums}</style></head><body><h1>OC Panoramic exploration — LOT &amp; platinum</h1>",
+    sprintf("<p class='sub'>%s.%s &middot; generated %s</p>", esc(catalog), esc(schema), esc(gen_time)),
+    paste(html_secs, collapse = "\n"), "</body></html>")
+  list(md = paste(md, collapse = "\n"), html = html)
+}
+
+run <- function() {
+  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+  con <- get_con()
+  out <- run_analysis(con)
+  r <- render(out, format(Sys.time(), "%Y-%m-%d %H:%M"))
+  writeLines(r$html, file.path(out_dir, "oc_exploration.html"))
+  writeLines(r$md,   file.path(out_dir, "oc_exploration.md"))
+  cat(r$md, "\n")
+  message(sprintf("wrote %s", file.path(out_dir, "oc_exploration.html")))
+  invisible(out)
+}
+if (!nzchar(Sys.getenv("OC_DEFINE_ONLY"))) run()
+
+
+intake/oncology/oc/202606/exploratory/code/qc_runner.R
 # Config-driven QC runner — one place to declare the "ends" (data sources) and the checks to run
-# against them, edited entirely in the CFG block below. Standalone, tumor/product-agnostic. It runs
-# the SAME check library at any stage: the raw source feed (before/at ingestion) and the built data
-# product (after creation), plus cross-stage raw->product reconciliation.
+# against them, all in the CFG block below. Standalone, works for any tumor/product. The same check
+# library runs at any stage: the raw feed (before/at ingestion) and the built product (after), plus
+# raw->product reconciliation across stages.
 #
 # TWO OUTPUTS from one file:
 #   - Rscript qc_runner.R            -> writes an HTML + md QC report and exits non-zero if any check failed
 #   - testthat::test_file("qc_runner.R")  -> the same checks register as test_that() cases for CI/test runners
 #
-# Every rule check pushes its work down to SQL as one or a few COUNT queries — no table pulls (some verbs
-# run 2: row_count-compare, no_fanout/no_row_loss, derive_equals; domain adds a sample query only on
-# failure). Dates/domains/joins are checked in the warehouse. `profile`/`drift` shell out to sibling scripts,
-# so there is one config surface over profiling, drift, and rule/reconciliation QC — no duplicated logic.
-# EXCEPTION: the `expr` escape hatch can materialize a table in R (its load() does SELECT *); it is an
-# expert-only fallback for a check no verb covers — prefer the declarative verbs, which stay push-down.
+# Each rule check pushes its work down to SQL as one or a few COUNT queries — it never pulls a whole table
+# (some verbs run 2: row_count-compare, no_fanout/no_row_loss, derive_equals; domain adds a sample query
+# only when it fails). Dates, domains and joins are all checked in the warehouse. `profile`/`drift` shell
+# out to the sibling scripts, so one config covers profiling, drift, and rule/reconciliation QC with no
+# duplicated logic. EXCEPTION: the `expr` escape hatch can pull a table into R (its load() does SELECT *);
+# it's an expert-only fallback for a check no verb covers — prefer the verbs, which stay push-down.
 #
 # Check verbs (type = ...). EVERY table-target verb also accepts an optional `filter` (a SQL WHERE
 # fragment) so a check can target a filtered/derived subset, not just a whole table. Join-shaped verbs
@@ -845,9 +1847,9 @@ out_dir <- { v <- getcfg("QC_OUT", CFG$out_dir); if (nzchar(v)) v else file.path
 abspath <- function(p) if (nzchar(p) && (startsWith(p, "/") || grepl("^[A-Za-z]:", p))) p else file.path(this_dir, p)
 
 # ---- connection + SQL helpers ----
-# bigint = "character" for exact 64-bit ids (matches data_profiler.R). Rule checks run in SQL and return
-# only counts, which q1() re-parses with as.numeric(), so this is transparent to them; it only matters for
-# the `expr` hatch, where a materialized large id stays exact instead of losing precision as an R double.
+# bigint = "character" keeps 64-bit ids exact (matches data_profiler.R). Rule checks run in SQL and only
+# return counts, which q1() re-parses as numbers, so they never notice this. It only matters for the `expr`
+# hatch, where a large id pulled into R stays exact instead of losing precision as a double.
 get_con <- function() {
   if (exists("con", envir = .GlobalEnv)) return(get("con", envir = .GlobalEnv))
   pwd <- Sys.getenv("DATABRICKS_PWD", "")
@@ -1204,14 +2206,14 @@ handlers <- list(
       return(res(chk$label %||% sprintf("profile %s", chk$source), "profile", pass = FALSE,
                  detail = sprintf("source '%s' is undefined or has a blank catalog/schema (DBI mode) — set CFG$sources$%s, or use source_mode='local'", chk$source, chk$source)))
     od <- file.path(out_dir, sprintf("profile_%s", chk$source))
-    # system2(env=) ADDS to the child's inherited environment, it doesn't replace it — so a DC_* still
-    # exported in the parent shell (e.g. a hand DC_NEW_ONLY=1, or DC_DEFINE_ONLY=1) would leak into the child
-    # and change its mode/cut/baseline. Set EVERY DC_* the profiler reads explicitly (unset string -> empty
-    # so the profiler falls back to its own default; flags -> explicit 0/1), so the CFG fully determines the
-    # child run. Only DATABRICKS_DSN/PWD (credentials) are intentionally inherited.
-    # SHELL-SAFE: system2 prepends these env entries and appends args to a /bin/sh string WITHOUT quoting
-    # (only the command is shQuoted), so a value with a space (DC_MISSING_TOKENS="Unknown,Not documented"), a
-    # regex metachar (DC_CUT_REGEX="_(a|b)$") or a path with spaces would break the launch — shQuote each value.
+    # system2(env=) ADDS to the child's environment, it doesn't replace it — so a DC_* still set in the
+    # parent shell (a stray DC_NEW_ONLY=1 or DC_DEFINE_ONLY=1) would leak in and change the child's mode,
+    # cut, or baseline. So set EVERY DC_* the profiler reads (unset -> "" so it uses its own default; flags
+    # -> explicit 0/1); the CFG then fully controls the child run. Only the credentials (DATABRICKS_DSN/PWD)
+    # are inherited on purpose.
+    # SHELL-SAFE: system2 builds a /bin/sh string and does NOT quote these env values or args (only the
+    # command is quoted), so a value with a space (DC_MISSING_TOKENS="Unknown,Not documented"), a regex char
+    # (DC_CUT_REGEX="_(a|b)$"), or a path with spaces would break the launch — so shQuote each one.
     kv <- function(name, x) sprintf("%s=%s", name, shQuote(if (is.null(x)) "" else as.character(x)))  # unset -> '' (child default)
     fl <- function(x) if (isTRUE(x)) "1" else "0"                 # explicit boolean (never inherit)
     env <- c(
@@ -1248,14 +2250,14 @@ handlers <- list(
             else if (!is.null(chk$label)) sprintf("drift_%s", gsub("[^a-z0-9]+", "_", tolower(chk$label)))
             else "drift"
     od <- file.path(out_dir, slug)
-    # Hermetic child env, same policy as the profile handler: system2(env=) ADDS to the inherited environment,
-    # so a CMP_* still exported in the parent shell would leak in. A leaked CMP_DEFINE_ONLY is the dangerous
-    # one — compare_snapshots.R quits status 0 the moment it sees it, WITHOUT reading a profile or writing a
-    # report, which would score an un-run drift as informational success. Leaked CMP_*_PTS/PCT/SMD would
-    # silently move the thresholds. Clear the guard, pass old/new as CLI args (also blank the CMP_OLD/NEW
-    # fallbacks), and pin every threshold from the check's CFG (unset -> "" so the child uses its own default).
-    # SHELL-SAFE like the profile handler: shQuote each env value and each path arg, since system2 doesn't
-    # quote them and CMP_OUT / the profile paths can contain spaces (e.g. a restricted-archive run folder).
+    # Clean child env, same policy as the profile handler: system2(env=) ADDS to the inherited environment,
+    # so a CMP_* still set in the parent shell would leak in. A leaked CMP_DEFINE_ONLY is the dangerous one —
+    # compare_snapshots.R quits status 0 the moment it sees it, WITHOUT reading a profile or writing a report,
+    # which would score an un-run drift as info success. Leaked CMP_*_PTS/PCT/SMD would quietly shift the
+    # thresholds. So clear the guard, pass old/new as CLI args (and blank the CMP_OLD/NEW fallbacks), and pin
+    # every threshold from the check's CFG (unset -> "" so the child uses its own default).
+    # SHELL-SAFE like the profile handler: shQuote each env value and path arg, since system2 doesn't quote
+    # them and CMP_OUT / the profile paths can contain spaces (say a restricted-archive run folder).
     kv <- function(name, x) sprintf("%s=%s", name, shQuote(if (is.null(x)) "" else as.character(x)))
     env <- c(kv("CMP_OUT", od), kv("CMP_DEFINE_ONLY", ""), kv("CMP_OLD", ""), kv("CMP_NEW", ""),
              kv("CMP_MISS_PTS", chk$miss_pts),   kv("CMP_ROWS_PCT", chk$rows_pct),
@@ -1312,29 +2314,121 @@ run_checks <- function() {
 esc <- function(x) { x <- as.character(x); x <- gsub("&","&amp;",x,fixed=TRUE)
   x <- gsub("<","&lt;",x,fixed=TRUE); gsub(">","&gt;",x,fixed=TRUE) }
 status_of <- function(r) if (isTRUE(r$info)) "info" else if (isTRUE(r$pass)) "pass" else "FAIL"
+
+# ---- HTML report (stakeholder-facing); the MD output stays the complete technical record ----
+qc_css <- '<style>
+:root{
+  --accent:#C4441C; --accent-bar:#F36633; --amber:#CA8A04; --amber-bg:#FEF3C7; --amber-ink:#8A6D09;
+  --fail:#B91C1C; --pass:#15803D;
+  --ink:#2A1A47; --ink-2:#3F3A4A; --muted:#6B6A78; --faint:#A3A1AD;
+  --line:#E7E3EF; --line-2:#D6D1E0; --surface:#FFFFFF; --page:#F2F0F7; --panel:#F8F6FB; --panel-edge:#ECE8F3; --track:#ECEAF2;
+  --mono:ui-monospace,"Cascadia Code","Source Code Pro",Menlo,Consolas,monospace;
+  --sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+}
+*{box-sizing:border-box}
+body{font:15px/1.55 var(--sans);color:var(--ink-2);background:var(--page);margin:0;padding:28px}
+.sheet{max-width:1180px;margin:0 auto;background:var(--surface);border:1px solid var(--line);border-radius:12px;box-shadow:0 1px 3px rgba(15,23,42,.06);padding:34px 38px 30px}
+.eyebrow{font-size:11px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:var(--accent);margin:0 0 4px}
+h1{font-size:27px;line-height:1.15;font-weight:700;color:var(--ink);margin:0 0 8px;letter-spacing:-.01em}
+h1 .verdict{font-size:14px;font-weight:700;letter-spacing:.04em;padding:3px 12px;border-radius:20px;vertical-align:4px;margin-left:8px}
+h1 .verdict.pass{background:#DCFCE7;color:var(--pass);border:1px solid #86EFAC}
+h1 .verdict.fail{background:#FEE2E2;color:var(--fail);border:1px solid #FCA5A5}
+.runmeta{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:13px;color:var(--muted);margin:0 0 4px}
+.runmeta b{color:var(--ink-2);font-weight:600}
+.conf{display:inline-block;font-size:10.5px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--amber-ink);background:var(--amber-bg);border:1px solid #FCD34D;border-radius:5px;padding:2px 8px;margin-top:6px}
+h2{font-size:12px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);margin:30px 0 12px;padding-bottom:7px;border-bottom:1px solid var(--line)}
+.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:2px 0 4px}
+.card{background:var(--panel);border:1px solid var(--panel-edge);border-left:3px solid var(--accent);border-radius:10px;padding:14px 16px}
+.card.warn{border-left-color:var(--amber)}.card.fail{border-left-color:var(--fail)}.card.good{border-left-color:var(--pass)}
+.card .val{font-size:30px;font-weight:700;color:var(--ink);line-height:1.05;letter-spacing:-.02em}
+.card.fail .val{color:var(--fail)}.card.good .val{color:var(--pass)}
+.card .lab{font-size:12.5px;font-weight:600;color:var(--ink-2);margin-top:3px}
+.card .sub{font-size:11.5px;color:var(--muted);margin-top:2px}
+.segbar{display:flex;height:12px;border-radius:6px;overflow:hidden;background:var(--track);max-width:520px;margin:12px 0 4px}
+.segbar .seg{height:100%}
+.segbar .pass{background:#22A559}.segbar .fail{background:var(--fail)}.segbar .info{background:#B9B7C4}
+.seglegend{font-size:12px;color:var(--muted);margin:2px 0 0}
+.seglegend .sw{display:inline-block;width:9px;height:9px;border-radius:2px;margin:0 3px 0 12px;vertical-align:0}.seglegend .sw:first-child{margin-left:0}
+.table-wrap{width:100%;overflow-x:auto}
+table{border-collapse:collapse;width:100%;margin:2px 0 6px;font-size:14px}
+thead th{position:sticky;top:0;background:var(--panel);text-align:left;font-weight:600;color:var(--ink-2);font-size:12.5px;padding:9px 12px;border-bottom:2px solid var(--line-2);white-space:nowrap}
+tbody td{padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+tbody tr:nth-child(even){background:#FBFAFC}
+tbody tr:hover{background:#FAF5F1}
+tr.fail td{background:#FEF6F6}tr.fail:hover td{background:#FDEEEE}
+.badge{display:inline-block;font-size:11px;font-weight:700;letter-spacing:.03em;padding:2px 9px;border-radius:20px;white-space:nowrap}
+.badge.fail{background:#FEE2E2;color:var(--fail);border:1px solid #FCA5A5}
+.badge.pass{background:#DCFCE7;color:var(--pass);border:1px solid #86EFAC}
+.badge.info{background:#EEF0F5;color:#4B5563;border:1px solid #E3E1EA}
+.vtype{font-family:var(--mono);font-size:12.5px;color:var(--muted)}
+.chk{color:var(--ink);font-weight:500}
+.det{font-size:13px;color:var(--ink-2);white-space:normal;word-break:break-word}
+.samp{color:var(--amber-ink);font-family:var(--mono);font-size:12px}
+.panel{background:var(--panel);border:1px solid var(--panel-edge);border-radius:10px;padding:12px 16px;font-size:12.5px;color:var(--muted);margin-top:8px}
+.panel b{color:var(--ink-2);font-weight:600}
+.foot{display:flex;flex-wrap:wrap;justify-content:space-between;gap:8px;margin-top:26px;padding-top:14px;border-top:1px solid var(--line);font-size:11.5px;color:var(--faint)}
+.foot b{color:var(--muted);font-weight:600}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.printfoot{display:none}
+@media (max-width:820px){.cards{grid-template-columns:repeat(2,1fr)}}
+@media print{
+  @page{size:A4 landscape;margin:12mm 12mm 15mm}
+  *{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+  body{background:#fff;padding:0;font-size:10pt}
+  .sheet{border:0;box-shadow:none;border-radius:0;max-width:none;padding:0}
+  thead{display:table-header-group}
+  tr,.card{break-inside:avoid}h2{break-after:avoid}
+  .printfoot{display:block;position:fixed;bottom:0;left:0;right:0;font-size:8pt;color:var(--muted);border-top:1px solid var(--line);padding-top:3px;background:#fff}
+}
+</style>'
+cards_html <- function(cards) paste0('<div class="cards">', paste(vapply(cards, function(c)
+  sprintf('<div class="card%s"><div class="val">%s</div><div class="lab">%s</div><div class="sub">%s</div></div>',
+    paste0(if (isTRUE(c$fail)) " fail" else "", if (isTRUE(c$good)) " good" else "", if (isTRUE(c$warn)) " warn" else ""),
+    esc(c$val), esc(c$lab), esc(c$sub)), character(1)), collapse = ""), '</div>')
+badge_html <- function(st) sprintf('<span class="badge %s">%s</span>', tolower(st), toupper(st))
+
 render <- function(results, gen_time) {
   npass <- sum(vapply(results, function(r) isTRUE(r$pass), logical(1)))
   nfail <- sum(vapply(results, function(r) !isTRUE(r$info) && !isTRUE(r$pass), logical(1)))
   ninfo <- sum(vapply(results, function(r) isTRUE(r$info), logical(1)))
+  total <- npass + nfail + ninfo
   # Resolved source provenance in the report, so an archived HTML says which catalog.schema each end used.
   src_txt <- paste(vapply(names(CFG$sources), function(nm) { s <- CFG$sources[[nm]]
     sprintf("%s=%s.%s", nm, s$catalog %||% "?", if (nzchar(s$schema %||% "")) s$schema else "?") }, character(1)), collapse = " · ")
   ordr  <- order(vapply(results, function(r) if (status_of(r)=="FAIL") 0L else if (status_of(r)=="info") 2L else 1L, integer(1)))
   rows_html <- vapply(results[ordr], function(r) sprintf(
-    "<tr class='%s'><td>%s</td><td>%s</td><td>%s</td><td class='det'>%s%s</td></tr>",
-    tolower(status_of(r)), esc(status_of(r)), esc(r$type), esc(r$label), esc(r$detail),
-    if (nzchar(r$sample)) sprintf(" <span class='samp'>[%s]</span>", esc(r$sample)) else ""), character(1))
-  html <- paste0(
-    "<!doctype html><html><head><meta charset='utf-8'><title>QC report</title><style>",
-    "body{font:14px/1.5 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#1a1a1a;margin:0;padding:32px;max-width:1100px}",
-    "h1{font-size:22px;margin:0 0 4px}.sub{color:#666;margin:0 0 16px}",
-    "table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:6px 10px;border-bottom:1px solid #eee;vertical-align:top}",
-    "th{font-size:12px;text-transform:uppercase;letter-spacing:.03em;color:#555;background:#fafafa}",
-    ".det{font-size:13px;color:#333}.samp{color:#b45309}",
-    "tr.fail td:first-child{color:#b91c1c;font-weight:600}tr.pass td:first-child{color:#15803d}tr.info td:first-child{color:#666}</style></head><body>",
-    "<h1>QC report</h1><p class='sub'>", sprintf("%d passed &middot; %d failed &middot; %d info &middot; generated %s<br>sources: %s", npass, nfail, ninfo, esc(gen_time), esc(src_txt)),
-    "</p><table><thead><tr><th>status</th><th>type</th><th>check</th><th>detail</th></tr></thead><tbody>",
-    paste(rows_html, collapse = "\n"), "</tbody></table></body></html>")
+    '<tr class="%s"><td>%s</td><td class="vtype">%s</td><td class="chk">%s</td><td class="det">%s%s</td></tr>',
+    tolower(status_of(r)), badge_html(status_of(r)), esc(r$type), esc(r$label), esc(r$detail),
+    if (nzchar(r$sample)) sprintf(' <span class="samp">[%s]</span>', esc(r$sample)) else ""), character(1))
+  verdict <- if (nfail > 0) "fail" else "pass"
+  seg <- function(n, cls) if (total > 0 && n > 0) sprintf('<span class="seg %s" style="width:%.1f%%"></span>', cls, 100 * n / total) else ""
+  segbar <- paste0('<div class="segbar">', seg(npass, "pass"), seg(nfail, "fail"), seg(ninfo, "info"), '</div>',
+    '<p class="seglegend"><span class="sw" style="background:#22A559"></span>passed ', npass,
+    '<span class="sw" style="background:var(--fail)"></span>failed ', nfail,
+    '<span class="sw" style="background:#B9B7C4"></span>info ', ninfo, '</p>')
+  cards <- cards_html(list(
+    list(val = nfail, lab = "Failed", sub = "assertions not passing", fail = nfail > 0),
+    list(val = npass, lab = "Passed", sub = "assertions held", good = npass > 0 && nfail == 0),
+    list(val = ninfo, lab = "Info",   sub = "non-gating steps"),
+    list(val = total, lab = "Checks", sub = "run this pass")))
+  ident <- sprintf("QC %s · generated %s", toupper(verdict), esc(gen_time))
+  html <- paste0('<!doctype html><html lang="en"><head><meta charset="utf-8">',
+    '<meta name="viewport" content="width=device-width, initial-scale=1">',
+    '<title>QC report</title>', qc_css, '</head><body><div class="sheet">',
+    '<p class="eyebrow">Data quality</p>',
+    sprintf('<h1>QC report <span class="verdict %s">%s</span></h1>', verdict, toupper(verdict)),
+    sprintf('<div class="runmeta"><span>sources <b>%s</b></span><span><b>%d</b> checks</span><span>generated <b>%s</b></span></div>', esc(src_txt), total, esc(gen_time)),
+    '<span class="conf">Restricted RWD output</span>',
+    '<h2>Executive summary</h2>',
+    cards, segbar,
+    '<h2>Results <span class="n"></span></h2>',
+    '<div class="table-wrap"><table><caption class="sr-only">QC check results, failures first</caption>',
+    '<thead><tr><th>Status</th><th>Type</th><th>Check</th><th>Detail</th></tr></thead><tbody>',
+    paste(rows_html, collapse = ""), '</tbody></table></div>',
+    '<div class="panel"><b>Sources</b> — ', esc(src_txt),
+    '. Status: <b>FAIL</b> gates the run (non-zero exit). A <em>successful</em> profile/drift/placeholder step is <b>info</b> (non-gating); a <em>failed</em> profile/drift subprocess is a FAIL.</div>',
+    sprintf('<div class="foot"><span><b>QC report</b></span><span>Restricted RWD output · generated %s</span></div>', esc(gen_time)),
+    '</div>', sprintf('<div class="printfoot">Restricted RWD output · %s</div>', ident), '</body></html>')
   md <- c(sprintf("# QC report\n\n%d passed · %d failed · %d info — generated %s\n\nsources: %s\n", npass, nfail, ninfo, gen_time, src_txt),
     "| status | type | check | detail |", "|---|---|---|---|",
     vapply(results[ordr], function(r) sprintf("| %s | %s | %s | %s%s |", status_of(r), r$type, r$label,
@@ -1370,1286 +2464,3 @@ run_all <- function() {
   invisible(results)
 }
 if (!nzchar(Sys.getenv("QC_DEFINE_ONLY"))) run_all()
-#==FILE==# compare_snapshots.R
-# Snapshot comparison — diff two profile_<cut>.tsv files (from data_profiler.R) into a data-level
-# drift report: what changed between an OLD and a NEW snapshot, beyond just added/dropped columns.
-# Standalone, tumor/product-agnostic. tidyverse/dplyr, no Spark, no Databricks — it only reads the
-# two metrics files the profiler already wrote, so it never re-queries and never overwrites them.
-#
-# TO RUN: point it at the two profiles (edit CFG, or pass them as arguments):
-#   Rscript compare_snapshots.R outputs/2026m03/profile_2026m03.tsv outputs/2026m06/profile_2026m06.tsv
-# Every CFG value is also overridable by its CMP_* env var (env wins).
-#
-# What it reports, per column present in both snapshots:
-#   - missingness drift as a RATE (pct_missing), with n_rows / n_missing shown so a shift can be
-#     traced to numerator vs denominator (missingness counts alone aren't comparable across drops);
-#   - continuous drift via SMD = (mean_new - mean_old) / pooled_sd (the standard "Table 1" effect
-#     size; |SMD|<0.1 ~ negligible), plus per-quantile shifts for shape/tails;
-#   - categorical drift: top values that entered/left the top list or shifted share;
-#   - cardinality drift (distinct per non-missing, so it isn't just an artifact of more rows);
-#   - kind/type changes; and added/dropped tables & columns (schema diff).
-# Flags are magnitude-based CANDIDATES to review — clinical significance is a human judgment.
-
-library(dplyr); library(stringr)
-
-# ============================ CONFIG — edit these, then run ============================
-CFG <- list(
-  old = "",       # path to the OLD snapshot's profile_<cut>.tsv   (or 1st CLI arg / CMP_OLD)
-  new = "",       # path to the NEW snapshot's profile_<cut>.tsv   (or 2nd CLI arg / CMP_NEW)
-  out_dir = "",   # where the report is written; "" = ./outputs next to this script   (CMP_OUT)
-  # -- flag thresholds: what counts as a shift worth reviewing --
-  miss_pts     = 5,     # flag |Δ % missing| >= this many percentage points        (CMP_MISS_PTS)
-  rows_pct     = 10,    # note |Δ table row count| >= this %                        (CMP_ROWS_PCT)
-  distinct_pct = 20,    # flag |Δ distinct-per-non-missing| >= this %               (CMP_DISTINCT_PCT)
-  smd          = 0.10,  # flag continuous |SMD| >= this                             (CMP_SMD)
-  cat_pts      = 10,    # flag categorical |Δ share| >= this many points, or a top  (CMP_CAT_PTS)
-                        #   value entering/leaving the top list
-  cat_min      = 1      # ignore categories below this % share                      (CMP_CAT_MIN)
-)
-# ======================================================================================
-
-getcfg  <- function(env, default) { v <- Sys.getenv(env, ""); if (nzchar(v)) v else default }
-getcfgn <- function(env, default) { v <- Sys.getenv(env, ""); if (nzchar(v)) as.numeric(v) else as.numeric(default) }
-args <- commandArgs(trailingOnly = TRUE)
-old_path <- if (length(args) >= 1) args[1] else getcfg("CMP_OLD", CFG$old)
-new_path <- if (length(args) >= 2) args[2] else getcfg("CMP_NEW", CFG$new)
-miss_pts     <- getcfgn("CMP_MISS_PTS",     CFG$miss_pts)
-rows_pct     <- getcfgn("CMP_ROWS_PCT",     CFG$rows_pct)
-distinct_pct <- getcfgn("CMP_DISTINCT_PCT", CFG$distinct_pct)
-smd_thresh   <- getcfgn("CMP_SMD",          CFG$smd)
-cat_pts      <- getcfgn("CMP_CAT_PTS",      CFG$cat_pts)
-cat_min      <- getcfgn("CMP_CAT_MIN",      CFG$cat_min)
-
-this_dir <- tryCatch(dirname(sub("^--file=", "", grep("^--file=", commandArgs(FALSE), value = TRUE))),
-                     error = function(e) ".")
-if (!length(this_dir) || this_dir == "") this_dir <- "."
-out_dir <- { v <- getcfg("CMP_OUT", CFG$out_dir); if (nzchar(v)) v else file.path(this_dir, "outputs") }
-
-# ---- read ----
-NUM_COLS <- c("n_rows","n_rows_total","n_nonmissing","n_missing","pct_missing","distinct",
-              "mean","sd","min","p1","p5","p10","p25","p50","p75","p90","p95","p99","max","unparseable")
-read_profile <- function(path, label) {
-  if (!nzchar(path)) stop(sprintf("%s profile path is empty — set it in CFG, CMP_%s, or as a CLI arg.",
-                                  label, toupper(label)))
-  if (!file.exists(path)) stop(sprintf("%s profile not found: %s", label, path))
-  df <- utils::read.delim(path, sep = "\t", quote = "", na.strings = "",
-                          stringsAsFactors = FALSE, check.names = FALSE, colClasses = "character")
-  need <- c("table_base","column","kind")
-  if (!all(need %in% names(df)))
-    stop(sprintf("%s (%s) doesn't look like a profile_<cut>.tsv — missing %s",
-                 label, path, paste(setdiff(need, names(df)), collapse = ", ")))
-  for (c in intersect(NUM_COLS, names(df))) df[[c]] <- suppressWarnings(as.numeric(df[[c]]))
-  as_tibble(df)
-}
-# CMP_DEFINE_ONLY: syntax/parse check only. The interpreter has already parsed the whole file by now
-# (a syntax error anywhere would have failed before this line), so quit before touching any input file.
-if (nzchar(Sys.getenv("CMP_DEFINE_ONLY"))) { message("CMP_DEFINE_ONLY: parsed OK"); quit(save = "no", status = 0L) }
-old <- read_profile(old_path, "old")
-new <- read_profile(new_path, "new")
-samp_note <- {
-  os <- "sampled" %in% names(old) && any(toupper(as.character(old$sampled)) == "TRUE")
-  ns <- "sampled" %in% names(new) && any(toupper(as.character(new$sampled)) == "TRUE")
-  if (os || ns) sprintf("%s%s%s profiled from a sample — a flagged difference may be sampling variation; re-run the profiler with DC_SAMPLE_N=0 for exact metrics.",
-    if (os) "OLD" else "", if (os && ns) " and " else "", if (ns) "NEW" else "") else ""
-}
-
-# ---- schema diff ----
-o_tbls <- unique(old$table_base); n_tbls <- unique(new$table_base)
-added_tbls   <- sort(setdiff(n_tbls, o_tbls))
-dropped_tbls <- sort(setdiff(o_tbls, n_tbls))
-o_keys <- paste(old$table_base, old$column, sep = "|")
-n_keys <- paste(new$table_base, new$column, sep = "|")
-added_cols   <- sort(n_keys[!(n_keys %in% o_keys)])
-dropped_cols <- sort(o_keys[!(o_keys %in% n_keys)])
-
-# ---- per-column deltas (columns present in both) ----
-j <- inner_join(old, new, by = c("table_base","column"), suffix = c(".o",".n"))
-j <- j %>% mutate(
-  colname   = paste(table_base, column, sep = "."),
-  d_miss    = pct_missing.n - pct_missing.o,
-  ratio.o   = distinct.o / pmax(1, n_nonmissing.o),
-  ratio.n   = distinct.n / pmax(1, n_nonmissing.n),
-  d_distinct_rel    = ifelse(ratio.o > 0, abs(ratio.n - ratio.o) / ratio.o, NA_real_),  # magnitude -> flag
-  d_distinct_signed = ifelse(ratio.o > 0, (ratio.n - ratio.o) / ratio.o, NA_real_),     # signed  -> display
-  pooled_sd = sqrt((sd.o^2 + sd.n^2) / 2),
-  smd       = ifelse(is.na(pooled_sd) | pooled_sd == 0, NA_real_, (mean.n - mean.o) / pooled_sd),
-  # Shape/tail drift the mean-based SMD misses: max standardized shift across p10..p90 (an unchanged
-  # mean can still hide a fatter tail). Same pooled-SD denominator as SMD, so it reads in the same units.
-  q_shift_max = ifelse(is.na(pooled_sd) | pooled_sd == 0, NA_real_,   # suppress the all-NA pmax warning on categorical rows (result discarded by the ifelse)
-                suppressWarnings(pmax(abs(p5.n - p5.o), abs(p10.n - p10.o), abs(p25.n - p25.o), abs(p50.n - p50.o),
-                     abs(p75.n - p75.o), abs(p90.n - p90.o), abs(p95.n - p95.o), na.rm = TRUE)) / pooled_sd),
-  kind_change     = kind.o != kind.n,
-  date_min_change = kind.o == "date" & kind.n == "date" &
-                    (coalesce(date_min.o, "") != coalesce(date_min.n, "")),
-  d_unparse        = coalesce(unparseable.n, 0) - coalesce(unparseable.o, 0),
-  unparse_up       = coalesce(unparseable.n, 0) > coalesce(unparseable.o, 0),   # more parse failures = QA regression
-  date_max_regress = kind.o == "date" & kind.n == "date" & !is.na(date_max.o) & !is.na(date_max.n) &
-                     (date_max.n < date_max.o),   # max moved backwards = truncated history (an advance is expected, not flagged)
-  type_change      = type.o != type.n & kind.o == kind.n,   # same-kind storage change (e.g. integer -> double)
-  const_shift      = kind.o == "numeric" & kind.n == "numeric" & is.na(smd) &
-                     !is.na(mean.o) & !is.na(mean.n) & (mean.o != mean.n))  # zero-variance column whose value moved (SMD undefined)
-
-# Categorical drift: parse "count:value|..." into per-value shares and compare the two snapshots.
-parse_topv <- function(s, nn) {
-  if (is.na(s) || !nzchar(s) || is.na(nn) || nn <= 0) return(setNames(numeric(0), character(0)))
-  items <- str_split(s, "\\|")[[1]]
-  cnts  <- suppressWarnings(as.numeric(sub(":.*$", "", items)))   # count = before the first ':'
-  vals  <- sub("^[0-9]+:", "", items)                            # value = after the first ':'
-  ok <- !is.na(cnts) & nzchar(vals)
-  setNames(100 * cnts[ok] / nn, vals[ok])
-}
-cat_compare <- function(tv_o, nn_o, tv_n, nn_n) {
-  so <- parse_topv(tv_o, nn_o); sn <- parse_topv(tv_n, nn_n)
-  msgs <- character(0)
-  for (v in union(names(so), names(sn))) {
-    a <- if (v %in% names(so)) so[[v]] else NA_real_
-    b <- if (v %in% names(sn)) sn[[v]] else NA_real_
-    if (is.na(a)) { if (!is.na(b) && b >= cat_min) msgs <- c(msgs, sprintf("+%s (%.0f%%)", v, b)) }
-    else if (is.na(b)) { if (a >= cat_min) msgs <- c(msgs, sprintf("-%s (%.0f%%)", v, a)) }
-    else if (abs(b - a) >= cat_pts) msgs <- c(msgs, sprintf("%s %.0f%%->%.0f%%", v, a, b))
-  }
-  list(flag = length(msgs) > 0, desc = paste(msgs, collapse = "; "))
-}
-cat_flag <- rep(FALSE, nrow(j)); cat_desc <- rep("", nrow(j))
-is_cat <- j$kind.o == "categorical" & j$kind.n == "categorical"
-for (i in which(is_cat)) {
-  cc <- cat_compare(j$top_values.o[i], j$n_nonmissing.o[i], j$top_values.n[i], j$n_nonmissing.n[i])
-  cat_flag[i] <- cc$flag; cat_desc[i] <- cc$desc
-}
-j$cat_flag <- cat_flag; j$cat_desc <- cat_desc
-
-j <- j %>% mutate(
-  flag_miss     = !is.na(d_miss) & abs(d_miss) >= miss_pts,
-  flag_smd      = !is.na(smd) & abs(smd) >= smd_thresh,
-  flag_quantile = !is.na(q_shift_max) & q_shift_max >= smd_thresh,
-  flag_distinct = !is.na(d_distinct_rel) & d_distinct_rel >= distinct_pct / 100,
-  flag_kind     = kind_change,
-  flag_type     = type_change,
-  flag_const    = const_shift,
-  flag_date     = date_min_change | unparse_up | date_max_regress,
-  any_flag      = flag_miss | flag_smd | flag_quantile | flag_distinct | flag_kind | flag_type | flag_const | flag_date | cat_flag)
-
-# Table-level row-count change ("change in numbers"): n_rows_total is constant within a table.
-tbl_rows <- j %>% group_by(table_base) %>%
-  summarise(rows_o = dplyr::first(n_rows_total.o), rows_n = dplyr::first(n_rows_total.n), .groups = "drop") %>%
-  mutate(d_rel = ifelse(rows_o > 0, 100 * (rows_n - rows_o) / rows_o, NA_real_),
-         flag  = !is.na(d_rel) & abs(d_rel) >= rows_pct) %>%
-  arrange(desc(abs(d_rel)))
-
-# ---- assemble the flagged rows (what changed, most-shifted first) ----
-fmtn <- function(v) ifelse(is.na(v), "", ifelse(abs(v - round(v)) < 1e-9,
-                    formatC(v, format = "f", digits = 0, big.mark = ","), formatC(v, format = "f", digits = 2, big.mark = ",")))
-note_for <- function(r) {
-  m <- character(0)
-  if (r$flag_kind)  m <- c(m, sprintf("kind %s->%s", r$kind.o, r$kind.n))
-  if (isTRUE(r$flag_type))  m <- c(m, sprintf("type %s->%s", r$type.o, r$type.n))
-  if (isTRUE(r$flag_const)) m <- c(m, sprintf("constant value %s->%s", fmtn(r$mean.o), fmtn(r$mean.n)))
-  if (r$flag_miss)  m <- c(m, sprintf("missing %.1f%%->%.1f%% (%+.1fpt)", r$pct_missing.o, r$pct_missing.n, r$d_miss))
-  if (r$flag_smd)   m <- c(m, sprintf("SMD %+.2f (mean %s->%s)", r$smd, fmtn(r$mean.o), fmtn(r$mean.n)))
-  if (isTRUE(r$flag_quantile) || isTRUE(r$flag_smd))
-    m <- c(m, sprintf("quantiles p25/p50/p75: %s->%s / %s->%s / %s->%s (max shift %.2f SD)",
-      fmtn(r$p25.o), fmtn(r$p25.n), fmtn(r$p50.o), fmtn(r$p50.n), fmtn(r$p75.o), fmtn(r$p75.n), r$q_shift_max))
-  if (r$flag_distinct) m <- c(m, sprintf("distinct/nonmiss %+.0f%%", 100 * r$d_distinct_signed))
-  if (r$flag_date) m <- c(m, sprintf("date range %s..%s -> %s..%s%s",
-    coalesce(r$date_min.o, "n/a"), coalesce(r$date_max.o, "n/a"),
-    coalesce(r$date_min.n, "n/a"), coalesce(r$date_max.n, "n/a"),
-    if (isTRUE(r$unparse_up)) sprintf("; unparseable %s->%s", fmtn(coalesce(r$unparseable.o, 0)), fmtn(coalesce(r$unparseable.n, 0))) else ""))
-  if (nzchar(r$cat_desc)) m <- c(m, sprintf("categories: %s", r$cat_desc))
-  paste(m, collapse = " | ")
-}
-flagged <- j %>% filter(any_flag) %>%
-  arrange(desc(abs(coalesce(smd, 0)) + coalesce(q_shift_max, 0) + abs(coalesce(d_miss, 0)) / 10 + flag_kind * 100))
-flag_rows <- if (nrow(flagged)) lapply(seq_len(nrow(flagged)), function(i) {
-  r <- flagged[i, ]
-  list(col = r$colname, kind = r$kind.n,
-       miss = sprintf("%.1f%% -> %.1f%%", r$pct_missing.o, r$pct_missing.n),
-       n = sprintf("%s -> %s", fmtn(r$n_rows.o), fmtn(r$n_rows.n)),
-       note = note_for(r))
-}) else list()
-
-# ---- render ----
-esc <- function(x) { x <- as.character(x); x <- gsub("&","&amp;",x,fixed=TRUE)
-  x <- gsub("<","&lt;",x,fixed=TRUE); gsub(">","&gt;",x,fixed=TRUE) }
-li  <- function(v) if (length(v)) esc(paste(v, collapse = ", ")) else "&mdash;"
-gen_time <- format(Sys.time(), "%Y-%m-%d %H:%M")
-sub_txt  <- sprintf("old: %s  |  new: %s  |  generated %s", basename(old_path), basename(new_path), gen_time)
-thr_txt  <- sprintf("Flag thresholds: missing >=%gpt, SMD >=%g, distinct >=%g%%, category share >=%gpt (>=%g%% share), row count >=%g%%.",
-                    miss_pts, smd_thresh, distinct_pct, cat_pts, cat_min, rows_pct)
-
-render_html <- function() {
-  frows <- paste(vapply(flag_rows, function(r) sprintf(
-    "<tr><td>%s</td><td>%s</td><td>%s</td><td class='num'>%s</td><td class='note'>%s</td></tr>",
-    esc(r$col), esc(r$kind), esc(r$miss), esc(r$n), esc(r$note)), character(1)), collapse = "\n")
-  trows <- if (nrow(tbl_rows)) paste(apply(tbl_rows, 1, function(t) sprintf(
-    "<tr><td>%s</td><td class='num'>%s</td><td class='num'>%s</td><td class='num'>%s%%%s</td></tr>",
-    esc(t[["table_base"]]), esc(fmtn(as.numeric(t[["rows_o"]]))), esc(fmtn(as.numeric(t[["rows_n"]]))),
-    esc(sprintf("%+.1f", as.numeric(t[["d_rel"]]))),
-    if (as.logical(t[["flag"]])) " &#9888;" else "")), collapse = "\n") else ""
-  paste0(
-    "<!doctype html><html><head><meta charset='utf-8'><title>Snapshot comparison</title><style>",
-    "body{font:14px/1.5 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#1a1a1a;margin:0;padding:32px;max-width:1100px}",
-    "h1{font-size:22px;margin:0 0 4px}h2{font-size:17px;margin:28px 0 6px;border-top:1px solid #e5e5e5;padding-top:18px}",
-    ".sub{color:#666;margin:0 0 4px}.caveat{color:#b45309;font-size:12px;margin:6px 0 14px}",
-    ".changes{background:#f6f8fa;border:1px solid #e5e5e5;border-radius:8px;padding:8px 18px;margin:8px 0}",
-    ".changes li{margin:3px 0}table{border-collapse:collapse;width:100%;margin:6px 0}",
-    "th,td{text-align:left;padding:6px 10px;border-bottom:1px solid #eee;vertical-align:top}",
-    "th{font-size:12px;text-transform:uppercase;letter-spacing:.03em;color:#555;background:#fafafa}",
-    "td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}.note{font-size:13px;color:#333}</style></head><body>",
-    "<h1>Snapshot comparison</h1><p class='sub'>", esc(sub_txt), "</p>",
-    if (nzchar(samp_note)) sprintf("<p class='caveat'>%s</p>", esc(samp_note)) else "",
-    "<p class='caveat'>Flags are magnitude-based candidates to review — clinical significance is a human judgment. ",
-    esc(thr_txt), "</p>",
-    "<div class='changes'><h2>Schema changes</h2><ul>",
-    sprintf("<li><b>Added tables (%d):</b> %s</li>", length(added_tbls), li(added_tbls)),
-    sprintf("<li><b>Dropped tables (%d):</b> %s</li>", length(dropped_tbls), li(dropped_tbls)),
-    sprintf("<li><b>Added columns (%d):</b> %s</li>", length(added_cols), li(added_cols)),
-    sprintf("<li><b>Dropped columns (%d):</b> %s</li>", length(dropped_cols), li(dropped_cols)),
-    "</ul></div>",
-    "<h2>Row counts by table</h2><table><thead><tr><th>table</th><th class='num'>old rows</th>",
-    "<th class='num'>new rows</th><th class='num'>&Delta;%</th></tr></thead><tbody>", trows, "</tbody></table>",
-    sprintf("<h2>Flagged shifts (%d of %d shared columns)</h2>", length(flag_rows), nrow(j)),
-    if (length(flag_rows))
-      paste0("<table><thead><tr><th>table.column</th><th>kind</th><th>missing (old&rarr;new)</th>",
-             "<th class='num'>n (old&rarr;new)</th><th>what changed</th></tr></thead><tbody>", frows, "</tbody></table>")
-    else "<p>No column crossed a flag threshold.</p>",
-    "</body></html>")
-}
-render_md <- function() {
-  c(sprintf("# Snapshot comparison\n\n%s\n%s\n_%s_\n\n_%s_\n", sub_txt,
-            if (nzchar(samp_note)) sprintf("\n**%s**\n", samp_note) else "",
-            "Flags are magnitude-based candidates to review — clinical significance is a human judgment.", thr_txt),
-    "## Schema changes\n",
-    sprintf("- **Added tables (%d):** %s", length(added_tbls), if (length(added_tbls)) paste(added_tbls, collapse=", ") else "—"),
-    sprintf("- **Dropped tables (%d):** %s", length(dropped_tbls), if (length(dropped_tbls)) paste(dropped_tbls, collapse=", ") else "—"),
-    sprintf("- **Added columns (%d):** %s", length(added_cols), if (length(added_cols)) paste(added_cols, collapse=", ") else "—"),
-    sprintf("- **Dropped columns (%d):** %s", length(dropped_cols), if (length(dropped_cols)) paste(dropped_cols, collapse=", ") else "—"),
-    "\n## Row counts by table\n", "| table | old rows | new rows | Δ% |", "|---|---:|---:|---:|",
-    if (nrow(tbl_rows)) apply(tbl_rows, 1, function(t) sprintf("| %s | %s | %s | %+.1f%%%s |", t[["table_base"]],
-      fmtn(as.numeric(t[["rows_o"]])), fmtn(as.numeric(t[["rows_n"]])), as.numeric(t[["d_rel"]]),
-      if (as.logical(t[["flag"]])) " ⚠" else "")) else character(0),
-    sprintf("\n## Flagged shifts (%d of %d shared columns)\n", length(flag_rows), nrow(j)),
-    if (length(flag_rows)) c("| table.column | kind | missing (old→new) | n (old→new) | what changed |",
-                             "|---|---|---|---:|---|",
-      vapply(flag_rows, function(r) sprintf("| %s | %s | %s | %s | %s |", r$col, r$kind, r$miss, r$n,
-             gsub("|","\\|", r$note, fixed = TRUE)), character(1)))
-    else "_No column crossed a flag threshold._")
-}
-
-run <- function() {
-  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
-  html <- file.path(out_dir, "snapshot_comparison.html")
-  md   <- file.path(out_dir, "snapshot_comparison.md")
-  writeLines(render_html(), html)
-  writeLines(paste(render_md(), collapse = "\n"), md)
-  message(sprintf("compared %d shared columns; %d flagged. wrote %s",
-                  nrow(j), length(flag_rows), html))
-  invisible(list(flagged = flagged, tbl_rows = tbl_rows))
-}
-if (!nzchar(Sys.getenv("CMP_DEFINE_ONLY"))) run()
-#==FILE==# oc_exploration.R
-# OC Panoramic exploration — LOT and platinum items. Builds one report (HTML + md)
-# of patient counts by treatment setting, lines of therapy, and platinum use.
-# tidyverse/dplyr over ODBC, no Spark.
-#   DATABRICKS_DSN=RWDE DATABRICKS_PWD=... Rscript oc_exploration.R
-# Lines are built from the non-maintenance drug episodes. Two items need columns that the
-# profiler surfaces first — recurrence date (2e) and the Panoramic platinum-status table
-# (3b/3c); set them below (or via env). If absent, those items are marked pending, not run.
-
-library(dplyr); library(tidyr); library(stringr)
-
-# ---- config ----
-catalog         <- Sys.getenv("OC_CATALOG", "hive_metastore")
-schema          <- Sys.getenv("OC_SCHEMA",  "clnprw_flatiron_pano_ovar_use")
-drugepisode_tbl <- Sys.getenv("OC_DRUGEP",  "t_drugepisode_2026m06")
-platinum_drugs  <- "carboplatin|cisplatin|oxaliplatin"     # platinum drugs
-settings_keep   <- c("Neoadjuvant", "Adjuvant", "Advanced")
-
-# Expected column names for items 2e / 3b / 3c. Two live caveats: recurrence date can lag
-# the data dictionary (confirm it is delivered and check its null rate on the first feed);
-# the platinum table has one row per platinum-containing line, values Sensitive / Resistant
-# / Refractory / null, so a non-platinum line has no row.
-recur_tbl   <- Sys.getenv("OC_RECUR_TBL",   "t_enh_ov_2026m06")
-recur_col   <- Sys.getenv("OC_RECUR_COL",   "recurrencedate")
-plat_tbl    <- Sys.getenv("OC_PLAT_TBL",    "t_enh_ov_platstatus_2026m06")
-plat_line   <- Sys.getenv("OC_PLAT_LINE",   "linenumber")
-plat_status <- Sys.getenv("OC_PLAT_STATUS", "platinumstatus")
-
-this_dir <- tryCatch(dirname(sub("^--file=", "", grep("^--file=", commandArgs(FALSE), value = TRUE))),
-                     error = function(e) ".")
-if (!length(this_dir) || this_dir == "") this_dir <- "."
-out_dir <- Sys.getenv("OC_OUT_DIR", file.path(this_dir, "outputs"))
-
-is_nonmaint <- function(x) str_to_lower(str_trim(as.character(x))) %in% c("false","f","n","no","0")
-# Live linesetting is uppercase (ADVANCED/ADJUVANT/NEOADJUVANT); make it title case
-# so comparisons don't depend on the feed's casing. Vectorized (used per episode).
-canon_setting <- function(x) { s <- str_squish(as.character(x))
-  ifelse(is.na(s) | s == "", NA_character_, str_to_title(s)) }
-# The drugs actually given in a segment, as a sorted set, from the episode-level drug names.
-# Splits combined names and de-duplicates, so order and repeats don't matter ("Carbo, Pac" ==
-# "Pac + Carbo"). Takes all of a segment's drug names at once and returns one "a|b" string.
-drug_set <- function(v) {
-  toks <- unlist(str_split(str_squish(str_to_lower(as.character(v))), "\\s*[,/+;&|]\\s*"))
-  toks <- toks[!is.na(toks) & toks != ""]
-  paste(sort(unique(toks)), collapse = "|") }
-
-# ---- connection ----
-get_con <- function() {
-  if (exists("con", envir = .GlobalEnv)) return(get("con", envir = .GlobalEnv))
-  pwd <- Sys.getenv("DATABRICKS_PWD", "")
-  if (!nzchar(pwd)) stop("set DATABRICKS_PWD, or provide a DBI `con`.")
-  DBI::dbConnect(odbc::odbc(), dsn = Sys.getenv("DATABRICKS_DSN", "RWDE"),
-                 pwd = pwd, timeout = 120, bigint = "numeric")
-}
-fqtn <- function(tbl) paste(c(catalog, schema, tbl), collapse = ".")
-load_tbl <- function(con, tbl, cols = NULL) {
-  sel <- if (is.null(cols)) "*" else paste(cols, collapse = ", ")
-  df <- as_tibble(DBI::dbGetQuery(con, sprintf("SELECT %s FROM %s", sel, fqtn(tbl))))
-  names(df) <- tolower(names(df)); df
-}
-
-# ---- analysis ----
-run_analysis <- function(con) {
-  # Drop rows with no patient or line key: they can't be placed on a line, and R and SQL treat
-  # missing keys differently in joins/counts, so removing them up front keeps the two in step.
-  drugep <- load_tbl(con, drugepisode_tbl,
-    c("patientid","linenumber","linesetting","ismaintenancetherapy","linename","linestartdate","episodedate","drugname")) %>%
-    filter(!is.na(patientid), !is.na(linenumber))
-
-  # Non-maintenance episodes, with a title-cased setting PER EPISODE. A line number can span
-  # settings (neoadjuvant then adjuvant on line 1), so setting is not one-per-line.
-  ep <- drugep %>% filter(is_nonmaint(ismaintenancetherapy)) %>%
-    mutate(setting = canon_setting(linesetting),
-           linestartdate = as.Date(linestartdate), episodedate = as.Date(episodedate))
-
-  # One row per line-segment: (patient, line, setting). Because a line can span settings, the
-  # regimen and start are built from the segment's own episodes, not the whole-line fields:
-  # regimen from the drug names in this setting, start from the first episode in this setting.
-  seg <- ep %>% filter(!is.na(setting)) %>%
-    group_by(patientid, linenumber, setting) %>%
-    summarise(regimen = drug_set(drugname),
-              start   = suppressWarnings(min(episodedate, na.rm = TRUE)), .groups = "drop") %>%
-    mutate(start = as.Date(ifelse(is.finite(start), start, NA), origin = "1970-01-01"))
-
-  # Lines whose number spans more than one setting. The platinum-status table is line-level,
-  # so for these the status can't be pinned to a single setting (used as a QC flag in 3b/3c).
-  span_lines <- seg %>% distinct(patientid, linenumber, setting) %>%
-    count(patientid, linenumber, name = "n_set") %>% filter(n_set > 1) %>%
-    distinct(patientid, linenumber)
-
-  out <- list()   # each element: list(title, note, table)
-
-  # 2a. patients by non-maintenance setting combination
-  combo <- seg %>% filter(setting %in% settings_keep) %>% distinct(patientid, setting) %>%
-    group_by(patientid) %>% summarise(combo = paste(sort(unique(setting)), collapse = " + "), .groups = "drop")
-  out$q2a <- list(
-    title = "2a. Patients by non-maintenance treatment setting combination",
-    note  = sprintf("Denominator = %d patients with >=1 non-maintenance line in Neoadjuvant/Adjuvant/Advanced (Off-Systemic-Therapy and missing settings excluded).",
-                    n_distinct(combo$patientid)),
-    table = combo %>% count(combo, name = "patients") %>%
-      mutate(pct = sprintf("%.1f%%", 100 * patients / sum(patients))) %>% arrange(desc(patients)))
-
-  # 2b. patients with >1 non-maintenance adjuvant line
-  adj_lines <- seg %>% filter(setting == "Adjuvant") %>% distinct(patientid, linenumber)
-  n_multi_adj <- adj_lines %>% count(patientid, name = "n") %>% filter(n > 1) %>% nrow()
-  out$q2b <- list(title = "2b. Patients with multiple non-maintenance adjuvant lines", note = "",
-    table = tibble(metric = "patients with >1 adjuvant line", patients = n_multi_adj))
-
-  # 2c. among advanced-setting patients, distribution of total LOT count. Count only treatment
-  # settings (Neo/Adj/Adv), so Off-Systemic-Therapy doesn't inflate the line count — same scope
-  # as 2a.
-  adv_pts <- seg %>% filter(setting == "Advanced") %>% distinct(patientid) %>% pull(patientid)
-  lot_ct  <- seg %>% filter(patientid %in% adv_pts, setting %in% settings_keep) %>%
-    distinct(patientid, linenumber) %>% count(patientid, name = "n_lot")
-  out$q2c <- list(
-    title = "2c. Advanced-setting patients by total number of lines of therapy",
-    note  = sprintf("Denominator = %d patients with >=1 Advanced line. LOT = distinct non-maintenance lines in Neoadjuvant/Adjuvant/Advanced (Off-Systemic-Therapy excluded), not Advanced-only. Confirm whether Advanced-only is intended instead.", length(adv_pts)),
-    table = lot_ct %>% count(n_lot, name = "patients") %>%
-      mutate(pct = sprintf("%.1f%%", 100 * patients / sum(patients))) %>% arrange(n_lot))
-
-  # 2d. same regimen in the last adjuvant line and the first-line Advanced regimen. regimen is
-  # already a sorted drug set, so equality is order-independent. L1 = first Advanced line (line
-  # number 1 is the earliest line overall, so nothing is "prior to it" — that reading is vacuous).
-  first_adv <- seg %>% filter(setting == "Advanced") %>%
-    arrange(patientid, linenumber) %>% group_by(patientid) %>% slice(1L) %>% ungroup() %>%
-    transmute(patientid, adv_regimen = regimen, adv_start = start)
-  # last adjuvant line that STARTS BEFORE the first Advanced line ("last one prior to L1"). Ties
-  # on start break by the higher line number, so R and SQL pick the same line.
-  adj_last_pre <- seg %>% filter(setting == "Adjuvant") %>% inner_join(first_adv, by = "patientid") %>%
-    filter(!is.na(start), !is.na(adv_start), start < adv_start) %>%
-    arrange(patientid, desc(start), desc(linenumber)) %>%
-    group_by(patientid) %>% slice(1L) %>% ungroup()
-  n_same <- adj_last_pre %>% filter(nzchar(regimen) & regimen == adv_regimen) %>% nrow()
-  out$q2d <- list(
-    title = "2d. Patients whose last adjuvant regimen matches their first-line Advanced regimen",
-    note  = "L1 = first Advanced line; adjuvant line = the last one starting before it; regimens compared as drug sets (blanks excluded). (2e uses line number 1; 2d can't, since nothing starts before line 1.)",
-    table = tibble(metric = c("patients with an adjuvant line before their first-Advanced line", "same regimen"),
-                   patients = c(nrow(adj_last_pre), n_same)))
-
-  # 2e. L1 start < recurrence date  (needs recurrence date). L1 = line number 1. This uses
-  # linestartdate (the line-start field), since the ask says "1L start date" — not the per-episode
-  # date 2d uses. A line can span settings, so take the earliest line start across them. Built from `ep`
-  # (BEFORE the setting filter), because 2e is setting-independent — a line-1 row with a missing setting
-  # still counts; the SQL mirrors this by building l1 from the drug episodes directly, not from oc_lines.
-  l1 <- ep %>% filter(linenumber == 1) %>% group_by(patientid) %>%
-    summarise(l1_start = suppressWarnings(min(linestartdate, na.rm = TRUE)), .groups = "drop") %>%
-    mutate(l1_start = as.Date(ifelse(is.finite(l1_start), l1_start, NA), origin = "1970-01-01"))
-  rec <- tryCatch(load_tbl(con, recur_tbl, c("patientid", recur_col)), error = function(e) e)
-  out$q2e <- if (inherits(rec, "error")) list(title = "2e. Patients with 1L start date < recurrence date",
-      note = sprintf("PENDING: confirm recurrence date column (tried %s.%s). %s", recur_tbl, recur_col, conditionMessage(rec)),
-      table = NULL)
-    else {
-      names(rec)[2] <- "recur"
-      # One recurrence date per patient (earliest), so a table with >1 row per patient can't
-      # fan out the join and overcount — matches the SQL's min(recurrencedate).
-      rec <- rec %>% mutate(recur = as.Date(recur)) %>% filter(!is.na(recur)) %>%
-        group_by(patientid) %>% summarise(recur = min(recur), .groups = "drop")
-      n_l1 <- l1 %>% filter(!is.na(l1_start)) %>% nrow()
-      j <- l1 %>% inner_join(rec, by = "patientid") %>% filter(!is.na(l1_start))
-      list(title = "2e. Patients with 1L start date < recurrence date",
-           note = "1L = line number 1, the first line of therapy (confirmed). The drop from row 1 to row 2 is patients with no recurrence date.",
-           table = tibble(metric = c("patients with an L1 start", "of those, have a recurrence date", "L1 start < recurrence"),
-                          patients = c(n_l1, nrow(j), sum(j$l1_start < j$recur))))
-    }
-
-  # 3a. among adjuvant-setting patients, % who received platinum chemo. The platinum has to be
-  # on an adjuvant episode itself: a line can span settings, so joining on the line number would
-  # wrongly credit platinum given in the neoadjuvant part of the same line.
-  adj_pts  <- seg %>% filter(setting == "Adjuvant") %>% distinct(patientid) %>% pull(patientid)
-  plat_adj <- ep %>% filter(setting == "Adjuvant", str_detect(str_to_lower(drugname), platinum_drugs)) %>%
-    distinct(patientid) %>% pull(patientid)
-  out$q3a <- list(
-    title = "3a. Adjuvant-setting patients who received platinum-based chemotherapy",
-    note  = sprintf("Platinum = drug name contains %s, on an adjuvant non-maintenance episode.", platinum_drugs),
-    table = tibble(metric = c("adjuvant-setting patients", "received platinum", "%"),
-                   value  = c(as.character(length(adj_pts)), as.character(length(plat_adj)),
-                              sprintf("%.1f%%", 100 * length(plat_adj) / max(1, length(adj_pts))))))
-
-  # 3b/3c. platinum status by setting  (needs the Panoramic platinum-status table)
-  # Patient-level: one line per patient. A conflict (line with >1 distinct status) is flagged,
-  # not silently resolved; matched-but-blank and no-matching-row are shown separately, so the
-  # denominator stays all patients in the setting.
-  plat_status_block <- function(pt_lines, title, note) {
-    ps <- tryCatch(load_tbl(con, plat_tbl, c("patientid", plat_line, plat_status)), error = function(e) e)
-    if (inherits(ps, "error")) return(list(title = title, table = NULL,
-      note = sprintf("PENDING: confirm platinum-status table/columns (tried %s: %s, %s). %s",
-                     plat_tbl, plat_line, plat_status, conditionMessage(ps))))
-    names(ps) <- c("patientid", "linenumber", "status")
-    # Trim before comparing (keep the trimmed text, not the raw), so " Sensitive " and "Sensitive"
-    # are one status — same as the SQL's nullif(trim(platinumstatus),'').
-    ps <- ps %>% mutate(status = str_trim(status),
-                        status = ifelse(is.na(status) | status == "", NA_character_, status),
-                        matched = TRUE)
-    cls <- pt_lines %>% left_join(ps, by = c("patientid","linenumber")) %>%
-      group_by(patientid) %>%
-      summarise(matched = any(!is.na(matched)),
-                n_stat  = n_distinct(status[!is.na(status)]),
-                one     = { s <- unique(status[!is.na(status)]); if (length(s) == 1) s else NA_character_ },
-                .groups = "drop") %>%
-      mutate(status = case_when(n_stat == 1 ~ one,
-                                n_stat >  1 ~ "Conflicting status (multiple rows)",
-                                matched     ~ "Status row present but blank",
-                                TRUE        ~ "No status row"))
-    # The status table has one row per line, but a line can cover more than one setting. Count how
-    # many of these lines do, so that risk is shown, not hidden.
-    n_span <- pt_lines %>% distinct(patientid, linenumber) %>%
-      semi_join(span_lines, by = c("patientid","linenumber")) %>% nrow()
-    if (n_span > 0) note <- sprintf(
-      "%s QC: %d of these lines also have episodes in another setting, so their status can't be tied to just one setting — confirm how to count those.",
-      note, n_span)
-    list(title = title, note = note,
-         table = cls %>% count(status, name = "patients") %>%
-           mutate(pct = sprintf("%.1f%%", 100 * patients / sum(patients))) %>% arrange(desc(patients)))
-  }
-
-  # All adjuvant lines: the status table only has platinum lines, so the last adjuvant line
-  # may not be the one with a status. The block aggregates per patient and flags conflicts.
-  adj_all <- seg %>% filter(setting == "Adjuvant") %>% distinct(patientid, linenumber)
-  out$q3b <- plat_status_block(adj_all, "3b. Platinum status in the adjuvant setting (patients)",
-    "Panoramic PlatinumStatus across a patient's adjuvant lines; denominator = all adjuvant-setting patients (non-platinum lines have no status row).")
-
-  first_adv_line <- seg %>% filter(setting == "Advanced") %>%
-    arrange(patientid, linenumber) %>% group_by(patientid) %>% slice(1L) %>% ungroup() %>%
-    distinct(patientid, linenumber)
-  out$q3c <- plat_status_block(first_adv_line, "3c. Platinum status in the first-line advanced setting (patients)",
-    "Panoramic PlatinumStatus. One row per patient = their earliest Advanced line; denominator = all first-line-advanced patients.")
-
-  out
-}
-
-# ---- rendering ----
-esc <- function(x) { x <- as.character(x); x <- gsub("&","&amp;",x,fixed=TRUE)
-  x <- gsub("<","&lt;",x,fixed=TRUE); gsub(">","&gt;",x,fixed=TRUE) }
-df_to_md <- function(df) {
-  if (is.null(df) || !nrow(df)) return("_no rows_")
-  head <- paste0("| ", paste(names(df), collapse = " | "), " |")
-  sep  <- paste0("| ", paste(rep("---", ncol(df)), collapse = " | "), " |")
-  body <- apply(df, 1, function(r) paste0("| ", paste(r, collapse = " | "), " |"))
-  paste(c(head, sep, body), collapse = "\n")
-}
-df_to_html <- function(df) {
-  if (is.null(df) || !nrow(df)) return("<p class='pending'>no rows</p>")
-  th <- paste0("<th>", paste(esc(names(df)), collapse = "</th><th>"), "</th>")
-  tr <- apply(df, 1, function(r) paste0("<tr><td>", paste(esc(r), collapse = "</td><td>"), "</td></tr>"))
-  paste0("<table><thead><tr>", th, "</tr></thead><tbody>", paste(tr, collapse = ""), "</tbody></table>")
-}
-render <- function(out, gen_time) {
-  md <- c(sprintf("# OC Panoramic exploration — LOT & platinum\n\n%s.%s — generated %s\n",
-                  catalog, schema, gen_time))
-  html_secs <- character()
-  for (s in out) {
-    note_md <- if (nzchar(s$note)) paste0("\n", s$note, "\n") else ""
-    md <- c(md, sprintf("\n## %s\n%s", s$title, note_md), df_to_md(s$table))
-    pend <- grepl("^PENDING", s$note)
-    html_secs <- c(html_secs, sprintf("<h2%s>%s</h2>%s%s",
-      if (pend) " class='pend'" else "", esc(s$title),
-      if (nzchar(s$note)) sprintf("<p class='note'>%s</p>", esc(s$note)) else "",
-      df_to_html(s$table)))
-  }
-  html <- paste0(
-    "<!doctype html><html><head><meta charset='utf-8'><title>OC exploration — LOT &amp; platinum</title><style>",
-    "body{font:14px/1.5 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#1a1a1a;margin:0;padding:32px;max-width:900px}",
-    "h1{font-size:22px;margin:0 0 4px}h2{font-size:17px;margin:28px 0 6px;border-top:1px solid #e5e5e5;padding-top:18px}",
-    "h2.pend{color:#b45309}.sub{color:#666;margin:0 0 20px}.note{color:#666;font-size:13px;margin:0 0 8px}",
-    "table{border-collapse:collapse;margin:6px 0}th,td{text-align:left;padding:6px 12px;border-bottom:1px solid #eee}",
-    "th{font-size:12px;text-transform:uppercase;letter-spacing:.03em;color:#555;background:#fafafa}",
-    "td{font-variant-numeric:tabular-nums}</style></head><body><h1>OC Panoramic exploration — LOT &amp; platinum</h1>",
-    sprintf("<p class='sub'>%s.%s &middot; generated %s</p>", esc(catalog), esc(schema), esc(gen_time)),
-    paste(html_secs, collapse = "\n"), "</body></html>")
-  list(md = paste(md, collapse = "\n"), html = html)
-}
-
-run <- function() {
-  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
-  con <- get_con()
-  out <- run_analysis(con)
-  r <- render(out, format(Sys.time(), "%Y-%m-%d %H:%M"))
-  writeLines(r$html, file.path(out_dir, "oc_exploration.html"))
-  writeLines(r$md,   file.path(out_dir, "oc_exploration.md"))
-  cat(r$md, "\n")
-  message(sprintf("wrote %s", file.path(out_dir, "oc_exploration.html")))
-  invisible(out)
-}
-if (!nzchar(Sys.getenv("OC_DEFINE_ONLY"))) run()
-#==FILE==# oc_exploration.sql
--- OC exploration — LOT & platinum items in SQL (mirrors oc_exploration.R). Run top to bottom.
--- Each numbered block returns one result set. Sources:
---   t_drugepisode_2026m06        — lines, settings, drugs (items 2a-2d, 3a)
---   t_enh_ov_2026m06             — recurrence date (item 2e; may lag the dictionary)
---   t_enh_ov_platstatus_2026m06  — platinum status (items 3b/3c; one row per platinum line)
-USE CATALOG hive_metastore;
-USE SCHEMA  clnprw_flatiron_pano_ovar_use;
-
--- Shared view: one row per line-SEGMENT (patient, line, setting). A line number can span settings
--- (neoadjuvant then adjuvant on line 1), so setting is not one-per-line and is normalized per
--- episode. Because a line can span settings, regimen and start_date come from the segment's own
--- episodes (its drug names and episode dates), not the whole-line fields; line_start keeps the
--- line-start field for item 2e. Rows with no patient or line key are dropped so R and SQL agree.
-CREATE OR REPLACE TEMP VIEW oc_lines AS
-WITH ep AS (   -- non-maintenance episodes, setting normalized and drug names split per episode
-  SELECT patientid, linenumber,
-         CASE WHEN lower(trim(linesetting)) = 'neoadjuvant' THEN 'Neoadjuvant'
-              WHEN lower(trim(linesetting)) = 'adjuvant'    THEN 'Adjuvant'
-              WHEN lower(trim(linesetting)) = 'advanced'    THEN 'Advanced'
-              WHEN lower(trim(linesetting)) LIKE 'off%systemic%' THEN 'Off-Systemic-Therapy'
-              WHEN nullif(trim(linesetting), '') IS NULL THEN NULL
-              ELSE initcap(lower(trim(linesetting))) END AS setting,
-         split(regexp_replace(lower(trim(drugname)), '\\s+', ' '), '\\s*[,/+;&|]\\s*') AS drug_tokens,
-         episodedate, linestartdate
-  FROM t_drugepisode_2026m06
-  WHERE lower(trim(ismaintenancetherapy)) IN ('false','f','n','no','0')
-    AND patientid IS NOT NULL AND linenumber IS NOT NULL
-)
-SELECT patientid, linenumber, setting,
-       array_join(array_sort(array_distinct(filter(flatten(collect_list(drug_tokens)), x -> x <> ''))), '|') AS regimen,
-       min(episodedate)   AS start_date,
-       min(linestartdate) AS line_start
-FROM ep
-WHERE setting IS NOT NULL
-GROUP BY patientid, linenumber, setting;
-
--- 2a. Patients by non-maintenance treatment setting combination (Neoadjuvant/Adjuvant/Advanced).
-WITH pc AS (
-  SELECT patientid, concat_ws(' + ', sort_array(collect_set(setting))) AS combo
-  FROM oc_lines WHERE setting IN ('Neoadjuvant','Adjuvant','Advanced')
-  GROUP BY patientid
-)
-SELECT combo, count(*) AS patients, round(100.0 * count(*) / sum(count(*)) OVER (), 1) AS pct
-FROM pc GROUP BY combo ORDER BY patients DESC;
-
--- 2b. Patients with more than one non-maintenance adjuvant line.
-SELECT count(*) AS patients_with_multiple_adjuvant_lines FROM (
-  SELECT patientid FROM oc_lines WHERE setting = 'Adjuvant'
-  GROUP BY patientid HAVING count(DISTINCT linenumber) > 1
-);
-
--- 2c. Advanced-setting patients by total number of lines. Counts only treatment settings
---     (Neo/Adj/Adv), so Off-Systemic-Therapy doesn't inflate the line count — same scope as 2a.
-WITH adv AS (SELECT DISTINCT patientid FROM oc_lines WHERE setting = 'Advanced'),
-lot AS (
-  SELECT l.patientid, count(DISTINCT l.linenumber) AS n_lot
-  FROM oc_lines l JOIN adv a ON l.patientid = a.patientid
-  WHERE l.setting IN ('Neoadjuvant','Adjuvant','Advanced')
-  GROUP BY l.patientid
-)
-SELECT n_lot, count(*) AS patients, round(100.0 * count(*) / sum(count(*)) OVER (), 1) AS pct
-FROM lot GROUP BY n_lot ORDER BY n_lot;
-
--- 2d. Patients whose last adjuvant regimen matches their first-line Advanced regimen. regimen is
---     already a sorted drug set, so equality is order-independent (blanks excluded). L1 = first
---     Advanced line; adjuvant = the last one starting before it.
-WITH fa AS (   -- first Advanced line per patient
-  SELECT patientid, regimen AS adv_regimen, start_date AS adv_start FROM (
-    SELECT patientid, regimen, start_date,
-           row_number() OVER (PARTITION BY patientid ORDER BY linenumber) AS rn
-    FROM oc_lines WHERE setting = 'Advanced'
-  ) WHERE rn = 1
-),
-la AS (   -- last adjuvant line before the first Advanced line (ties break by higher line number)
-  SELECT patientid, adj_regimen, adv_regimen FROM (
-    SELECT o.patientid, o.regimen AS adj_regimen, fa.adv_regimen,
-           row_number() OVER (PARTITION BY o.patientid ORDER BY o.start_date DESC, o.linenumber DESC) AS rn
-    FROM oc_lines o JOIN fa ON o.patientid = fa.patientid
-    WHERE o.setting = 'Adjuvant' AND o.start_date IS NOT NULL AND fa.adv_start IS NOT NULL
-      AND o.start_date < fa.adv_start
-  ) WHERE rn = 1
-)
-SELECT count(*) AS patients_with_adjuvant_before_first_advanced,
-       sum(CASE WHEN adj_regimen <> '' AND adj_regimen = adv_regimen THEN 1 ELSE 0 END) AS same_regimen
-FROM la;
-
--- 2e. Patients with 1L start date < recurrence date  (needs recurrencedate in t_enh_ov_2026m06).
---     1L = line number 1. Uses linestartdate (the line-start field), since the ask says "1L start date".
---     Built straight from the drug episodes, NOT oc_lines: 2e is setting-independent, so a line-1 row with
---     a missing linesetting must still count — oc_lines drops those (WHERE setting IS NOT NULL), which would
---     diverge from the R (which builds l1 from ep, before the setting filter). Row 1 minus row 2 = no recurrence date.
-WITH l1  AS (
-  SELECT patientid, min(linestartdate) AS l1_start
-  FROM t_drugepisode_2026m06
-  WHERE lower(trim(ismaintenancetherapy)) IN ('false','f','n','no','0')
-    AND patientid IS NOT NULL AND linenumber IS NOT NULL AND linenumber = 1
-  GROUP BY patientid),
-rec AS (SELECT patientid, min(recurrencedate) AS recur FROM t_enh_ov_2026m06 GROUP BY patientid)
-SELECT
-  count(CASE WHEN l1.l1_start IS NOT NULL THEN 1 END)                                                     AS l1_patients,
-  count(CASE WHEN l1.l1_start IS NOT NULL AND r.recur IS NOT NULL THEN 1 END)                             AS with_recurrence_date,
-  count(CASE WHEN l1.l1_start IS NOT NULL AND r.recur IS NOT NULL AND l1.l1_start < r.recur THEN 1 END)   AS l1_start_before_recurrence
-FROM l1 LEFT JOIN rec r ON l1.patientid = r.patientid;
-
--- 3a. Adjuvant-setting patients who received platinum chemo (carboplatin/cisplatin/oxaliplatin).
---     Platinum must be on an adjuvant episode itself: a line can span settings, so matching on the
---     line number alone would credit platinum given in the neoadjuvant part of the same line.
-WITH adj AS (SELECT DISTINCT patientid FROM oc_lines WHERE setting = 'Adjuvant'),
-plat AS (
-  SELECT DISTINCT patientid
-  FROM t_drugepisode_2026m06
-  WHERE lower(trim(ismaintenancetherapy)) IN ('false','f','n','no','0')
-    AND patientid IS NOT NULL
-    AND lower(trim(linesetting)) = 'adjuvant'
-    AND (lower(drugname) LIKE '%carboplatin%' OR lower(drugname) LIKE '%cisplatin%'
-      OR lower(drugname) LIKE '%oxaliplatin%')
-)
-SELECT (SELECT count(DISTINCT patientid) FROM adj)  AS adjuvant_patients,
-       (SELECT count(*) FROM plat)                  AS received_platinum,
-       round(100.0 * (SELECT count(*) FROM plat) / nullif((SELECT count(DISTINCT patientid) FROM adj), 0), 1) AS pct;
-
--- 3b. Platinum status in the adjuvant setting (patients). Checks all of a patient's adjuvant
---     lines; a conflict (>1 distinct status) is flagged; a non-platinum line has no status row.
---     Caveat: the status table is keyed by line only, but a line can span settings — for a line
---     that does, its status can't be pinned to the adjuvant setting. QC block at the end counts
---     how many. Confirm the attribution rule before treating 3b as exact.
-WITH adj AS (SELECT DISTINCT patientid, linenumber FROM oc_lines WHERE setting = 'Adjuvant'),
-ps  AS (SELECT patientid, linenumber, nullif(trim(platinumstatus), '') AS status, 1 AS in_ps
-        FROM t_enh_ov_platstatus_2026m06),
-j AS (
-  SELECT a.patientid, count(DISTINCT ps.status) AS n_stat,
-         max(coalesce(ps.in_ps, 0)) AS has_row, max(ps.status) AS any_status
-  FROM adj a LEFT JOIN ps ON a.patientid = ps.patientid AND a.linenumber = ps.linenumber
-  GROUP BY a.patientid
-),
-cls AS (
-  SELECT patientid,
-    CASE WHEN n_stat = 1 THEN any_status
-         WHEN n_stat > 1 THEN 'Conflicting status (multiple rows)'
-         WHEN has_row = 1 THEN 'Status row present but blank'
-         ELSE 'No status row' END AS status
-  FROM j
-)
-SELECT status, count(*) AS patients, round(100.0 * count(*) / sum(count(*)) OVER (), 1) AS pct
-FROM cls GROUP BY status ORDER BY patients DESC;
-
--- 3c. Platinum status in the first-line advanced setting (patients). Uses each patient's
---     earliest Advanced line. Same line-vs-setting caveat as 3b (see the QC block at the end).
-WITH fa AS (
-  SELECT patientid, linenumber FROM (
-    SELECT patientid, linenumber, row_number() OVER (PARTITION BY patientid ORDER BY linenumber) AS rn
-    FROM oc_lines WHERE setting = 'Advanced'
-  ) WHERE rn = 1
-),
-ps AS (SELECT patientid, linenumber, nullif(trim(platinumstatus), '') AS status, 1 AS in_ps
-       FROM t_enh_ov_platstatus_2026m06),
-j AS (
-  SELECT f.patientid, count(DISTINCT ps.status) AS n_stat,
-         max(coalesce(ps.in_ps, 0)) AS has_row, max(ps.status) AS any_status
-  FROM fa f LEFT JOIN ps ON f.patientid = ps.patientid AND f.linenumber = ps.linenumber
-  GROUP BY f.patientid
-),
-cls AS (
-  SELECT patientid,
-    CASE WHEN n_stat = 1 THEN any_status
-         WHEN n_stat > 1 THEN 'Conflicting status (multiple rows)'
-         WHEN has_row = 1 THEN 'Status row present but blank'
-         ELSE 'No status row' END AS status
-  FROM j
-)
-SELECT status, count(*) AS patients, round(100.0 * count(*) / sum(count(*)) OVER (), 1) AS pct
-FROM cls GROUP BY status ORDER BY patients DESC;
-
--- QC for 3b/3c. Among the lines used above, how many span more than one setting (so the
--- line-level platinum status can't be attributed to one setting). Ideally these are ~0.
-WITH span AS (
-  SELECT patientid, linenumber FROM oc_lines
-  GROUP BY patientid, linenumber HAVING count(DISTINCT setting) > 1
-),
-adj AS (SELECT DISTINCT patientid, linenumber FROM oc_lines WHERE setting = 'Adjuvant'),
-fa AS (
-  SELECT patientid, linenumber FROM (
-    SELECT patientid, linenumber, row_number() OVER (PARTITION BY patientid ORDER BY linenumber) AS rn
-    FROM oc_lines WHERE setting = 'Advanced'
-  ) WHERE rn = 1
-)
-SELECT '3b adjuvant lines' AS keyset,
-       (SELECT count(*) FROM adj a JOIN span s ON a.patientid = s.patientid AND a.linenumber = s.linenumber) AS lines_spanning_settings
-UNION ALL
-SELECT '3c first-advanced lines',
-       (SELECT count(*) FROM fa f JOIN span s ON f.patientid = s.patientid AND f.linenumber = s.linenumber);
-#==FILE==# fralpha_by_treatment.R
-# FRalpha status at index by treatment (Mirvetuximab vs ICC), for ovarian patients on 2L-4L
-# lines. A patient can be in both arms; each arm uses its own first dose date. ICC must be a
-# single drug, unless the line also has mirvetuximab. Builds Table 1 (counts and %).
-# Pulls from Databricks over ODBC, then works on local data frames with dplyr:
-#   DATABRICKS_DSN=RWDE DATABRICKS_PWD=... Rscript fralpha_by_treatment.R
-
-library(dplyr); library(tidyr); library(stringr)
-
-# ---- config ----
-catalog         <- Sys.getenv("FRA_CATALOG", "hive_metastore")
-schema          <- "clnprw_flatiron_pano_ovar_use"
-drugepisode_tbl <- "t_drugepisode_2026m06"
-biomarker_tbl   <- "t_enh_ovbiomarkers_2026m06"   # FOLR1 biomarker snapshot
-biomarker_name  <- "FOLR1/FRalpha"
-index_lines     <- c(2L, 3L, 4L)
-bio_window_days <- 14L
-pct_scale       <- Sys.getenv("FRA_PCT_SCALE", "percent") # fraction | percent | auto
-source_mode     <- Sys.getenv("FRA_SOURCE_MODE", "dbi")  # dbi | local
-local_dir       <- Sys.getenv("FRA_LOCAL_DIR", "")
-
-ARM_ICC   <- "ICC (Paclitaxel, PLD, or topotecan)"
-FRA_ORDER <- c("FRa high", "FRa low", "FRa moderate", "Unknown/untested")   # table row order
-FRA_RANK  <- c("FRa high", "FRa moderate", "FRa low", "Unknown/untested")   # best to worst
-
-this_dir <- tryCatch(dirname(sub("^--file=", "", grep("^--file=", commandArgs(FALSE), value = TRUE))),
-                     error = function(e) ".")
-if (!length(this_dir) || this_dir == "") this_dir <- "."
-out_dir <- Sys.getenv("FRA_OUT_DIR", file.path(this_dir, "outputs"))
-
-# ---- load a table into a local data frame ----
-load_tbl <- function(tbl, cols) {
-  df <- if (source_mode == "local") {
-    stopifnot(nzchar(local_dir))
-    pq <- file.path(local_dir, paste0(tbl, ".parquet"))
-    cs <- file.path(local_dir, paste0(tbl, ".csv"))
-    if      (file.exists(pq)) as_tibble(arrow::read_parquet(pq))
-    else if (file.exists(cs)) as_tibble(readr::read_csv(cs, show_col_types = FALSE))
-    else stop(sprintf("no extract for %s in %s", tbl, local_dir))
-  } else {
-    fqtn <- paste(c(catalog, schema, tbl), collapse = ".")
-    as_tibble(DBI::dbGetQuery(con, sprintf("SELECT %s FROM %s", paste(cols, collapse = ", "), fqtn)))
-  }
-  # Databricks may hand back a column in mixed case (e.g. PercentStaining). The script uses
-  # lowercase names, so make them lowercase here.
-  names(df) <- tolower(names(df))
-  miss <- setdiff(cols, names(df))
-  if (length(miss)) stop(sprintf("%s is missing column(s): %s", tbl, paste(miss, collapse = ", ")))
-  df[, cols, drop = FALSE]
-}
-
-# ---- FRalpha result: percent, intensity, class ----
-# PercentStaining is text like "75%", so default to percent. "auto" reads it from the data.
-resolve_scale <- function(num) {
-  if (pct_scale %in% c("fraction", "percent")) return(pct_scale)
-  v <- num[!is.na(num)]
-  if (!length(v)) return("percent")
-  if (max(v) <= 1) return("fraction")
-  if (min(v) > 1)  return("percent")
-  stop("PercentStaining has values on both sides of 1 — set FRA_PCT_SCALE to 'fraction' or 'percent'.")
-}
-pct_numeric <- function(x) suppressWarnings(as.numeric(str_replace_all(as.character(x), "[^0-9.\\-]", "")))
-to_pct <- function(x, scale) { num <- pct_numeric(x); if (scale == "fraction") num * 100 else num }
-to_intensity <- function(x) {
-  s <- str_to_lower(as.character(x))
-  # accept "3+", a word (strong/moderate/weak), or a bare digit
-  case_when(str_detect(s, "3\\s*\\+|strong")             ~ 3L,
-            str_detect(s, "2\\s*\\+|moderate")           ~ 2L,
-            str_detect(s, "1\\s*\\+|weak")               ~ 1L,
-            str_detect(s, "negative|no staining")        ~ 0L,
-            str_detect(s, "(^|[^0-9])3([^0-9]|$)")       ~ 3L,
-            str_detect(s, "(^|[^0-9])2([^0-9]|$)")       ~ 2L,
-            str_detect(s, "(^|[^0-9])1([^0-9]|$)")       ~ 1L,
-            str_detect(s, "(^|[^0-9])0([^0-9]|$)")       ~ 0L,
-            TRUE ~ NA_integer_)
-}
-fra_class <- function(pct, intensity) {
-  case_when(pct >= 75 & intensity %in% c(2L, 3L)            ~ "FRa high",
-            pct >= 50 & pct < 75 & intensity %in% c(2L, 3L) ~ "FRa moderate",
-            (pct < 50) | (intensity <= 1L)                  ~ "FRa low",
-            TRUE                                            ~ "Unknown/untested")
-}
-
-# ---- treatment arm from drug name ----
-arm_of <- function(drugname) {
-  d <- str_to_lower(drugname)
-  case_when(str_detect(d, "mirvetuximab")                      ~ "Mirvetuximab",
-            str_detect(d, "topotecan")                         ~ ARM_ICC,
-            str_detect(d, "doxil|lipodox|caelyx")              ~ ARM_ICC,  # pegylated liposomal doxorubicin
-            str_detect(d, "doxorubicin") & str_detect(d, "liposom|pegylat") ~ ARM_ICC,
-            str_detect(d, "paclitaxel")                        ~ ARM_ICC,
-            TRUE                                               ~ NA_character_)
-}
-is_nab      <- function(d) { d2 <- str_squish(str_to_lower(d))
-  str_detect(d2, "paclitaxel") & str_detect(d2, "nab|protein[- ]?bound|albumin|abraxane") }
-is_nonmaint <- function(x) str_to_lower(str_trim(as.character(x))) %in% c("false","f","n","no","0")
-is_advanced <- function(s) str_to_lower(str_trim(coalesce(as.character(s), ""))) == "advanced"
-
-# ---- build the markdown table ----
-table1_md <- function(df, title) {
-  d <- df %>% mutate(arm = factor(arm, c("Mirvetuximab", ARM_ICC)),
-                     fra = factor(fra, FRA_ORDER)) %>%
-    count(arm, fra, .drop = FALSE, name = "n") %>%
-    group_by(arm) %>% mutate(tot = sum(n), pct = if_else(tot > 0, 100 * n / tot, NA_real_)) %>% ungroup()
-  cell <- function(a, f) { r <- d[d$arm == a & d$fra == f, ]
-    if (is.na(r$pct)) sprintf("%d", r$n) else sprintf("%d (%.1f%%)", r$n, r$pct) }
-  nm <- sum(d$n[d$arm == "Mirvetuximab"]); ni <- sum(d$n[d$arm == ARM_ICC])
-  out <- c(sprintf("### %s", title),
-           sprintf("| FOLR1/FRalpha at index (N, %%) | Mirvetuximab (N = %d) | %s (N = %d) |", nm, ARM_ICC, ni),
-           "|---|---|---|")
-  for (f in FRA_ORDER) out <- c(out, sprintf("| %s | %s | %s |", f, cell("Mirvetuximab", f), cell(ARM_ICC, f)))
-  paste(out, collapse = "\n")
-}
-
-# ---- run ----
-run_analysis <- function() {
-  if (!pct_scale %in% c("fraction", "percent", "auto"))
-    stop("FRA_PCT_SCALE must be 'fraction', 'percent', or 'auto'.")
-  if (!source_mode %in% c("dbi", "local"))
-    stop("FRA_SOURCE_MODE must be 'dbi' or 'local'.")
-  if (source_mode == "dbi" && !exists("con")) {
-    pwd <- Sys.getenv("DATABRICKS_PWD", "")
-    if (!nzchar(pwd))
-      stop("set DATABRICKS_PWD, or provide a DBI `con`, or use FRA_SOURCE_MODE=local.")
-    # Databricks over ODBC. bigint = "numeric" keeps counts and line numbers as plain
-    # numbers (not integer64), so the filters and math work.
-    con <<- DBI::dbConnect(odbc::odbc(), dsn = Sys.getenv("DATABRICKS_DSN", "RWDE"),
-                           pwd = pwd, timeout = 120, bigint = "numeric")
-  }
-
-  drugep <- load_tbl(drugepisode_tbl,
-                     c("patientid","drugname","linenumber","linesetting","ismaintenancetherapy","episodedate"))
-  biomk  <- load_tbl(biomarker_tbl,
-                     c("patientid","biomarkername","specimenreceiveddate","resultdate","percentstaining","stainingintensity"))
-
-  drugep <- drugep %>% filter(!is.na(patientid))    # valid patient rows only
-  biomk  <- biomk  %>% filter(!is.na(patientid))
-
-  # ---- qualifying episodes, per arm (a patient can be in both) ----
-  # Per line: how many drugs, and does it include mirvetuximab (needed for the ICC rule).
-  line_comp <- drugep %>%
-    filter(linenumber %in% index_lines, is_nonmaint(ismaintenancetherapy)) %>%
-    mutate(agent = str_split(str_squish(str_to_lower(drugname)), "\\s*[,/+;&|]\\s*")) %>%
-    tidyr::unnest(agent) %>%
-    filter(!is.na(agent), agent != "") %>%
-    group_by(patientid, linenumber) %>%
-    summarise(n_agents = n_distinct(agent),
-              has_mirv = any(str_detect(agent, "mirvetuximab")), .groups = "drop")
-
-  base_ep <- drugep %>% mutate(episodedate = as.Date(episodedate)) %>%
-    filter(linenumber %in% index_lines, is_nonmaint(ismaintenancetherapy))
-  # Split each drug name so a single "mirve + ICC" value can feed both arms.
-  agent_ep <- base_ep %>% filter(!is.na(episodedate)) %>%
-    mutate(agent = str_split(str_squish(str_to_lower(drugname)), "\\s*[,/+;&|]\\s*")) %>%
-    tidyr::unnest(agent) %>% filter(agent != "") %>%
-    mutate(arm = arm_of(agent)) %>%
-    left_join(line_comp, by = c("patientid","linenumber"))
-
-  # Mirvetuximab arm: any line with mirvetuximab (combinations are fine).
-  mirv_ep <- agent_ep %>% filter(arm == "Mirvetuximab")
-  # ICC arm: an ICC drug (not nab) that is the only drug on the line, or on a line that also
-  # has mirvetuximab (that line counts in both arms).
-  icc_ep  <- agent_ep %>% filter(arm == ARM_ICC, !is_nab(agent), n_agents == 1 | has_mirv)
-  # Missing dates: an undated dose can't set the index, so an arm can shift to a later date
-  # or be missed. Report the total dropped, and how many patients this may affect per arm.
-  n_nodate <- base_ep %>% filter(is.na(episodedate), !is.na(arm_of(drugname))) %>% nrow()
-  undated_ag <- base_ep %>% filter(is.na(episodedate)) %>%
-    mutate(agent = str_split(str_squish(str_to_lower(drugname)), "\\s*[,/+;&|]\\s*")) %>%
-    tidyr::unnest(agent) %>% filter(agent != "") %>% mutate(arm = arm_of(agent))
-  n_mirv_nd <- n_distinct(undated_ag$patientid[undated_ag$arm == "Mirvetuximab"])
-  n_icc_nd  <- n_distinct(undated_ag$patientid[undated_ag$arm == ARM_ICC & !is_nab(undated_ag$agent)])
-
-  # ---- FRalpha per patient (score once, apply the window per arm) ----
-  folr1 <- biomk %>% filter(str_to_upper(str_trim(biomarkername)) == str_to_upper(biomarker_name))
-  if (nrow(folr1) == 0)
-    stop(sprintf("no records match biomarkername='%s' in %s — check the table and name.", biomarker_name, biomarker_tbl))
-  scale    <- resolve_scale(pct_numeric(folr1$percentstaining))
-  if (pct_scale == "auto" && scale == "fraction")
-    message("PercentStaining read as fractions (all values <=1); set FRA_PCT_SCALE explicitly for the final run.")
-  pct_norm <- to_pct(folr1$percentstaining, scale)
-  if (any(pct_norm > 100 + 1e-9 | pct_norm < 0, na.rm = TRUE))
-    stop(sprintf("PercentStaining out of 0-100 after scaling (%.2f..%.2f) — check FRA_PCT_SCALE.",
-                 min(pct_norm, na.rm = TRUE), max(pct_norm, na.rm = TRUE)))
-  fin     <- pct_norm[is.finite(pct_norm)]
-  if (!length(fin)) message("no usable PercentStaining — high/moderate not possible; using intensity only.")
-  pct_rng <- if (length(fin)) sprintf("%.3g..%.3g", min(fin), max(fin)) else "n/a"
-  scored <- folr1 %>%
-    mutate(test_date = pmax(as.Date(specimenreceiveddate), as.Date(resultdate), na.rm = TRUE),
-           rec = fra_class(pct_norm, to_intensity(stainingintensity)))
-
-  # best FRalpha among the patient's tests inside that arm's window; none -> Unknown
-  attach_fra <- function(pop1) {   # pop1 = one arm, one row per patient
-    f <- scored %>% inner_join(select(pop1, patientid, index_date), by = "patientid") %>%
-      filter(!is.na(test_date), test_date <= index_date + bio_window_days) %>%
-      mutate(rank = match(rec, FRA_RANK)) %>%
-      group_by(patientid) %>% summarise(rank = min(rank), .groups = "drop") %>%
-      transmute(patientid, fra = FRA_RANK[rank])
-    pop1 %>% left_join(f, by = "patientid") %>% mutate(fra = coalesce(fra, "Unknown/untested"))
-  }
-
-  # each arm on its own: one row per patient, index = first qualifying dose of that arm
-  arm_pop <- function(ep, arm_label, advanced_only = FALSE) {
-    if (advanced_only) ep <- ep %>% filter(is_advanced(linesetting))
-    p <- ep %>% group_by(patientid) %>% slice_min(episodedate, n = 1, with_ties = FALSE) %>% ungroup() %>%
-      transmute(patientid, arm = arm_label, index_date = episodedate)
-    attach_fra(p)
-  }
-  build_pop <- function(advanced_only)
-    bind_rows(arm_pop(mirv_ep, "Mirvetuximab", advanced_only), arm_pop(icc_ep, ARM_ICC, advanced_only))
-
-  all_pop <- build_pop(FALSE)   # any setting
-  adv_pop <- build_pop(TRUE)    # advanced only, chosen independently
-
-  t_all <- table1_md(all_pop, "Table 1a — all 2L-4L lines (any setting)")
-  t_adv <- table1_md(adv_pop, "Table 1b — advanced setting only")
-  both_of <- function(p) length(intersect(p$patientid[p$arm == "Mirvetuximab"], p$patientid[p$arm == ARM_ICC]))
-  summary <- paste(
-    "A patient can be in both arms. Each arm uses its own first dose date.",
-    sprintf("Cohort 1a: Mirv %d, ICC %d patients (%d counted in both).",
-            n_distinct(all_pop$patientid[all_pop$arm == "Mirvetuximab"]),
-            n_distinct(all_pop$patientid[all_pop$arm == ARM_ICC]), both_of(all_pop)),
-    sprintf("Cohort 1b (advanced): Mirv %d, ICC %d patients (%d counted in both).",
-            n_distinct(adv_pop$patientid[adv_pop$arm == "Mirvetuximab"]),
-            n_distinct(adv_pop$patientid[adv_pop$arm == ARM_ICC]), both_of(adv_pop)),
-    sprintf("FOLR1 records: %d rows, %d patients. PercentStaining scale=%s (range %s).",
-            nrow(folr1), n_distinct(folr1$patientid), scale, pct_rng),
-    sprintf("Target episodes dropped for missing date: %d (undated qualifying agents, review if >0: %d mirvetuximab, %d ICC patients).",
-            n_nodate, n_mirv_nd, n_icc_nd),
-    sprintf("Source: %s / %s.%s.", drugepisode_tbl, biomarker_tbl, biomarker_name),
-    sep = "\n")
-
-  cat("\n", summary, "\n\n", t_all, "\n\n", t_adv, "\n", sep = "")
-  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
-  writeLines(c(summary, "", t_all, "", t_adv), file.path(out_dir, "fralpha_by_treatment.md"))
-  message(sprintf("wrote %s", file.path(out_dir, "fralpha_by_treatment.md")))
-  invisible(list(all = all_pop, adv = adv_pop, table1_all = t_all, table1_adv = t_adv))
-}
-
-if (!nzchar(Sys.getenv("FRA_DEFINE_ONLY"))) run_analysis()
-#==FILE==# qc_profiling.sql
--- FRalpha analysis — data profiling + QC (Databricks / Spark SQL).
--- Run these first to check the data; section 10 rebuilds Table 1 as an independent cross-check.
--- Change the catalog below if yours is not hive_metastore.
-USE CATALOG hive_metastore;
-USE SCHEMA  clnprw_flatiron_pano_ovar_use;
-
--- 0. Which FOLR1 biomarker snapshots exist? Pick the one to use.
-SHOW TABLES LIKE 't_enh_ovbiomarkers_*';
-SHOW TABLES LIKE 't_drugepisode_*';
-
--- 1. biomarkername values — confirm the exact string and find any variants/whitespace.
-SELECT biomarkername, count(*) AS n, count(DISTINCT patientid) AS pts
-FROM t_enh_ovbiomarkers_2026m06
-GROUP BY biomarkername
-ORDER BY n DESC;
-
--- 2. FOLR1 record + patient counts (the zero-match guard depends on this being > 0).
-SELECT count(*) AS folr1_rows, count(DISTINCT patientid) AS folr1_pts
-FROM t_enh_ovbiomarkers_2026m06
-WHERE upper(trim(biomarkername)) = 'FOLR1/FRALPHA';
-
--- 3. PercentStaining: parse rate, <=1 vs >1 (mixed => set FRA_PCT_SCALE), negatives, min/max.
-WITH f AS (
-  SELECT try_cast(regexp_replace(percentstaining, '[^0-9.-]', '') AS DOUBLE) AS p, percentstaining
-  FROM t_enh_ovbiomarkers_2026m06
-  WHERE upper(trim(biomarkername)) = 'FOLR1/FRALPHA'
-)
-SELECT count(*)                                   AS folr1_rows,
-       count(p)                                   AS parseable,
-       sum(CASE WHEN p IS NULL THEN 1 ELSE 0 END) AS unparseable_or_null,
-       sum(CASE WHEN p <= 1  THEN 1 ELSE 0 END)   AS le_1,          -- looks fractional
-       sum(CASE WHEN p >  1  THEN 1 ELSE 0 END)   AS gt_1,          -- looks like a percent
-       sum(CASE WHEN p <  0  THEN 1 ELSE 0 END)   AS negatives,     -- expect 0
-       min(p) AS min_p, max(p) AS max_p
-FROM f;
--- distinct raw values, to check formatting ("0.75" vs "75" vs "75%").
-SELECT percentstaining, count(*) AS n
-FROM t_enh_ovbiomarkers_2026m06
-WHERE upper(trim(biomarkername)) = 'FOLR1/FRALPHA'
-GROUP BY percentstaining ORDER BY n DESC LIMIT 50;
-
--- 4. StainingIntensity values — confirm 0 / 1+ / 2+ / 3+ coding; catch surprises.
-SELECT stainingintensity, count(*) AS n
-FROM t_enh_ovbiomarkers_2026m06
-WHERE upper(trim(biomarkername)) = 'FOLR1/FRALPHA'
-GROUP BY stainingintensity ORDER BY n DESC;
-
--- 5. Drug codelist — check the target drugnames (esp. PLD pegylated, nab-paclitaxel).
-SELECT drugname, count(*) AS episodes, count(DISTINCT patientid) AS pts,
-       CASE
-         WHEN lower(drugname) LIKE '%mirvetuximab%' THEN 'Mirvetuximab'
-         WHEN lower(drugname) LIKE '%topotecan%'    THEN 'ICC:topotecan'
-         WHEN lower(drugname) LIKE '%doxil%' OR lower(drugname) LIKE '%lipodox%'
-              OR lower(drugname) LIKE '%caelyx%'    THEN 'ICC:PLD-brand'
-         WHEN lower(drugname) LIKE '%doxorubicin%' AND
-              (lower(drugname) LIKE '%liposom%' OR lower(drugname) LIKE '%pegylat%') THEN 'ICC:PLD-generic'
-         WHEN lower(drugname) LIKE '%paclitaxel%' AND
-              (lower(drugname) LIKE '%nab%' OR lower(drugname) LIKE '%protein%bound%'
-               OR lower(drugname) LIKE '%albumin%' OR lower(drugname) LIKE '%abraxane%') THEN 'nab-paclitaxel (excluded)'
-         WHEN lower(drugname) LIKE '%paclitaxel%' THEN 'ICC:paclitaxel'
-         ELSE 'other' END AS maps_to
-FROM t_drugepisode_2026m06
-WHERE lower(drugname) LIKE '%mirvetuximab%' OR lower(drugname) LIKE '%paclitaxel%'
-   OR lower(drugname) LIKE '%doxorubicin%'  OR lower(drugname) LIKE '%topotecan%'
-   OR lower(drugname) LIKE '%doxil%' OR lower(drugname) LIKE '%lipodox%' OR lower(drugname) LIKE '%caelyx%'
-GROUP BY drugname ORDER BY maps_to, episodes DESC;
--- 5b. Every distinct 2L-4L drugname, so an unknown brand-only name is visible.
-SELECT drugname, count(*) AS episodes, count(DISTINCT patientid) AS pts
-FROM t_drugepisode_2026m06
-WHERE linenumber IN (2,3,4) AND lower(trim(ismaintenancetherapy)) IN ('false','f','n','no','0')
-GROUP BY drugname ORDER BY episodes DESC;
-
--- 6. ismaintenancetherapy values (NULL/blank do not count as non-maintenance).
-SELECT ismaintenancetherapy, count(*) AS n FROM t_drugepisode_2026m06
-GROUP BY ismaintenancetherapy ORDER BY n DESC;
-
--- 7. linesetting values — confirm the exact "Advanced" label used for Table 1b.
-SELECT linesetting, count(*) AS n, count(DISTINCT patientid) AS pts
-FROM t_drugepisode_2026m06
-GROUP BY linesetting ORDER BY n DESC;
-
--- 8. Line composition / single-agent rule.
---    (a) distribution of distinct drugs per line (patient,line).
-WITH la AS (   -- split combined drug names into single drugs; drop blanks
-  SELECT patientid, linenumber, count(DISTINCT agent) AS n_agents
-  FROM (SELECT patientid, linenumber,
-               explode(split(regexp_replace(lower(trim(drugname)), '\\s+', ' '), '\\s*[,/+;&|]\\s*')) AS agent
-        FROM t_drugepisode_2026m06
-        WHERE linenumber IN (2,3,4)
-          AND lower(trim(ismaintenancetherapy)) IN ('false','f','n','no','0')
-          AND drugname IS NOT NULL AND trim(drugname) <> '')
-  WHERE agent <> ''
-  GROUP BY patientid, linenumber
-)
-SELECT n_agents, count(*) AS line_instances FROM la GROUP BY n_agents ORDER BY n_agents;
--- (b) any line with more than one setting? >0 means a line's setting is unclear.
-SELECT count(*) AS patient_lines_spanning_settings FROM (
-  SELECT patientid, linenumber FROM t_drugepisode_2026m06
-  WHERE linenumber IN (2,3,4)
-  GROUP BY patientid, linenumber HAVING count(DISTINCT coalesce(linesetting,'')) > 1
-);
-
--- 9. Cohort funnel — patient counts per arm (a patient can be in both); check against the R summary.
---    Splits drug names first, like section 10, so a combined value feeds both arms.
-WITH agent AS (   -- split drugname into single drugs (keep the date; don't filter on it here)
-  SELECT patientid, linenumber, episodedate,
-         explode(split(regexp_replace(lower(trim(drugname)), '\\s+', ' '), '\\s*[,/+;&|]\\s*')) AS ag
-  FROM t_drugepisode_2026m06
-  WHERE linenumber IN (2,3,4) AND lower(trim(ismaintenancetherapy)) IN ('false','f','n','no','0')
-    AND drugname IS NOT NULL AND trim(drugname) <> ''
-), comp AS (   -- count drugs over ALL of them (undated ones count too), matching the R line rule
-  SELECT patientid, linenumber, count(DISTINCT ag) AS n_agents,
-         max(CASE WHEN ag LIKE '%mirvetuximab%' THEN 1 ELSE 0 END) AS has_mirv
-  FROM agent WHERE ag <> '' GROUP BY patientid, linenumber
-), tagged AS (   -- per drug: arm + nab; only dated drugs put a patient in an arm (need a date to index)
-  SELECT a.patientid,
-         CASE WHEN a.ag LIKE '%mirvetuximab%' THEN 'M'
-              WHEN a.ag LIKE '%topotecan%' OR a.ag LIKE '%doxil%' OR a.ag LIKE '%lipodox%' OR a.ag LIKE '%caelyx%'
-                OR (a.ag LIKE '%doxorubicin%' AND (a.ag LIKE '%liposom%' OR a.ag LIKE '%pegylat%'))
-                OR a.ag LIKE '%paclitaxel%' THEN 'I' END AS arm,
-         (a.ag LIKE '%paclitaxel%' AND (a.ag LIKE '%nab%' OR a.ag LIKE '%protein%bound%'
-                 OR a.ag LIKE '%albumin%' OR a.ag LIKE '%abraxane%')) AS is_nab,
-         c.n_agents, c.has_mirv
-  FROM agent a JOIN comp c ON a.patientid=c.patientid AND a.linenumber=c.linenumber
-  WHERE a.ag <> '' AND a.episodedate IS NOT NULL
-), pat AS (   -- per patient: in the mirve arm? in the ICC arm? (can be both)
-  SELECT patientid,
-         max(CASE WHEN arm = 'M' THEN 1 ELSE 0 END) AS in_mirv,
-         max(CASE WHEN arm = 'I' AND NOT is_nab AND (n_agents = 1 OR has_mirv = 1) THEN 1 ELSE 0 END) AS in_icc
-  FROM tagged GROUP BY patientid
-)
-SELECT sum(CASE WHEN in_mirv = 1 OR in_icc = 1 THEN 1 ELSE 0 END)   AS with_target_drug,
-       sum(in_mirv)                                                 AS mirv_arm,
-       sum(in_icc)                                                  AS icc_arm,
-       sum(CASE WHEN in_mirv = 1 AND in_icc = 1 THEN 1 ELSE 0 END)  AS in_both
-FROM pat;
-
--- 10. Table 1 rebuilt in SQL to cross-check R. Set params.pct_scale from section 3.
---     A patient can be in both arms; each arm uses its own first dose date. A line with both
---     mirve and an ICC drug counts in both arms. Groups: 'all' (1a), 'adv' (1b).
-WITH params AS (SELECT 'percent' AS pct_scale),   -- <-- set from Section 3 before trusting cells
-la AS (   -- per line: how many drugs + does it include mirvetuximab
-  SELECT patientid, linenumber,
-         count(DISTINCT agent) AS n_agents,
-         max(CASE WHEN agent LIKE '%mirvetuximab%' THEN 1 ELSE 0 END) AS has_mirv
-  FROM (SELECT patientid, linenumber,
-               explode(split(regexp_replace(lower(trim(drugname)), '\\s+', ' '), '\\s*[,/+;&|]\\s*')) AS agent
-        FROM t_drugepisode_2026m06
-        WHERE linenumber IN (2,3,4) AND lower(trim(ismaintenancetherapy)) IN ('false','f','n','no','0')
-          AND drugname IS NOT NULL AND trim(drugname) <> '')
-  WHERE agent <> ''
-  GROUP BY patientid, linenumber
-),
-dep_agent AS (   -- split each drug name into single drugs (a combined value feeds both arms)
-  SELECT patientid, linenumber, episodedate,
-         regexp_replace(lower(trim(coalesce(linesetting,''))), '\\s+', ' ') AS linesetting,
-         explode(split(regexp_replace(lower(trim(drugname)), '\\s+', ' '), '\\s*[,/+;&|]\\s*')) AS agent
-  FROM t_drugepisode_2026m06
-  WHERE linenumber IN (2,3,4) AND lower(trim(ismaintenancetherapy)) IN ('false','f','n','no','0')
-    AND episodedate IS NOT NULL AND drugname IS NOT NULL AND trim(drugname) <> ''
-),
-ep AS (   -- per drug: arm + line makeup
-  SELECT a.patientid, a.episodedate, a.linesetting,
-         CASE WHEN a.agent LIKE '%mirvetuximab%' THEN 'M'
-              WHEN a.agent LIKE '%topotecan%' OR a.agent LIKE '%doxil%'
-                OR a.agent LIKE '%lipodox%' OR a.agent LIKE '%caelyx%'
-                OR (a.agent LIKE '%doxorubicin%' AND (a.agent LIKE '%liposom%' OR a.agent LIKE '%pegylat%'))
-                OR a.agent LIKE '%paclitaxel%' THEN 'I' END AS arm,
-         (a.agent LIKE '%paclitaxel%' AND (a.agent LIKE '%nab%' OR a.agent LIKE '%protein%bound%'
-                 OR a.agent LIKE '%albumin%' OR a.agent LIKE '%abraxane%')) AS is_nab,
-         la.n_agents, la.has_mirv
-  FROM dep_agent a JOIN la ON a.patientid=la.patientid AND a.linenumber=la.linenumber
-  WHERE a.agent <> ''
-),
-arm_ep AS (   -- mirve arm: any mirve drug; ICC arm: ICC alone, or an ICC drug on a line that also has mirve
-  SELECT 'Mirvetuximab' AS arm, patientid, episodedate, linesetting FROM ep WHERE arm = 'M'
-  UNION ALL
-  SELECT 'ICC (Paclitaxel, PLD, or topotecan)' AS arm, patientid, episodedate, linesetting
-    FROM ep WHERE arm = 'I' AND NOT is_nab AND (n_agents = 1 OR has_mirv = 1)
-),
-cohort_ep AS (   -- both groups: all settings, and advanced only
-  SELECT 'all' AS cohort, a.* FROM arm_ep a
-  UNION ALL
-  SELECT 'adv' AS cohort, a.* FROM arm_ep a WHERE a.linesetting = 'advanced'
-),
-picked AS (   -- per (arm, cohort, patient): index = first qualifying dose of that arm
-  SELECT arm, cohort, patientid, min(episodedate) AS index_date
-  FROM cohort_ep GROUP BY arm, cohort, patientid
-),
-scored AS (   -- FOLR1 record class + biomarker date
-  SELECT b.patientid,
-    greatest(b.specimenreceiveddate, b.resultdate) AS test_date,
-    CASE
-      WHEN pct >= 75 AND inten IN (2,3) THEN 1                 -- rank 1 = high
-      WHEN pct >= 50 AND pct < 75 AND inten IN (2,3) THEN 2    -- moderate
-      WHEN pct < 50 OR inten <= 1 THEN 3                       -- low
-      ELSE 4 END AS rk
-  FROM (
-    SELECT patientid, specimenreceiveddate, resultdate,
-      (CASE WHEN (SELECT pct_scale FROM params)='fraction'
-            THEN try_cast(regexp_replace(percentstaining,'[^0-9.-]','') AS DOUBLE)*100
-            ELSE try_cast(regexp_replace(percentstaining,'[^0-9.-]','') AS DOUBLE) END) AS pct,
-      (CASE WHEN lower(stainingintensity) RLIKE '3\\s*\\+|strong'   THEN 3
-            WHEN lower(stainingintensity) RLIKE '2\\s*\\+|moderate' THEN 2
-            WHEN lower(stainingintensity) RLIKE '1\\s*\\+|weak'     THEN 1
-            WHEN lower(stainingintensity) LIKE '%negative%' OR lower(stainingintensity) LIKE '%no staining%' THEN 0
-            WHEN lower(stainingintensity) RLIKE '(^|[^0-9])3([^0-9]|$)' THEN 3
-            WHEN lower(stainingintensity) RLIKE '(^|[^0-9])2([^0-9]|$)' THEN 2
-            WHEN lower(stainingintensity) RLIKE '(^|[^0-9])1([^0-9]|$)' THEN 1
-            WHEN lower(stainingintensity) RLIKE '(^|[^0-9])0([^0-9]|$)' THEN 0
-            ELSE NULL END) AS inten
-    FROM t_enh_ovbiomarkers_2026m06 WHERE upper(trim(biomarkername))='FOLR1/FRALPHA'
-  ) b
-),
-fra AS (   -- best class within that arm's window, per (arm, cohort, patient)
-  SELECT p.arm, p.cohort, p.patientid,
-         CASE min(s.rk) WHEN 1 THEN 'FRa high' WHEN 2 THEN 'FRa moderate' WHEN 3 THEN 'FRa low' ELSE 'Unknown/untested' END AS fra
-  FROM picked p JOIN scored s ON p.patientid=s.patientid
-  WHERE s.test_date IS NOT NULL AND s.test_date <= date_add(p.index_date, 14)
-  GROUP BY p.arm, p.cohort, p.patientid
-)
-SELECT pk.cohort, pk.arm,
-       coalesce(fra.fra, 'Unknown/untested') AS fra_status,
-       count(*) AS n
-FROM picked pk LEFT JOIN fra ON pk.arm=fra.arm AND pk.cohort=fra.cohort AND pk.patientid=fra.patientid
-GROUP BY pk.cohort, pk.arm, coalesce(fra.fra, 'Unknown/untested')
-ORDER BY pk.cohort, pk.arm, fra_status;
-#==EOF==#
-
-
-
-#!/usr/bin/env python3
-# Unpack the RWD OC tools bundle into individual source files.
-#
-#   python unpack_bundle.py [bundle.txt] [dest_dir]
-#
-# Defaults: bundle = rwd_oc_tools_bundle.txt, dest = current folder.
-# Output files are written as UTF-8 (NOT ASCII), with Windows CRLF line
-# endings and no BOM, so they open cleanly in VS Code on Windows.
-#
-# Line endings: the parser first normalizes whatever endings the transfer
-# may have introduced (LF / CRLF / CR) to a single canonical form, then
-# re-emits every file with CRLF -- so the result is correct regardless of
-# how the bundle itself arrived on the Windows box.
-
-import io
-import os
-import re
-import sys
-
-FILE_MARK = re.compile(r"(?m)^#==FILE==# (.+?)[ \t]*\n")
-EOF_MARK  = re.compile(r"(?m)^#==EOF==#[ \t]*\n?\Z")
-
-
-def main():
-    bundle = sys.argv[1] if len(sys.argv) > 1 else "rwd_oc_tools_bundle.txt"
-    dest   = sys.argv[2] if len(sys.argv) > 2 else "."
-
-    if not os.path.isfile(bundle):
-        sys.exit("bundle not found: %s" % bundle)
-
-    with io.open(bundle, "r", encoding="utf-8") as f:
-        data = f.read()
-
-    # Canonicalize any CR / CRLF the transfer introduced, so parsing and the
-    # per-file content are on plain \n before we re-emit as CRLF.
-    data = data.replace("\r\n", "\n").replace("\r", "\n")
-
-    parts = FILE_MARK.split(data)          # [preamble, name1, body1, name2, body2, ...]
-    pairs = list(zip(parts[1::2], parts[2::2]))
-    if not pairs:
-        sys.exit("no '#==FILE==#' sections found -- is this the right bundle?")
-
-    if dest not in ("", "."):
-        os.makedirs(dest, exist_ok=True)
-
-    count = 0
-    for name, body in pairs:
-        name = name.strip()
-        body = EOF_MARK.sub("", body)      # trim the trailing #==EOF==# from the last section
-        outpath = os.path.join(dest, name)
-        with io.open(outpath, "w", encoding="utf-8", newline="\r\n") as out:
-            out.write(body)
-        count += 1
-        print("wrote %s (%d bytes UTF-8, CRLF)" % (outpath, len(body.encode("utf-8"))))
-
-    print("done: %d files -> %s" % (count, os.path.abspath(dest)))
-
-
-if __name__ == "__main__":
-    main()
