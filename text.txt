@@ -1,3 +1,2128 @@
+#==RWDBUNDLE==# v1  UTF-8; unpack with: python unpack_bundle.py (writes Windows CRLF, no BOM)
+#==FILE==# data_profiler.R
+# Data characterization — a standalone, tumor/product-agnostic profiler. Point it at ANY
+# Databricks schema (or local extracts) and it writes a stakeholder report: per-column
+# distribution and missingness for every table. Nothing here is tumor-specific.
+#
+# TO RUN: edit the CONFIG block just below (at least catalog + schema for your product), then
+#   DATABRICKS_DSN=RWDE DATABRICKS_PWD=... Rscript data_profiler.R
+# Every CONFIG value is also overridable by its DC_* environment variable (env wins), so
+# automation keeps working — but editing the block and running is all a person needs.
+# tidyverse/dplyr over ODBC, no Spark.
+
+library(dplyr); library(stringr)
+
+# ============================ CONFIG — edit these, then run ============================
+# Fill in your feed and run `Rscript data_profiler.R`. `schema` is REQUIRED and has no default, so a
+# copy of this script can't silently profile the wrong product — set it to YOUR product's schema (or
+# pass DC_SCHEMA). Every value here is also overridable by the matching DC_* env var (env wins).
+CFG <- list(
+  catalog     = "hive_metastore",  # catalog (shared Databricks metastore; overridable)   (env DC_CATALOG)
+  schema      = "",                # REQUIRED — your product's schema, e.g. clnprw_flatiron_pano_ovar_use (DC_SCHEMA)
+  cut         = "",           # keep only tables ending in this snapshot, e.g. "2026m06"  (DC_CUT; ""=all)
+  baseline    = "",           # prior drop's inventory.txt -> flags added cols  (DC_BASELINE_COLS; ""=none)
+  product_id  = "",           # stable product identity for cross-schema baselines, e.g. "oc-panoramic" (DC_PRODUCT_ID; ""=use catalog.schema)
+  tables      = "",           # comma list to limit tables, else all in the schema        (DC_TABLES)
+  sample_n    = 200000L,      # rows per table; 0 = ALL rows / exact numbers              (DC_SAMPLE_N)
+  out_dir     = "",           # where outputs go; "" = ./outputs next to this script      (DC_OUT_DIR)
+  source_mode = "dbi",        # "dbi" (Databricks) or "local" (.parquet/.csv extracts)    (DC_SOURCE_MODE)
+  local_dir   = "",           # folder of extracts when source_mode = "local"             (DC_LOCAL_DIR)
+  # -- advanced (rarely changed) --
+  sample_seed = 42L,          # reproducible-sample seed                                  (DC_SAMPLE_SEED)
+  top_n       = 10L,          # top values listed per categorical column                  (DC_TOPN)
+  cut_regex   = "_(\\d{4}m\\d{2}|\\d{4}q[1-4]|\\d{6}|\\d{4})$",  # snapshot-suffix strip           (DC_CUT_REGEX)
+  cut_table_regex = "",   # regex to SELECT a snapshot's tables; "" = default "_<DC_CUT>$"  (DC_CUT_FILTER_REGEX)
+  known_new_tables = "",      # manual "new" hint when there is no baseline (comma list)   (DC_KNOWN_NEW_TABLES)
+  known_new_cols   = "",      # ditto for columns                                         (DC_KNOWN_NEW_COLS)
+  missing_tokens   = "",      # extra values counted as MISSING, e.g. "Unknown,Not documented" (DC_MISSING_TOKENS)
+  numeric_cat_max  = 10L,     # a numeric column with <= this many distinct values is summarised as categorical (DC_NUMERIC_CAT_MAX)
+  kind_overrides   = "",      # force a column's kind: "col1=categorical,col2=numeric"     (DC_KIND_OVERRIDES)
+  require_baseline = FALSE,   # TRUE = refuse to run without DC_BASELINE_COLS + DC_CUT (formal old->new mode) (DC_REQUIRE_BASELINE)
+  new_only         = FALSE,   # TRUE = profile ONLY newly-added columns (the new-variables ask); full profile is the default (DC_NEW_ONLY)
+  inventory_only   = FALSE    # TRUE = write the column inventory only, reading no data rows (cheap old-snapshot pass) (DC_INVENTORY_ONLY)
+)
+# ======================================================================================
+
+# ---- config resolution (a DC_* env var, if set, overrides the CONFIG block above) ----
+getcfg  <- function(env, default) { v <- Sys.getenv(env, ""); if (nzchar(v)) v else default }
+getcfgi <- function(env, default) { v <- Sys.getenv(env, ""); if (nzchar(v)) as.integer(v) else as.integer(default) }
+catalog     <- getcfg ("DC_CATALOG",     CFG$catalog)
+schema      <- getcfg ("DC_SCHEMA",      CFG$schema)
+tables_env  <- getcfg ("DC_TABLES",      CFG$tables)
+cut_filter  <- getcfg ("DC_CUT",         CFG$cut)
+sample_n    <- getcfgi("DC_SAMPLE_N",    CFG$sample_n)
+sample_seed <- getcfgi("DC_SAMPLE_SEED", CFG$sample_seed)
+top_n       <- getcfgi("DC_TOPN",        CFG$top_n)
+source_mode <- getcfg ("DC_SOURCE_MODE", CFG$source_mode)
+local_dir   <- getcfg ("DC_LOCAL_DIR",   CFG$local_dir)
+
+this_dir <- tryCatch(dirname(sub("^--file=", "", grep("^--file=", commandArgs(FALSE), value = TRUE))),
+                     error = function(e) ".")
+if (!length(this_dir) || this_dir == "") this_dir <- "."
+out_dir <- { v <- getcfg("DC_OUT_DIR", CFG$out_dir); if (nzchar(v)) v else file.path(this_dir, "outputs") }
+# What the report says it profiled — local mode must not be labelled as the Databricks schema.
+source_label <- if (source_mode == "local") sprintf("local:%s", local_dir) else sprintf("%s.%s", catalog, schema)
+require_baseline <- tolower(getcfg("DC_REQUIRE_BASELINE", as.character(CFG$require_baseline))) %in% c("true","1","yes","t")
+product_id       <- getcfg("DC_PRODUCT_ID", CFG$product_id)   # optional stable product identity; if set, the baseline
+# provenance check compares THIS (not the schema), so a same-product feed may live in cut-specific schemas.
+new_only         <- tolower(getcfg("DC_NEW_ONLY",       as.character(CFG$new_only)))       %in% c("true","1","yes","t")
+inventory_only   <- tolower(getcfg("DC_INVENTORY_ONLY", as.character(CFG$inventory_only))) %in% c("true","1","yes","t")
+
+# "New" detection. Best way: compare against the prior feed. Set DC_BASELINE_COLS to a file
+# of "tablebase|column" lines (base = table name without the _YYYYmMM cut); a column is new
+# if it isn't in that list. Without a baseline, nothing is flagged unless you name known
+# additions yourself via DC_KNOWN_NEW_TABLES / DC_KNOWN_NEW_COLS — kept generic (no tumor or
+# data product baked in) so the one script is reusable everywhere. Prefer a baseline; these are a hint.
+env_list <- function(env, default) { v <- str_trim(getcfg(env, default))
+  if (!nzchar(v)) character(0) else str_to_lower(str_split(v, "\\s*,\\s*")[[1]]) }
+KNOWN_NEW_TABLES <- env_list("DC_KNOWN_NEW_TABLES", CFG$known_new_tables)   # base names; default none
+KNOWN_NEW_COLS   <- env_list("DC_KNOWN_NEW_COLS",   CFG$known_new_cols)     # column names; default none
+missing_tokens_lc <- env_list("DC_MISSING_TOKENS", CFG$missing_tokens)      # extra values treated as missing (lowercased)
+numeric_cat_max   <- getcfgi("DC_NUMERIC_CAT_MAX", CFG$numeric_cat_max)     # numeric with <= this many distinct -> categorical
+# Fail loud on a malformed setting (e.g. DC_SAMPLE_N=abc -> NA via as.integer) instead of a cryptic crash
+# later. sample_n / numeric_cat_max may be 0; sample_seed (feeds TABLESAMPLE REPEATABLE) and top_n must be >= 1.
+for (.nm in c("sample_n", "numeric_cat_max")) { .v <- get(.nm)
+  if (length(.v) != 1L || is.na(.v) || .v < 0L)
+    stop(sprintf("config %s must resolve to a non-negative integer (check its DC_* override).", .nm)) }
+for (.nm in c("sample_seed", "top_n")) { .v <- get(.nm)
+  if (length(.v) != 1L || is.na(.v) || .v < 1L)
+    stop(sprintf("config %s must resolve to a positive integer (check its DC_* override).", .nm)) }
+if (!source_mode %in% c("dbi", "local"))
+  stop(sprintf("DC_SOURCE_MODE must be 'dbi' or 'local', got '%s'.", source_mode))
+# per-column kind override "col=categorical,col2=numeric" -> named char vector (names/values lowercased)
+kind_overrides <- local({
+  s <- str_trim(getcfg("DC_KIND_OVERRIDES", CFG$kind_overrides))
+  if (!nzchar(s)) return(character(0))
+  kv <- str_split(str_split(s, "\\s*,\\s*")[[1]], "\\s*=\\s*")
+  setNames(vapply(kv, function(p) str_to_lower(p[2]), character(1)),
+           vapply(kv, function(p) str_to_lower(p[1]), character(1)))
+})
+# Strip the snapshot cut so tables match across drops. Default covers _YYYYmMM, _YYYYqN, _YYYYMM,
+# _YYYY; set CFG$cut_regex (or DC_CUT_REGEX) for a data product that suffixes snapshots differently.
+cut_regex <- getcfg("DC_CUT_REGEX", CFG$cut_regex)
+cut_table_regex <- getcfg("DC_CUT_FILTER_REGEX", CFG$cut_table_regex)  # selects a cut's tables (else "_<cut>$")
+base_name <- function(tbl) str_replace(str_to_lower(tbl), cut_regex, "")
+# Map a recognized cut label to a sortable "year*100 + month" value (YYYYmMM, YYYYqN -> quarter*3, YYYYMM,
+# YYYY -> month 0), so the baseline can be checked to be chronologically OLDER than the current cut. Returns
+# NA for a custom/unrecognized format, which the caller then skips (it can't be ordered).
+cut_order <- function(s) {
+  if (is.na(s) || !nzchar(s)) return(NA_real_)
+  s <- str_to_lower(s)
+  if (grepl("^\\d{4}m\\d{2}$", s)) return(as.integer(substr(s, 1, 4)) * 100 + as.integer(substr(s, 6, 7)))
+  if (grepl("^\\d{4}q[1-4]$", s)) return(as.integer(substr(s, 1, 4)) * 100 + as.integer(substr(s, 6, 6)) * 3L)
+  if (grepl("^\\d{6}$",       s)) return(as.numeric(s))            # YYYYMM
+  if (grepl("^\\d{4}$",       s)) return(as.numeric(s) * 100)      # YYYY -> month 0
+  NA_real_
+}
+
+baseline_file <- getcfg("DC_BASELINE_COLS", CFG$baseline)
+if (nzchar(baseline_file) && !file.exists(baseline_file))
+  stop(sprintf("DC_BASELINE_COLS is set but the file was not found: %s", baseline_file))
+# Read the baseline. Leading "# key=value" lines are a provenance header written by this tool; skip
+# them for the column set and parse them to verify the baseline is the same product/schema/scope.
+baseline_raw <- if (nzchar(baseline_file)) readLines(baseline_file, warn = FALSE) else character(0)
+baseline_meta_of <- function(key) {
+  h <- grep(sprintf("^#\\s*%s=", key), baseline_raw, value = TRUE)
+  if (!length(h)) NA_character_ else str_trim(sub(sprintf("^#\\s*%s=", key), "", h[1]))
+}
+baseline_cols <- { ln <- str_to_lower(str_trim(baseline_raw[!grepl("^\\s*#", baseline_raw)])); ln[ln != ""] }
+# A set-but-empty baseline is a mistake, not "no baseline" — stop instead of silently falling
+# back to the heuristic list (which would hide that the comparison never happened).
+if (nzchar(baseline_file) && !length(baseline_cols))
+  stop(sprintf("DC_BASELINE_COLS is set but the file has no usable entries: %s", baseline_file))
+# An inventory.txt is "tablebase|column" lines. If almost none contain "|", it's the wrong file
+# (e.g. a report or a catalogue) and would silently produce a bogus "everything is new" comparison.
+if (length(baseline_cols) && mean(grepl("\\|", baseline_cols)) < 0.5)
+  stop(sprintf("DC_BASELINE_COLS doesn't look like an inventory.txt ('tablebase|column' lines): %s", baseline_file))
+# Every data line must be a single 'tablebase|column' pair (both sides non-empty, exactly one separator).
+# A partially corrupted line would silently pollute the added/dropped diff: formal mode stops, otherwise
+# the bad lines are dropped with a warning.
+bad_lines <- baseline_cols[!grepl("^[^|]+\\|[^|]+$", baseline_cols)]
+if (length(bad_lines)) {
+  preview <- paste(utils::head(bad_lines, 3L), collapse = "; ")
+  if (require_baseline)
+    stop(sprintf("DC_BASELINE_COLS has %d malformed line(s) (need 'tablebase|column'): %s", length(bad_lines), preview))
+  message(sprintf("WARNING: dropping %d malformed baseline line(s) (need 'tablebase|column'): %s", length(bad_lines), preview))
+  baseline_cols <- setdiff(baseline_cols, bad_lines)
+  if (!length(baseline_cols))
+    stop(sprintf("DC_BASELINE_COLS has no usable 'tablebase|column' lines after dropping malformed ones: %s", baseline_file))
+}
+baseline_tbls <- unique(sub("\\|.*$", "", baseline_cols))
+have_baseline <- length(baseline_cols) > 0
+# Provenance guard: a valid-looking inventory from a DIFFERENT product would pass the format check and
+# flag everything as new/dropped. In formal mode (DC_REQUIRE_BASELINE) the baseline must carry THIS tool's
+# provenance header, a specific cut, and — when DC_PRODUCT_ID is set — a product field to check identity
+# against; a missing/incomplete header is rejected, not warned. Any product/schema mismatch, incompatible
+# normalization (cut_regex or table-selection regex), or self-comparison is a hard error. Without formal
+# mode these are warnings, so an older headerless inventory still runs.
+# Compare scopes as normalized table BASES (order- and cut-suffix-insensitive): base_name lowercases and
+# strips the snapshot suffix, so "t_x_2026m03" and "t_x_2026m06" read as the same logical scope and a
+# reordered list is not a false difference. "all" (no DC_TABLES) normalizes to itself.
+norm_scope <- function(s) if (is.na(s) || !nzchar(s)) s else
+  paste(sort(unique(base_name(str_trim(str_split(s, ",")[[1]])))), collapse = ",")
+if (have_baseline) {
+  b_schema <- baseline_meta_of("schema"); b_catalog <- baseline_meta_of("catalog"); b_cut <- baseline_meta_of("cut")
+  b_scope  <- baseline_meta_of("scope");  b_regex  <- baseline_meta_of("cut_regex")
+  b_product   <- baseline_meta_of("product"); b_cutfilter <- baseline_meta_of("cut_filter_regex")
+  cur_scope     <- if (nzchar(tables_env)) tables_env else "all"
+  cur_cutfilter <- if (nzchar(cut_table_regex)) cut_table_regex else "default"
+  has_tool_header <- any(grepl("^#\\s*data_profiler inventory", baseline_raw))
+  prod_missing_id <- nzchar(product_id) && is.na(b_product)   # DC_PRODUCT_ID set but the baseline has no product to compare
+  # Formal mode rejects missing/incomplete provenance instead of warning: it requires the COMPLETE manifest
+  # this tool writes — header, catalog, schema, cut, scope, cut_regex, cut_filter_regex (and a product field
+  # when DC_PRODUCT_ID is set) — so no identity/normalization/scope check is silently skipped because a field
+  # was hand-edited out. Cheap to satisfy: regenerate the old inventory with this profiler (DC_INVENTORY_ONLY).
+  if (require_baseline) {
+    need <- c(
+      if (!has_tool_header)   "the tool's provenance header (regenerate the old inventory with this profiler, e.g. DC_INVENTORY_ONLY)" else NULL,
+      if (is.na(b_catalog))   "a catalog field" else NULL,
+      if (is.na(b_schema))    "a schema field" else NULL,
+      if (prod_missing_id)    "a product field (DC_PRODUCT_ID is set — regenerate the old inventory with it, or unset it on both runs)" else NULL,
+      if (is.na(b_cut))       "a cut field (regenerate the old inventory with DC_CUT set)" else NULL,
+      if (is.na(b_scope))     "a scope field" else NULL,
+      if (is.na(b_regex))     "a cut_regex field" else NULL,
+      if (is.na(b_cutfilter)) "a cut_filter_regex field" else NULL)
+    if (length(need))
+      stop(sprintf("DC_REQUIRE_BASELINE: the baseline inventory is missing %s. Regenerate the old inventory with the current profiler.", paste(need, collapse = "; and ")))
+  }
+  if (is.na(b_schema)) {
+    message("WARNING: baseline has no provenance header (older inventory) — cannot verify same product/schema/scope.")
+  } else {
+    # Product identity: DC_PRODUCT_ID, if set, is the wrong-product test (so a same-product feed may live
+    # in cut-specific schemas and the schema is allowed to change); otherwise catalog.schema IS the identity.
+    prod_bad <- if (nzchar(product_id)) (!is.na(b_product) && !identical(tolower(b_product), tolower(product_id)))
+                else (!identical(tolower(b_schema), tolower(schema)) ||
+                      (!is.na(b_catalog) && !identical(tolower(b_catalog), tolower(catalog))))
+    # Hard mismatches (wrong product, unverifiable product, incompatible normalization, self-comparison) fail
+    # loud in formal mode; a table-scope difference is softer (a subset is a legit choice) so it always warns.
+    mism <- if (prod_bad)
+        if (nzchar(product_id)) sprintf("baseline product '%s' != this run's product '%s'", if (is.na(b_product)) "?" else b_product, product_id)
+        else sprintf("baseline is from %s.%s but this run profiles %s.%s — wrong product/schema",
+                     if (is.na(b_catalog)) "?" else b_catalog, b_schema, catalog, schema)
+      else if (prod_missing_id)
+        sprintf("DC_PRODUCT_ID='%s' is set but the baseline has no product field — can't verify same product; regenerate the old inventory with DC_PRODUCT_ID (or unset it on both runs)", product_id)
+      else if (!is.na(b_regex) && !identical(b_regex, cut_regex))
+        sprintf("baseline cut_regex differs (%s vs %s) — table-name normalization won't match, so added/dropped is unreliable", b_regex, cut_regex)
+      else if (!is.na(b_cutfilter) && !identical(b_cutfilter, cur_cutfilter))
+        sprintf("baseline table-selection regex differs (%s vs %s) — the two runs pick tables differently, so added/dropped is unreliable", b_cutfilter, cur_cutfilter)
+      else if (!is.na(b_cut) && nzchar(cut_filter) && identical(tolower(b_cut), tolower(cut_filter)))
+        sprintf("baseline cut (%s) equals this run's cut — comparing a snapshot against itself", b_cut)
+      else ""
+    if (nzchar(mism)) {
+      if (require_baseline) stop(sprintf("baseline provenance check failed: %s (fix the baseline, or unset DC_REQUIRE_BASELINE to bypass)", mism))
+      else message(sprintf("WARNING: %s", mism))
+    }
+    # Formal mode needs a cut-specific baseline: a cut=all inventory may combine snapshots and skew the diff.
+    if (require_baseline && !is.na(b_cut) && identical(tolower(b_cut), "all"))
+      stop("DC_REQUIRE_BASELINE: the baseline inventory has cut=all (no specific snapshot) — regenerate the old inventory with DC_CUT set.")
+    # A real scope difference makes added/dropped unreliable (columns outside the smaller scope look
+    # added or dropped), so formal mode stops; otherwise it warns.
+    if (!is.na(b_scope) && !identical(norm_scope(b_scope), norm_scope(cur_scope))) {
+      smsg <- sprintf("baseline table scope (%s) differs from this run (%s) — use the same table scope on both runs.", b_scope, cur_scope)
+      if (require_baseline) stop(sprintf("baseline provenance check failed: %s", smsg))
+      else message(sprintf("WARNING: %s", smsg))
+    }
+    # Best-effort chronological guard: the baseline should be the PRIOR snapshot. If both cuts are a
+    # recognized format and the baseline is not older than this run's cut, the old/new order is likely
+    # swapped (e.g. June fed as the baseline for March, or the same period in a different label such as
+    # 2026q1 vs 2026m03). The exact-same cut string is left to the self-comparison check above; custom/
+    # unorderable cut formats are skipped.
+    b_ord <- cut_order(b_cut); c_ord <- cut_order(cut_filter)
+    if (!is.na(b_ord) && !is.na(c_ord) && b_ord >= c_ord && !identical(tolower(b_cut), tolower(cut_filter))) {
+      omsg <- sprintf("baseline cut (%s) is not older than this run's cut (%s) — is the old/new order swapped?", b_cut, cut_filter)
+      if (require_baseline) stop(sprintf("baseline provenance check failed: %s", omsg))
+      else message(sprintf("WARNING: %s", omsg))
+    }
+  }
+}
+profile_mode  <- if (inventory_only) "inventory-only" else if (new_only && have_baseline) "new-columns-only" else "full"
+# Output-affecting settings, recorded in the report so an archived artifact is reproducible.
+settings_txt <- sprintf("missing_tokens=%s; numeric_cat_max=%d; top_n=%d; kind_overrides=%s; product_id=%s; cut_filter_regex=%s",
+  if (length(missing_tokens_lc)) paste(missing_tokens_lc, collapse = ",") else "none", numeric_cat_max, top_n,
+  if (length(kind_overrides)) paste(sprintf("%s=%s", names(kind_overrides), kind_overrides), collapse = ",") else "none",
+  if (nzchar(product_id)) product_id else "none",
+  if (nzchar(cut_table_regex)) cut_table_regex else "default")
+if (new_only && !have_baseline)
+  message("WARNING: DC_NEW_ONLY is set but no baseline was given -> profiling ALL columns. Set DC_BASELINE_COLS ",
+          "(and DC_REQUIRE_BASELINE to fail loud) for the focused new-columns-only run.")
+new_detection <- if (have_baseline) sprintf("compared against baseline (%s)", basename(baseline_file)) else
+                 if (length(KNOWN_NEW_TABLES) || length(KNOWN_NEW_COLS))
+                   "manual DC_KNOWN_NEW_* hint (set DC_BASELINE_COLS to diff the prior feed instead)" else
+                 "none flagged (set DC_BASELINE_COLS to diff the prior feed, or DC_KNOWN_NEW_* for a manual hint)"
+is_new_table <- function(tbl) if (have_baseline) !(base_name(tbl) %in% baseline_tbls) else
+                              base_name(tbl) %in% KNOWN_NEW_TABLES
+is_new_col   <- function(tbl, col) if (have_baseline) !(paste(base_name(tbl), str_to_lower(col), sep = "|") %in% baseline_cols) else
+                                   str_to_lower(col) %in% KNOWN_NEW_COLS
+
+# ---- connection (Databricks over ODBC) ----
+# bigint = "character": a profiler reads arbitrary columns, and a large 64-bit id as an R double can lose
+# exact precision (collapsing distinct ids / understating distinct counts). As character, ids stay exact and
+# read as high-cardinality categoricals (the correct treatment); a genuine numeric measure delivered as a
+# big integer can be forced back with DC_KIND_OVERRIDES=col=numeric (which coerces a character column).
+get_con <- function() {
+  if (exists("con", envir = .GlobalEnv)) return(get("con", envir = .GlobalEnv))
+  pwd <- Sys.getenv("DATABRICKS_PWD", "")
+  if (!nzchar(pwd)) stop("set DATABRICKS_PWD, or provide a DBI `con`, or use DC_SOURCE_MODE=local.")
+  DBI::dbConnect(odbc::odbc(), dsn = Sys.getenv("DATABRICKS_DSN", "RWDE"),
+                 pwd = pwd, timeout = 120, bigint = "character")
+}
+fqtn <- function(tbl) paste(c(catalog, schema, tbl), collapse = ".")
+
+list_tables <- function(con) {
+  df <- DBI::dbGetQuery(con, sprintf("SHOW TABLES IN %s.%s", catalog, schema))
+  names(df) <- tolower(names(df))
+  if ("tablename" %in% names(df)) df$tablename else df[[ncol(df) - 1]]
+}
+row_count <- function(con, tbl)
+  as.numeric(DBI::dbGetQuery(con, sprintf("SELECT count(*) AS n FROM %s", fqtn(tbl)))$n[1])
+# Column names WITHOUT reading data rows (LIMIT 0) — the cheap "schema-only" path for the old snapshot
+# and for deciding which columns are new before pulling any data.
+table_columns <- function(con, tbl)
+  tolower(names(DBI::dbGetQuery(con, sprintf("SELECT * FROM %s LIMIT 0", fqtn(tbl)))))
+
+load_dbi <- function(con, tbl, n_total, cols = NULL) {
+  sel <- if (is.null(cols) || !length(cols)) "*" else paste(sprintf("`%s`", cols), collapse = ", ")
+  q <- if (sample_n > 0 && n_total > sample_n)   # reproducible random sample, not first-N
+         sprintf("SELECT %s FROM %s TABLESAMPLE (%f PERCENT) REPEATABLE (%d)",
+                 sel, fqtn(tbl), min(100, 100 * sample_n / n_total), sample_seed)
+       else sprintf("SELECT %s FROM %s", sel, fqtn(tbl))
+  df <- as_tibble(DBI::dbGetQuery(con, q)); names(df) <- tolower(names(df)); df
+}
+load_local <- function(tbl) {
+  pq <- file.path(local_dir, paste0(tbl, ".parquet"))
+  cs <- file.path(local_dir, paste0(tbl, ".csv"))
+  df <- if      (file.exists(pq)) as_tibble(arrow::read_parquet(pq))
+        else if (file.exists(cs)) as_tibble(readr::read_csv(cs, show_col_types = FALSE))
+        else stop(sprintf("no extract for %s in %s", tbl, local_dir))
+  names(df) <- tolower(names(df)); df
+}
+
+# ---- profiling ----
+# Missing = NULL/NA/blank, plus any DC_MISSING_TOKENS you configure (e.g. "Unknown","Not documented").
+# Default is technical missingness only; sentinel tokens are opt-in, and are matched case-insensitively.
+is_missing <- function(x) if (is.character(x)) {
+    t <- str_to_lower(str_trim(x)); is.na(x) | t == "" | t %in% missing_tokens_lc
+  } else is.na(x)
+# Flatiron dates arrive as character over ODBC; treat an ISO-date-looking string column as a
+# date so it gets a range instead of being mislabeled high-cardinality. Returns the full parsed
+# vector (NA where a value didn't parse) so the caller can count and report the failures.
+date_or_null <- function(v) {
+  s <- str_trim(as.character(v))
+  if (mean(grepl("^\\d{4}-\\d{2}-\\d{2}", s)) < 0.9) return(NULL)
+  d <- suppressWarnings(as.Date(s))
+  if (mean(!is.na(d)) < 0.9) return(NULL)
+  d
+}
+fmt_num <- function(v) {
+  if (!is.finite(v)) return("n/a")
+  if (abs(v - round(v)) < 1e-9) format(round(v), big.mark = ",", scientific = FALSE)
+  else formatC(v, format = "f", digits = 2, big.mark = ",")
+}
+
+profile_column <- function(x, name, tbl) {
+  col_type <- class(x)[1]
+  n       <- length(x)
+  miss    <- sum(is_missing(x))
+  nonmiss <- x[!is_missing(x)]            # present values (technical missing removed)
+  n_nonmiss <- length(nonmiss)           # ALWAYS n - missing, one meaning across every kind (incl. dates)
+  bad_dates <- 0                          # present, date-looking values that DON'T parse (counted, not missing)
+  vals    <- nonmiss                      # values that feed the distribution; for a date column, the parsed dates
+  if (is.character(x) && n_nonmiss) {
+    d <- date_or_null(nonmiss)
+    if (!is.null(d)) { bad_dates <- sum(is.na(d)); vals <- d[!is.na(d)] }
+  }
+  n_valid  <- length(vals)               # values actually summarised (= n_nonmiss unless a date failed to parse)
+  distinct <- length(unique(vals))
+  # Structured metrics for the machine-readable profile_<cut>.tsv (input to compare_snapshots.R).
+  # NA unless the column's kind fills them. Continuous columns keep a full quantile grid + mean/sd,
+  # so the comparison can measure center AND shape (SMD, per-quantile drift), not just min/med/max.
+  num_mean <- NA_real_; num_sd <- NA_real_
+  qs <- setNames(as.numeric(rep(NA, 11)),
+                 c("min","p1","p5","p10","p25","p50","p75","p90","p95","p99","max"))
+  date_min <- NA_character_; date_max <- NA_character_; topv_enc <- NA_character_
+  # Kind decision: dates stay dates; a numeric column is "numeric" only if it has more than
+  # numeric_cat_max distinct values (else a flag/code/ordinal gets a category summary, not a mean/SD).
+  # DC_KIND_OVERRIDES forces a specific column either way.
+  force   <- unname(kind_overrides[str_to_lower(name)])
+  is_date <- inherits(vals, "Date") || inherits(x, "POSIXct")
+  # A `numeric` override on a NON-numeric column (a measure delivered as a string, or a BIGINT now read as
+  # character) coerces the values to numeric so it gets a real numeric summary; values that don't parse are
+  # counted as unparseable, not silently dropped. Without the override such a column stays categorical.
+  if (identical(force, "numeric") && !is.numeric(x) && !is_date && n_valid) {
+    cv <- suppressWarnings(as.numeric(as.character(vals)))
+    bad_dates <- bad_dates + sum(is.na(cv)); vals <- cv[!is.na(cv)]
+    n_valid <- length(vals); distinct <- length(unique(vals))
+  }
+  as_num  <- !is_date && is.numeric(vals) &&
+             (identical(force, "numeric") || (!identical(force, "categorical") && distinct > numeric_cat_max))
+  if (is_date) {
+    kind <- "date"
+    if (n_valid) { date_min <- as.character(min(vals)); date_max <- as.character(max(vals)) }
+    summ <- if (n_valid) sprintf("%s -> %s", date_min, date_max) else "n/a"
+    # Don't hide values that failed to parse: a mostly-clean date column with a few bad values
+    # would otherwise look pristine.
+    if (bad_dates > 0) summ <- sprintf("%s | %s unparseable", summ, fmi(bad_dates))
+  } else if (as_num) {
+    kind <- "numeric"
+    summ <- if (n_valid) {
+      qs[] <- quantile(vals, c(0, .01, .05, .10, .25, .50, .75, .90, .95, .99, 1),
+                       na.rm = TRUE, names = FALSE)
+      num_mean <- mean(vals); num_sd <- sd(vals)
+      sprintf("nonmissing %s | mean %s | sd %s | min %s | p25 %s | med %s | p75 %s | max %s",
+              fmt_num(n_valid), fmt_num(num_mean), fmt_num(num_sd), fmt_num(qs[["min"]]),
+              fmt_num(qs[["p25"]]), fmt_num(qs[["p50"]]), fmt_num(qs[["p75"]]), fmt_num(qs[["max"]]))
+    } else "n/a"
+    # Surface coercion failures in the compact summary too (a `numeric` override on a character/BIGINT
+    # column): otherwise a forced-numeric field with unparseable values would look clean in the report.
+    if (bad_dates > 0) summ <- sprintf("%s | %s unparseable", summ, fmi(bad_dates))
+  } else {
+    kind <- "categorical"
+    if (distinct > 50 && distinct > 0.5 * n_nonmiss) {
+      summ <- sprintf("high-cardinality: %s distinct (near-unique)", fmi(distinct))
+    } else if (n_nonmiss) {
+      tb   <- sort(table(as.character(nonmiss)), decreasing = TRUE)
+      topv <- utils::head(tb, top_n)
+      # Machine-readable top values for the categorical-drift compare: "count:value" items joined by
+      # "|"; values are stripped of |/tab/newline so they can't break the TSV (split on the FIRST ':').
+      topv_enc <- paste(sprintf("%d:%s", as.integer(topv), gsub("[|\t\r\n]", " ", names(topv))),
+                        collapse = "|")
+      summ <- paste(sprintf("%s (%s, %.1f%%)", names(topv), fmi(as.integer(topv)),
+                            100 * as.integer(topv) / n_nonmiss), collapse = "; ")
+      if (length(tb) > top_n) summ <- paste0(summ, sprintf("; +%d more", length(tb) - top_n))
+    } else summ <- "n/a"
+  }
+  tibble(column = name, type = col_type, kind = kind, new = is_new_col(tbl, name),
+         n = n, n_nonmissing = n_nonmiss, missing = miss,
+         pct_missing = if (n == 0) NA_real_ else 100 * miss / n,   # undefined (not 0%) when there are no rows
+         distinct = distinct, mean = num_mean, sd = num_sd,
+         min = qs[["min"]], p1 = qs[["p1"]], p5 = qs[["p5"]], p10 = qs[["p10"]], p25 = qs[["p25"]],
+         p50 = qs[["p50"]], p75 = qs[["p75"]], p90 = qs[["p90"]], p95 = qs[["p95"]], p99 = qs[["p99"]],
+         max = qs[["max"]], date_min = date_min, date_max = date_max, unparseable = bad_dates,
+         top_values = topv_enc, summary = summ)
+}
+
+profile_table <- function(df, tbl, n_total, sampled) {
+  prof <- bind_rows(lapply(names(df), function(nm) profile_column(df[[nm]], nm, tbl)))
+  meta <- tibble(table = tbl, new_table = is_new_table(tbl), n_rows_total = n_total,
+                 n_rows_profiled = nrow(df), n_cols = ncol(df), sampled = sampled,
+                 pct_cells_missing = if (nrow(df) == 0) NA_real_ else 100 * sum(prof$missing) / (nrow(df) * ncol(df)))
+  list(meta = meta, prof = prof)
+}
+
+# One row per (table, column) of machine-readable metrics -> profile_<cut>.tsv, the input to
+# compare_snapshots.R. Carries counts AND rates: missingness is stored as a rate (pct_missing) so it
+# is comparable across snapshots with different row counts, with n_rows/n_missing alongside so a rate
+# shift can be traced to numerator vs denominator. Plus the full numeric quantile grid and top values.
+profile_tsv_df <- function(results) {
+  bind_rows(lapply(results, function(r)
+    r$prof %>% mutate(table = r$meta$table, table_base = base_name(r$meta$table),
+                      n_rows_total = r$meta$n_rows_total, sampled = r$meta$sampled) %>%
+      select(table_base, table, column, kind, type, new, sampled,
+             n_rows = n, n_rows_total, n_nonmissing, n_missing = missing, pct_missing, distinct,
+             mean, sd, min, p1, p5, p10, p25, p50, p75, p90, p95, p99, max,
+             date_min, date_max, unparseable, top_values)))
+}
+
+# ---- rendering ----
+esc <- function(x) { x <- as.character(x)
+  x <- gsub("&", "&amp;", x, fixed = TRUE); x <- gsub("<", "&lt;", x, fixed = TRUE)
+  gsub(">", "&gt;", x, fixed = TRUE) }
+badge    <- function(new) if (isTRUE(new)) ' <span class="badge">new</span>' else ""
+miss_bar <- function(pct) if (is.na(pct)) "n/a (no rows)" else
+  sprintf('<div class="bar"><div class="fill" style="width:%.0f%%"></div></div> %.1f%%', pct, pct)
+pctfmt   <- function(p) if (is.na(p)) "n/a" else sprintf("%.1f%%", p)   # % missing, "n/a" when no rows
+fmi      <- function(n) format(n, big.mark = ",", scientific = FALSE)   # count -> "1,234,567" (never 1e+06)
+
+# Added / dropped tables and columns vs the baseline feed (the comparison deliverable).
+# cur_cols is the FULL current inventory (tablebase|column for every column), so added/dropped stay
+# correct even in new_only mode where `results` holds only the profiled (new) subset.
+compute_changes <- function(cur_cols) {
+  cur_tbls <- unique(sub("\\|.*$", "", cur_cols))
+  list(added_tbls = setdiff(cur_tbls, baseline_tbls), dropped_tbls = setdiff(baseline_tbls, cur_tbls),
+       added_cols = setdiff(cur_cols, baseline_cols), dropped_cols = setdiff(baseline_cols, cur_cols))
+}
+# The comparison only sees added/dropped tables and columns — not type, category, missingness or
+# distribution shifts. And if this run profiled a subset (DC_TABLES), "dropped" partly reflects
+# that subset, not a real feed drop; the two runs should use the same table scope.
+changes_caveats <- function() {
+  c("Added/dropped only — not type, category, missingness or distribution changes.",
+    if (nzchar(tables_env)) "This run profiled a table subset (DC_TABLES), so \"dropped\" may reflect the subset, not a real drop. Compare like-for-like table scope." else NULL)
+}
+render_changes_html <- function(ch) {
+  it <- function(lab, v) sprintf("<li><b>%s (%d):</b> %s</li>", lab, length(v),
+    if (length(v)) esc(paste(v, collapse = ", ")) else "&mdash;")
+  cav <- paste(sprintf("<p class='caveat'>%s</p>", esc(changes_caveats())), collapse = "")
+  paste0("<div class='changes'><h2>Changes vs baseline</h2><ul>",
+    it("Added tables", ch$added_tbls), it("Dropped tables", ch$dropped_tbls),
+    it("Added columns", ch$added_cols), it("Dropped columns", ch$dropped_cols), "</ul>", cav, "</div>")
+}
+render_changes_md <- function(ch) {
+  it <- function(lab, v) sprintf("- **%s (%d):** %s", lab, length(v), if (length(v)) paste(v, collapse = ", ") else "—")
+  paste(c("\n## Changes vs baseline\n", it("Added tables", ch$added_tbls), it("Dropped tables", ch$dropped_tbls),
+    it("Added columns", ch$added_cols), it("Dropped columns", ch$dropped_cols),
+    paste0("\n_", changes_caveats(), "_")), collapse = "\n")
+}
+
+# The focused answer to the new-variables ask: one compact table of the NEW variables (schema-new vs the
+# baseline) with row denominator, missing count/%, and a distribution summary. Leads the report.
+new_vars_df <- function(results) {
+  do.call(rbind, c(list(NULL), lapply(results, function(r) {
+    idx <- which(as.logical(r$prof$new))
+    if (!length(idx)) return(NULL)
+    data.frame(table = r$meta$table, column = r$prof$column[idx], kind = r$prof$kind[idx],
+               n = r$prof$n[idx], missing = r$prof$missing[idx], pct = r$prof$pct_missing[idx],
+               summary = r$prof$summary[idx], stringsAsFactors = FALSE)
+  })))
+}
+new_vars_caveat <- paste0("New = schema-new (present now, absent from the baseline inventory): a rename shows as one ",
+  "dropped + one added, and a changed derivation or a newly-populated existing column is NOT flagged. ",
+  "n = table rows profiled (episode-level or patient-level per the table's grain), not unique patients; ",
+  "category percentages are of non-missing rows.")
+render_new_vars_html <- function(results) {
+  d <- new_vars_df(results)
+  if (is.null(d) || !nrow(d)) return("<div class='changes'><h2>New variables</h2><p>None vs baseline.</p></div>")
+  tr <- apply(d, 1, function(t) sprintf(
+    "<tr><td>%s</td><td><b>%s</b></td><td>%s</td><td class='num'>%s</td><td class='num'>%s</td><td class='num'>%s</td><td class='summ'>%s</td></tr>",
+    esc(t[["table"]]), esc(t[["column"]]), esc(t[["kind"]]), esc(fmi(as.numeric(t[["n"]]))),
+    esc(fmi(as.numeric(t[["missing"]]))), pctfmt(as.numeric(t[["pct"]])), esc(t[["summary"]])))
+  paste0("<div class='changes'><h2>New variables (", nrow(d), ")</h2>",
+    "<table><thead><tr><th>table</th><th>new variable</th><th>kind</th><th class='num'>n</th>",
+    "<th class='num'>missing</th><th class='num'>% missing</th><th>distribution</th></tr></thead><tbody>",
+    paste(tr, collapse = ""), "</tbody></table><p class='caveat'>", esc(new_vars_caveat), "</p></div>")
+}
+render_new_vars_md <- function(results) {
+  d <- new_vars_df(results)
+  if (is.null(d) || !nrow(d)) return("\n## New variables\n\n_None vs baseline._\n")
+  rows <- apply(d, 1, function(t) sprintf("| %s | %s | %s | %s | %s | %s | %s |",
+    t[["table"]], t[["column"]], t[["kind"]], fmi(as.numeric(t[["n"]])), fmi(as.numeric(t[["missing"]])),
+    pctfmt(as.numeric(t[["pct"]])), gsub("|", "\\|", t[["summary"]], fixed = TRUE)))
+  paste(c(sprintf("\n## New variables (%d)\n", nrow(d)),
+    "| table | new variable | kind | n | missing | % missing | distribution |",
+    "|---|---|---|---:|---:|---:|---|", rows, paste0("\n_", new_vars_caveat, "_")), collapse = "\n")
+}
+
+render_html <- function(results, gen_time, cur_inv) {
+  ov <- lapply(results, function(r) with(r$meta, sprintf(
+    '<tr><td><a href="#%s">%s</a>%s</td><td class="num">%s</td><td class="num">%d</td><td>%s</td><td>%s</td></tr>',
+    table, esc(table), badge(new_table), fmi(n_rows_total), n_cols,
+    miss_bar(pct_cells_missing), if (sampled) sprintf("sampled %s", fmi(n_rows_profiled)) else "full")))
+  secs <- lapply(results, function(r) {
+    rows <- apply(r$prof, 1, function(p) sprintf(
+      '<tr class="%s"><td>%s%s</td><td>%s</td><td class="num">%s</td><td class="num">%s</td><td>%s (%s)</td><td class="summ">%s</td></tr>',
+      if (as.logical(p[["new"]])) "newrow" else "", esc(p[["column"]]),
+      badge(as.logical(p[["new"]])), esc(p[["kind"]]),
+      fmi(as.numeric(p[["n"]])), fmi(as.integer(p[["distinct"]])),
+      miss_bar(as.numeric(p[["pct_missing"]])), fmi(as.numeric(p[["missing"]])), esc(p[["summary"]])))
+    caveat <- if (r$meta$sampled) sprintf(
+      '<p class="caveat">Estimated from a reproducible random sample of ~%s rows; distinct, %% missing and top values are approximate. Set DC_SAMPLE_N=0 for exact counts.</p>',
+      fmi(r$meta$n_rows_profiled)) else ""
+    with(r$meta, sprintf(paste0(
+      '<h2 id="%s">%s%s</h2><p class="meta">%s rows',
+      '%s &middot; %d columns &middot; %s cells missing</p>%s',
+      '<table><thead><tr><th>column</th><th>kind</th><th class="num">n</th><th class="num">distinct</th>',
+      '<th>missing (count)</th><th>distribution (top values / range)</th></tr></thead><tbody>%s</tbody></table>'),
+      table, esc(table), badge(new_table), fmi(n_rows_total),
+      if (sampled) sprintf(" (profiled a %s-row sample)", fmi(n_rows_profiled)) else "",
+      n_cols, pctfmt(pct_cells_missing), caveat, paste(rows, collapse = "\n")))
+  })
+  paste0(
+    "<!doctype html><html><head><meta charset='utf-8'><title>Data characterization</title><style>",
+    "body{font:14px/1.5 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#1a1a1a;margin:0;padding:32px;max-width:1200px}",
+    "h1{font-size:22px;margin:0 0 4px}h2{font-size:17px;margin:32px 0 4px;border-top:1px solid #e5e5e5;padding-top:20px}",
+    ".sub{color:#666;margin:0 0 24px}.meta{color:#666;margin:0 0 10px;font-size:13px}",
+    ".caveat{color:#b45309;font-size:12px;margin:0 0 10px}",
+    ".changes{background:#f6f8fa;border:1px solid #e5e5e5;border-radius:8px;padding:8px 18px;margin:0 0 20px}",
+    ".changes ul{margin:8px 0;padding-left:18px}.changes li{margin:3px 0}",
+    "table{border-collapse:collapse;width:100%;margin:6px 0 4px}th,td{text-align:left;padding:6px 10px;border-bottom:1px solid #eee;vertical-align:top}",
+    "th{font-size:12px;text-transform:uppercase;letter-spacing:.03em;color:#555;background:#fafafa}",
+    "td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}.summ{font-size:13px;color:#333}",
+    ".bar{display:inline-block;width:70px;height:8px;background:#eee;border-radius:4px;overflow:hidden;vertical-align:middle;margin-right:6px}",
+    ".fill{height:100%;background:#d98a3d}.newrow{background:#fff8ef}",
+    ".badge{font-size:10px;background:#d98a3d;color:#fff;padding:1px 6px;border-radius:10px;vertical-align:middle}",
+    "a{color:#1a56db;text-decoration:none}a:hover{text-decoration:underline}</style></head><body>",
+    "<h1>Data characterization</h1>",
+    sprintf("<p class='sub'>%s &middot; %d tables &middot; generated %s</p>", esc(source_label), length(results), esc(gen_time)),
+    sprintf("<p class='meta'>mode: %s &middot; cut: %s &middot; baseline: %s &middot; %s &middot; scope: %s &middot; new-column flag: %s</p>",
+            esc(profile_mode), esc(if (nzchar(cut_filter)) cut_filter else "all"),
+            esc(if (nzchar(baseline_file)) basename(baseline_file) else "none"),
+            esc(if (sample_n > 0) sprintf("sampling: ~%s rows/table (TABLESAMPLE, approximate)", fmi(sample_n)) else "exact (all rows)"),
+            esc(if (nzchar(tables_env)) "DC_TABLES subset" else "all tables"), esc(new_detection)),
+    sprintf("<p class='meta'>settings: %s</p>", esc(settings_txt)),
+    if (have_baseline) render_new_vars_html(results) else "",
+    if (have_baseline) render_changes_html(compute_changes(cur_inv)) else "",
+    "<table><thead><tr><th>table</th><th class='num'>rows</th><th class='num'>cols</th><th>cells missing</th><th>coverage</th></tr></thead><tbody>",
+    paste(unlist(ov), collapse = "\n"), "</tbody></table>",
+    paste(unlist(secs), collapse = "\n"), "</body></html>")
+}
+
+render_md <- function(results, gen_time, cur_inv) {
+  head <- sprintf("# Data characterization\n\n%s — %d tables — generated %s\n\nmode: %s · cut: %s · baseline: %s · %s · scope: %s · new-column flag: %s.\n\nsettings: %s\n",
+                  source_label, length(results), gen_time, profile_mode,
+                  if (nzchar(cut_filter)) cut_filter else "all",
+                  if (nzchar(baseline_file)) basename(baseline_file) else "none",
+                  if (sample_n > 0) sprintf("sampling: ~%s rows/table (TABLESAMPLE, approximate)", fmi(sample_n)) else "exact (all rows)",
+                  if (nzchar(tables_env)) "DC_TABLES subset" else "all tables", new_detection, settings_txt)
+  ov <- c("\n## Overview\n", "| table | rows | cols | % cells missing | coverage |",
+          "|---|---:|---:|---:|---|",
+          unlist(lapply(results, function(r) with(r$meta, sprintf("| %s%s | %s | %d | %s | %s |",
+            table, if (new_table) " (new)" else "", fmi(n_rows_total), n_cols,
+            pctfmt(pct_cells_missing), if (sampled) sprintf("sampled %s", fmi(n_rows_profiled)) else "full")))))
+  secs <- unlist(lapply(results, function(r) {
+    rows <- apply(r$prof, 1, function(p) sprintf("| %s%s | %s | %s | %s | %s (%s) | %s |",
+      p[["column"]], if (as.logical(p[["new"]])) " (new)" else "", p[["kind"]],
+      fmi(as.numeric(p[["n"]])), fmi(as.integer(p[["distinct"]])),
+      pctfmt(as.numeric(p[["pct_missing"]])), fmi(as.numeric(p[["missing"]])),
+      gsub("|", "\\|", p[["summary"]], fixed = TRUE)))
+    caveat <- if (r$meta$sampled) sprintf(
+      "\n_Estimated from a reproducible random sample of ~%s rows; metrics approximate. Set DC_SAMPLE_N=0 for exact._\n",
+      fmi(r$meta$n_rows_profiled)) else ""
+    c(sprintf("\n## %s%s\n%s", r$meta$table, if (r$meta$new_table) " (new)" else "", caveat),
+      "| column | kind | n | distinct | % missing (count) | distribution |", "|---|---|---:|---:|---:|---|", rows)
+  }))
+  nv  <- if (have_baseline) render_new_vars_md(results) else NULL
+  chg <- if (have_baseline) render_changes_md(compute_changes(cur_inv)) else NULL
+  paste(c(head, nv, chg, ov, secs), collapse = "\n")
+}
+
+# ---- run ----
+run <- function() {
+  # Prostate, OC, endometrial, ... each live in their own catalog + schema, so an empty one
+  # would profile the wrong feed. Fail loud if the CONFIG block (or DC_* override) left them blank.
+  if (source_mode == "dbi" && (!nzchar(catalog) || !nzchar(schema)))
+    stop("catalog/schema are empty — set them in the CONFIG block at the top of this script ",
+         "(or via DC_CATALOG / DC_SCHEMA). They differ per tumor/product.")
+  if (require_baseline && !have_baseline)
+    stop("DC_REQUIRE_BASELINE is set but no DC_BASELINE_COLS was given — formal old->new mode needs the prior inventory.")
+  if (require_baseline && !nzchar(cut_filter))
+    stop("DC_REQUIRE_BASELINE is set but DC_CUT is empty — a schema can hold several snapshots, so formal mode must fix the cut.")
+  con <- if (source_mode == "dbi") get_con() else NULL
+  tables <- if (nzchar(tables_env)) str_split(str_trim(tables_env), "\\s*,\\s*")[[1]]
+            else if (source_mode == "dbi") list_tables(con)
+            else stop("DC_SOURCE_MODE=local needs DC_TABLES set.")
+  if (nzchar(cut_filter)) {
+    pat <- if (nzchar(cut_table_regex)) cut_table_regex else paste0("_", cut_filter, "$")
+    tables <- tables[grepl(pat, str_to_lower(tables))]
+  }
+  if (!length(tables)) stop(sprintf("no tables to profile%s",
+    if (nzchar(cut_filter)) paste0(" for cut '", cut_filter, "'") else ""))
+  message(sprintf("target: %s — %d table(s) [%s]", source_label, length(tables), profile_mode))
+
+  # Overwrite-safe outputs: a per-snapshot subfolder AND a snapshot-stamped filename, so profiling a
+  # new drop can never clobber a previous drop's files (rerunning the SAME cut still overwrites — for
+  # an immutable archive point DC_OUT_DIR at a unique per-run directory).
+  stamp   <- if (nzchar(cut_filter)) paste0("_", cut_filter) else ""
+  run_dir <- if (nzchar(cut_filter)) file.path(out_dir, cut_filter) else out_dir
+  dir.create(run_dir, showWarnings = FALSE, recursive = TRUE)
+  outp <- function(name, ext) file.path(run_dir, sprintf("%s%s.%s", name, stamp, ext))
+
+  # One pass. Always collect every current column name (cheap, no data read). Then, unless
+  # inventory-only, profile the columns needed: new_only reads data for the ADDED columns only
+  # (the focused answer to the new-variables ask); full mode reads every column.
+  gen_time <- format(Sys.time(), "%Y-%m-%d %H:%M")
+  results <- list(); schema_cols <- list()
+  for (tbl in tables) {
+    if (source_mode == "local") { df_all <- load_local(tbl); all_cols <- names(df_all)
+                                  n_total <- nrow(df_all); sampled <- FALSE }
+    else all_cols <- table_columns(con, tbl)
+    schema_cols[[tbl]] <- all_cols
+    if (inventory_only) next
+    prof_cols <- if (new_only && have_baseline && !is_new_table(tbl))
+                   all_cols[vapply(all_cols, function(cc) is_new_col(tbl, cc), logical(1))]
+                 else all_cols
+    if (new_only && !length(prof_cols)) { message(sprintf("  %s: no new columns, skipped", tbl)); next }
+    message(sprintf("profiling %s (%d col%s) ...", tbl, length(prof_cols), if (length(prof_cols) == 1) "" else "s"))
+    if (source_mode == "local") df <- df_all[, prof_cols, drop = FALSE]
+    else if (sample_n > 0) { n_total <- row_count(con, tbl); sampled <- n_total > sample_n
+                             df <- load_dbi(con, tbl, n_total, cols = prof_cols) }
+    else { sampled <- FALSE; df <- load_dbi(con, tbl, 0L, cols = prof_cols); n_total <- nrow(df) }  # exact: n IS nrow(df) — skip the redundant COUNT(*)
+    results[[tbl]] <- profile_table(df, tbl, n_total, sampled)
+  }
+
+  # inventory.txt = ALL current columns (so the next drop's baseline is complete even in new_only mode).
+  cur_inv <- sort(unique(unlist(lapply(names(schema_cols), function(t)
+    paste(base_name(t), tolower(schema_cols[[t]]), sep = "|")))))
+  # Provenance header (read back and verified when this file is later fed as a baseline).
+  inv_header <- c("# data_profiler inventory",
+    sprintf("# catalog=%s", catalog), sprintf("# schema=%s", schema),
+    if (nzchar(product_id)) sprintf("# product=%s", product_id) else NULL,
+    sprintf("# cut=%s", if (nzchar(cut_filter)) cut_filter else "all"),
+    sprintf("# scope=%s", if (nzchar(tables_env)) tables_env else "all"),
+    sprintf("# cut_regex=%s", cut_regex),
+    sprintf("# cut_filter_regex=%s", if (nzchar(cut_table_regex)) cut_table_regex else "default"),
+    sprintf("# generated=%s", gen_time))
+  writeLines(c(inv_header, cur_inv), outp("inventory", "txt"))
+  if (inventory_only) {
+    message(sprintf("inventory-only: wrote %s (%d columns%s)", outp("inventory", "txt"), length(cur_inv),
+                    if (source_mode == "dbi") ", no data read" else " — local mode read the extract to list columns"))
+    return(invisible(cur_inv))
+  }
+  # catalogue.txt = THIS drop's columns plus whatever baseline was fed in (NOT a cross-drop running list).
+  writeLines(sort(unique(c(baseline_cols, cur_inv))), outp("catalogue", "txt"))
+  writeLines(render_html(results, gen_time, cur_inv), outp("data_characterization", "html"))
+  writeLines(render_md(results, gen_time, cur_inv),   outp("data_characterization", "md"))
+  # Machine-readable per-column metrics. In new_only mode this is a PARTIAL profile (added columns only),
+  # so name it profile_new_<cut>.tsv — it is NOT a complete input for compare_snapshots.R drift.
+  tsv_name <- if (new_only && have_baseline) "profile_new" else "profile"
+  write.table(profile_tsv_df(results), outp(tsv_name, "tsv"),
+              sep = "\t", row.names = FALSE, quote = FALSE, na = "")
+  message(sprintf("wrote report + inventory/catalogue/%s%s.* to %s", tsv_name, stamp, run_dir))
+  invisible(results)
+}
+if (!nzchar(Sys.getenv("DC_DEFINE_ONLY"))) run()
+#==FILE==# qc_runner.R
+# Config-driven QC runner — one place to declare the "ends" (data sources) and the checks to run
+# against them, edited entirely in the CFG block below. Standalone, tumor/product-agnostic. It runs
+# the SAME check library at any stage: the raw source feed (before/at ingestion) and the built data
+# product (after creation), plus cross-stage raw->product reconciliation.
+#
+# TWO OUTPUTS from one file:
+#   - Rscript qc_runner.R            -> writes an HTML + md QC report and exits non-zero if any check failed
+#   - testthat::test_file("qc_runner.R")  -> the same checks register as test_that() cases for CI/test runners
+#
+# Every rule check pushes its work down to SQL as one or a few COUNT queries — no table pulls (some verbs
+# run 2: row_count-compare, no_fanout/no_row_loss, derive_equals; domain adds a sample query only on
+# failure). Dates/domains/joins are checked in the warehouse. `profile`/`drift` shell out to sibling scripts,
+# so there is one config surface over profiling, drift, and rule/reconciliation QC — no duplicated logic.
+# EXCEPTION: the `expr` escape hatch can materialize a table in R (its load() does SELECT *); it is an
+# expert-only fallback for a check no verb covers — prefer the declarative verbs, which stay push-down.
+#
+# Check verbs (type = ...). EVERY table-target verb also accepts an optional `filter` (a SQL WHERE
+# fragment) so a check can target a filtered/derived subset, not just a whole table. Join-shaped verbs
+# take `left`/`right` relation specs {source, table, filter, select, distinct}; `by` is a key column,
+# a vector of key columns, or list(left=, right=) when the names differ across the two sides.
+#   profile      profile a whole source (distribution + missingness)      -> data_profiler.R
+#   drift        diff two profile_<cut>.tsv files (temporal drift)         -> compare_snapshots.R
+#   domain       column values are within an allowed set
+#   not_future   a date column (or several, via `cols`) is not in the future
+#   ordering     one column <= another (+ optional `offset_days`, e.g. testdate <= indexdt + 14)
+#   null_rate    a column's missingness (over the optional filter) is <= a threshold
+#   rate         the share of rows (single relation OR a join) matching `predicate` is <= `max_pct`
+#   unique_key   no duplicate key combinations (1:1 safety)
+#   referential  every key in A exists in B (no orphan keys; multi-col keys + per-side filters supported)
+#   row_count    row count within [min,max]/equals, OR compares (<=,==,...) to another relation's count
+#                (needs >=1 of expected/min/max/compare, else it asserts nothing — set informational=TRUE to just report the count)
+#   no_fanout    a LEFT JOIN does not expand the left row count
+#   no_row_loss  an INNER JOIN keeps every left row (counts unmatched left rows via an anti-join)
+#   derive_equals  a product column equals an aggregate OR a mapping-`expr` of raw (per key; optional
+#                tolerance / tolerance_days — tolerance is fail-closed on an unmatched/one-null row unless allow_unmatched=TRUE;
+#                mapping mode assumes a 1:1 raw key — add require_unique_raw=TRUE to assert it)
+#   bound        min/max/sum/avg(product col) <op> same-agg(raw col), globally or per key (e.g. final max <=
+#                raw max); per-key is fail-closed on unmatched/NULL keys unless allow_unmatched=TRUE. Set
+#                cast="double"/"date" when the columns are numbers/dates stored as strings (else agg is lexical);
+#                add require_valid=TRUE to also fail on a non-blank value that doesn't parse (the agg would skip it)
+#   join_check   join two relations and assert no `predicate` violations, or no fan-out / no loss (windows, pairings)
+#   expr         escape hatch: a user R expression returning the count of violations (0 = pass). Runs
+#                arbitrary R with the connection in scope — expert-only; set QC_NO_EXPR=1 to reject expr checks
+# Empty-data policy: null_rate / rate / bound do NOT treat a zero-row or all-NULL relation as a pass — they
+# flag it unless allow_empty=TRUE. A nonzero profile/drift subprocess exit is a FAILURE, not an info row.
+
+library(dplyr); library(stringr)
+
+# ============================ CONFIG — edit these, then run ============================
+CFG <- list(
+  # The "ends". Name each stage; point it at any catalog/schema (edit per tumor / product).
+  sources = list(
+    raw     = list(catalog = "hive_metastore", schema = ""),   # REQUIRED — the raw feed's schema (per tumor/product)
+    product = list(catalog = "hive_metastore", schema = "")     # REQUIRED — the built product's schema (may equal raw)
+  ),
+  out_dir = "",  # where the QC report is written; "" = ./outputs next to this script   (QC_OUT)
+
+  # The checks. Each is list(type=..., <args>). Add/remove freely — no code changes. `<...>` are
+  # placeholders for your product's tables/columns; edit or delete the examples for your feed.
+  # The DEFAULT `checks` are cheap OC-illustrative rule checks (one COUNT each) that run once you set the
+  # schemas — no expensive full-schema profiles or environment-specific paths, so a first run is quick and
+  # doesn't fail on a missing file. The heavier `profile`/`drift` orchestration lives in `examples` below
+  # (opt-in), and everything here is a template: replace the tables/cols for another product.
+  checks = list(
+    # --- non-empty guards: many rule checks (domain, ordering, unique_key, referential, no_fanout) are
+    #     vacuously TRUE on a zero-row table, so guard every critical source with row_count min=1 first ---
+    list(type = "row_count", source = "raw", table = "t_drugepisode_2026m06", min = 1, label = "drugepisode has rows"),
+    list(type = "row_count", source = "raw", table = "t_enh_ov_2026m06",      min = 1, label = "enh_ov has rows"),
+
+    # --- generic rule checks on the raw feed (require_valid=TRUE shows the safe date pattern: parse-check +
+    #     date-cast comparison, so a non-ISO/invalid character date can't slip through) ---
+    list(type = "not_future", source = "raw", table = "t_drugepisode_2026m06", col = "episodedate", require_valid = TRUE),
+    list(type = "ordering",   source = "raw", table = "t_drugepisode_2026m06", lo = "linestartdate", hi = "lineenddate", require_valid = TRUE),
+    list(type = "domain",     source = "raw", table = "t_drugepisode_2026m06", col = "linesetting",
+         allowed = c("ADVANCED", "ADJUVANT", "NEOADJUVANT", "OFF SYSTEMIC THERAPY")),
+    list(type = "null_rate",  source = "raw", table = "t_enh_ov_2026m06", col = "recurrencedate", max_pct = 100),
+    list(type = "unique_key", source = "raw", table = "t_enh_ov_2026m06", keys = "patientid")
+  ),
+
+  # A copy-paste LIBRARY of every verb, incl. cross-stage reconciliation and raw->product merge-QC checks.
+  # NOT executed — run_all() only iterates CFG$checks. To use one: move the entry up into `checks`, replace
+  # every <placeholder> table/column name, and point CFG$sources$product at your product schema. (Safety
+  # net: run_checks skips — as an "info" row, not a run — any check whose table name still contains "<...>",
+  # so an un-edited copy is reported as a template instead of erroring.) Several examples reference
+  # illustrative table names (t_lineoftherapy, t_demographics, t_vitals) purely to show the pattern.
+  examples = list(
+    # --- profiling / drift orchestration (one config surface over profiling + QC). profile runs an EXACT
+    #     full-schema profile (DC_SAMPLE_N=0) unless you set sample_n, so it can be expensive; drift needs
+    #     real full profile_<cut>.tsv paths from prior profiler runs (never profile_new_*). ---
+    list(type = "profile", source = "raw",     cut = "2026m06", label = "profile raw feed"),
+    list(type = "profile", source = "product", cut = "2026m06", label = "profile product"),
+    list(type = "drift",
+         old = "outputs/2026m03/profile_2026m03.tsv",
+         new = "outputs/2026m06/profile_2026m06.tsv", label = "raw drift m03 -> m06"),
+
+    # --- cross-stage raw -> product reconciliation ---
+    list(type = "referential",
+         left  = list(source = "product", table = "<product_tbl>", col = "patientid"),
+         right = list(source = "raw",     table = "t_enh_ov_2026m06", col = "patientid"),
+         label = "every product patient exists in raw"),
+    list(type = "no_fanout",
+         left = list(source = "product", table = "<base_tbl>"),
+         right = list(source = "product", table = "<demographics_tbl>"), by = "patientid"),
+    list(type = "derive_equals", label = "lot1 start == min raw non-maint LOT1 episode",
+         key = "patientid", product_source = "product", product_table = "<product_tbl>", product = "lot1sd",
+         raw = list(source = "raw", table = "t_drugepisode_2026m06", agg = "min", col = "linestartdate",
+                    filter = "linenumber = 1 AND lower(trim(ismaintenancetherapy)) IN ('false','f','n','no','0')")),
+
+    # --- filtered targets & new verbs (raw->product parity; edit placeholders per product) ---
+    # A filtered target: LOT1 non-maintenance rows must be 1:1 per patient (safe to join).
+    list(type = "unique_key", source = "raw", table = "t_lineoftherapy_2026m06", keys = "patientid",
+         filter = "linenumber = 1 AND upper(ismaintenancetherapy) = 'FALSE'", label = "LOT1 non-maint is 1:1"),
+    # No fan-out when a filtered raw table is left-joined onto the distinct patient list.
+    list(type = "no_fanout", label = "advanced cohort <- LOT1 does not fan out",
+         left  = list(source = "raw", table = "t_enh_ov_2026m06", select = "patientid", distinct = TRUE),
+         right = list(source = "raw", table = "t_lineoftherapy_2026m06", filter = "linenumber = 1"), by = "patientid"),
+    # Count-vs-count: product patient count must not exceed raw patient count.
+    list(type = "row_count", source = "product", table = "<product_tbl>", select = "patientid", distinct = TRUE,
+         relation = "<=", compare = list(source = "raw", table = "t_enh_ov_2026m06", select = "patientid", distinct = TRUE),
+         label = "product patients <= raw patients"),
+    # Mapping derivation: product 'gender' equals a CASE mapping of raw birthsex (raw side 1:1 on key).
+    list(type = "derive_equals", label = "gender == mapping of raw birthsex", key = "patientid",
+         product_table = "<product_tbl>", product = "gender",
+         raw = list(source = "raw", table = "t_demographics_2026m06",
+                    expr = "CASE WHEN upper(birthsex)='F' THEN 'Female' WHEN upper(birthsex)='M' THEN 'Male' ELSE 'Missing' END")),
+    # Numeric tolerance: derived age within 1 of year(indexdt) - birthyear (raw side 1:1 on key).
+    list(type = "derive_equals", label = "age within 1 of indexyr - birthyear", key = "patientid",
+         product_table = "<product_tbl>", product = "age", tolerance = 1,
+         raw = list(source = "raw", table = "t_demographics_2026m06", expr = "year(current_date()) - birthyear")),
+    # Aggregate bound: final weight max must not exceed the raw weight max. cast="double" because both columns
+    # are numbers stored as strings (testresultcleaned is cast to double in the rate check below) — without it
+    # max() would compare lexically ("1000" < "95") and a real over-max could pass.
+    list(type = "bound", agg = "max", relation = "<=", cast = "double", label = "final weight max <= raw weight max",
+         product = list(source = "product", table = "<product_tbl>", col = "weight"),
+         raw     = list(source = "raw", table = "t_vitals_2026m06", col = "testresultcleaned",
+                        filter = "upper(test) = 'BODY WEIGHT'")),
+    # Predicate rate over a join: <1% of same-date BP pairs have diastolic >= systolic. Values are cast
+    # in the predicate so the comparison is numeric even when the raw column is stored as a string.
+    list(type = "rate", max_pct = 1, label = "<1% of BP pairs have diastolic >= systolic",
+         left  = list(source = "raw", table = "t_vitals_2026m06",
+                      filter = "upper(test) = 'SYSTOLIC BLOOD PRESSURE' AND testresultcleaned IS NOT NULL"),
+         right = list(source = "raw", table = "t_vitals_2026m06",
+                      filter = "upper(test) = 'DIASTOLIC BLOOD PRESSURE' AND testresultcleaned IS NOT NULL"),
+         by = list(left = c("patientid", "testdate"), right = c("patientid", "testdate")),
+         predicate = "try_cast(r.testresultcleaned AS double) >= try_cast(l.testresultcleaned AS double)"),
+    # Date-window join: no raw biomarker result used later than indexdt + 14 days. (<biomarker_tbl> is a
+    # placeholder — point right at your biomarker source and its result-date column.)
+    list(type = "join_check", kind = "inner", label = "biomarker resultdate <= indexdt + 14",
+         left  = list(source = "product", table = "<product_tbl>", select = c("patid", "indexdt")),
+         right = list(source = "raw", table = "<biomarker_tbl>"),
+         by = list(left = "patid", right = "patientid"),
+         predicate = "try_cast(r.resultdate AS date) > date_add(try_cast(l.indexdt AS date), 14)")
+  ),
+
+  # A run with NO runnable pass/fail assertion (empty checks, only placeholders, or only info steps) FAILS
+  # by default, so a mis-wired config can't exit 0 silently. Set TRUE (or QC_ALLOW_INFO_ONLY=1) for an
+  # intentionally info-only run (e.g. profile/drift only).
+  allow_info_only = FALSE,
+
+  # profile/drift verbs shell out to these sibling scripts (paths relative to this script unless absolute)
+  profiler_script = "data_profiler.R",
+  compare_script  = "compare_snapshots.R"
+)
+# ======================================================================================
+
+`%||%` <- function(x, y) if (is.null(x) || length(x) == 0 || (length(x) == 1 && is.na(x)) || identical(x, "")) y else x
+getcfg  <- function(env, default) { v <- Sys.getenv(env, ""); if (nzchar(v)) v else default }
+
+this_dir <- tryCatch(dirname(sub("^--file=", "", grep("^--file=", commandArgs(FALSE), value = TRUE))),
+                     error = function(e) ".")
+if (!length(this_dir) || this_dir == "") this_dir <- "."
+out_dir <- { v <- getcfg("QC_OUT", CFG$out_dir); if (nzchar(v)) v else file.path(this_dir, "outputs") }
+abspath <- function(p) if (nzchar(p) && (startsWith(p, "/") || grepl("^[A-Za-z]:", p))) p else file.path(this_dir, p)
+
+# ---- connection + SQL helpers ----
+# bigint = "character" for exact 64-bit ids (matches data_profiler.R). Rule checks run in SQL and return
+# only counts, which q1() re-parses with as.numeric(), so this is transparent to them; it only matters for
+# the `expr` hatch, where a materialized large id stays exact instead of losing precision as an R double.
+get_con <- function() {
+  if (exists("con", envir = .GlobalEnv)) return(get("con", envir = .GlobalEnv))
+  pwd <- Sys.getenv("DATABRICKS_PWD", "")
+  if (!nzchar(pwd)) stop("set DATABRICKS_PWD, or provide a DBI `con` in the global env.")
+  DBI::dbConnect(odbc::odbc(), dsn = Sys.getenv("DATABRICKS_DSN", "RWDE"), pwd = pwd, timeout = 120, bigint = "character")
+}
+bt  <- function(x) paste0("`", x, "`")                                   # backtick an identifier
+# Escape backslashes THEN single-quotes: Spark parses backslash escapes inside '...' literals by default
+# (spark.sql.parser.escapedStringLiterals=false), so a raw "\t" in an allowed value would become a TAB and
+# mis-match. Double each backslash first, then double each quote, so the literal is taken verbatim.
+sqs <- function(x) sprintf("'%s'", gsub("'", "''", gsub("\\", "\\\\", x, fixed = TRUE)))
+fq  <- function(source, table) {                                        # fully-qualified name for a named source
+  s <- CFG$sources[[source]]
+  if (is.null(s)) stop(sprintf("check references unknown source '%s' (define it in CFG$sources)", source))
+  if (!nzchar(s$catalog %||% "") || !nzchar(s$schema %||% ""))          # blank-required: no silent wrong-schema run
+    stop(sprintf("source '%s' has an empty catalog/schema — set CFG$sources$%s (differs per tumor/product)", source, source))
+  paste(c(s$catalog, s$schema, table), collapse = ".")
+}
+q1  <- function(con, sql) as.numeric(DBI::dbGetQuery(con, sql)[[1]][1])  # scalar from a single-value query
+qcol <- function(con, sql) DBI::dbGetQuery(con, sql)[[1]]               # first column as a vector
+fmi <- function(n) format(n, big.mark = ",", scientific = FALSE)        # integer count -> "1,234,567" (never 1e+06)
+
+# ---- result constructor ----
+# info=TRUE marks a non-pass/fail step (profile/drift) so it never fails the suite.
+res <- function(label, type, pass = NA, n_bad = NA, total = NA, detail = "", sample = "", info = FALSE) {
+  # Normalize the text fields to a single non-empty-safe string: a handler that builds a detail with
+  # sprintf() and a NULL argument yields character(0), and render()'s vapply(..., character(1)) would then
+  # abort the WHOLE run (writing no report) instead of surfacing that one check. Length-0 -> "".
+  n1 <- function(x) if (length(x) == 0) "" else x[[1]]
+  list(label = n1(label), type = n1(type), pass = pass, n_bad = n_bad, total = total,
+       detail = n1(detail), sample = n1(sample), info = info)
+}
+
+# ---- SQL builders shared by the verbs ----
+# Join keys: a char vector (same names both sides) or list(left=, right=) for differing names.
+# Validate equal, non-zero lengths so unequal vectors can't silently recycle into a wrong join condition.
+join_on <- function(by) {
+  if (is.list(by)) {
+    if (length(by$left) != length(by$right) || length(by$left) < 1)
+      stop(sprintf("join keys must be non-empty and equal length: left=%d, right=%d", length(by$left), length(by$right)))
+    paste(sprintf("l.%s = r.%s", bt(by$left), bt(by$right)), collapse = " AND ")
+  } else {
+    if (length(by) < 1) stop("join key `by` must be non-empty")
+    paste(sprintf("l.%s = r.%s", bt(by), bt(by)), collapse = " AND ")
+  }
+}
+and_filter <- function(base, filter) if (!is.null(filter) && nzchar(filter)) sprintf("(%s) AND (%s)", base, filter) else base
+whereof    <- function(filter) if (!is.null(filter) && nzchar(filter)) sprintf(" WHERE %s", filter) else ""
+# A filtered/derived relation -> "(SELECT [DISTINCT] <cols|*> FROM cat.sch.tbl [WHERE <filter>])". Every
+# table-target verb builds on this, so any check can target a filtered subset or a projected key list.
+rel <- function(spec) {
+  sel  <- if (!is.null(spec$select)) paste(vapply(spec$select, bt, character(1)), collapse = ", ") else "*"
+  dist <- if (isTRUE(spec$distinct)) "DISTINCT " else ""
+  sprintf("(SELECT %s%s FROM %s%s)", dist, sel, fq(spec$source, spec$table), whereof(spec$filter))
+}
+fmt2 <- function(v) if (length(v) != 1 || is.na(v)) "NA" else fmi(v)     # scalar formatter tolerant of NA/empty
+
+# ---- verb handlers: each returns res(...) ----
+handlers <- list(
+  domain = function(chk, con) {
+    lst  <- paste(vapply(chk$allowed, sqs, character(1)), collapse = ", ")
+    tab  <- fq(chk$source, chk$table)
+    cond <- and_filter(sprintf("%s IS NOT NULL AND %s NOT IN (%s)", bt(chk$col), bt(chk$col), lst), chk$filter)
+    nbad <- q1(con, sprintf("SELECT count(*) FROM %s WHERE %s", tab, cond))
+    samp <- if (nbad > 0) paste(utils::head(qcol(con, sprintf(
+      "SELECT DISTINCT %s FROM %s WHERE %s LIMIT 20", bt(chk$col), tab, cond)), 20), collapse = ", ") else ""
+    res(chk$label %||% sprintf("domain %s.%s", chk$table, chk$col), "domain",
+        pass = nbad == 0, n_bad = nbad, detail = sprintf("%d rows outside the allowed set", nbad), sample = samp)
+  },
+  not_future = function(chk, con) {
+    cols <- chk$cols %||% chk$col
+    # try_cast makes an invalid date NULL, so by itself this proves "no PARSEABLE future date". require_valid=TRUE
+    # also counts a non-blank value that fails to parse as a violation, closing that fail-open for date QC.
+    per_col <- function(c) { f <- sprintf("try_cast(%s AS date) > current_date()", bt(c))
+      if (isTRUE(chk$require_valid))
+        f <- sprintf("(%s) OR (%s IS NOT NULL AND trim(cast(%s AS string)) <> '' AND try_cast(%s AS date) IS NULL)",
+                     f, bt(c), bt(c), bt(c))
+      f }
+    disj <- paste(vapply(cols, per_col, character(1)), collapse = " OR ")
+    nbad <- q1(con, sprintf("SELECT count(*) FROM %s WHERE %s", fq(chk$source, chk$table), and_filter(disj, chk$filter)))
+    res(chk$label %||% sprintf("not_future %s.%s", chk$table, paste(cols, collapse = ",")), "not_future",
+        pass = nbad == 0, n_bad = nbad,
+        detail = sprintf("%d rows with a future%s date", nbad, if (isTRUE(chk$require_valid)) " or unparseable" else ""))
+  },
+  ordering = function(chk, con) {
+    off <- as.integer(chk$offset_days %||% 0L)
+    # Compare as DATES when there's a date offset, or the columns are declared dates (as_date / require_valid).
+    # Otherwise compare the raw columns (native date/timestamp or numeric). Casting is what stops a non-ISO
+    # character date from being compared LEXICOGRAPHICALLY (e.g. "09/01/2026" vs "10/12/2025").
+    as_date <- off != 0L || isTRUE(chk$as_date) || isTRUE(chk$require_valid)
+    if (as_date) {
+      lo_e <- sprintf("try_cast(%s AS date)", bt(chk$lo))
+      hi_e <- if (off != 0L) sprintf("date_add(try_cast(%s AS date), %d)", bt(chk$hi), off)
+              else           sprintf("try_cast(%s AS date)", bt(chk$hi))
+    } else { lo_e <- bt(chk$lo); hi_e <- bt(chk$hi) }
+    base <- sprintf("%s IS NOT NULL AND %s IS NOT NULL AND %s > %s", bt(chk$lo), bt(chk$hi), lo_e, hi_e)
+    # require_valid=TRUE (date columns): also count a non-blank lo/hi that fails to parse as a date, so an
+    # invalid date can't slip through by casting to NULL.
+    if (isTRUE(chk$require_valid))
+      base <- sprintf("(%s) OR %s", base, paste(vapply(c(chk$lo, chk$hi), function(c)
+        sprintf("(%s IS NOT NULL AND trim(cast(%s AS string)) <> '' AND try_cast(%s AS date) IS NULL)", bt(c), bt(c), bt(c)),
+        character(1)), collapse = " OR "))
+    nbad <- q1(con, sprintf("SELECT count(*) FROM %s WHERE %s", fq(chk$source, chk$table), and_filter(base, chk$filter)))
+    res(chk$label %||% sprintf("ordering %s: %s <= %s%s", chk$table, chk$lo, chk$hi, if (off != 0L) sprintf(" + %d", off) else ""),
+        "ordering", pass = nbad == 0, n_bad = nbad,
+        detail = sprintf("%d rows violating %s <= %s%s", nbad, chk$lo, chk$hi, if (isTRUE(chk$require_valid)) " (or unparseable)" else ""))
+  },
+  null_rate = function(chk, con) {
+    if (is.null(chk$max_pct))   # required ceiling: without it `pct <= NULL` is logical(0) and the detail sprintf
+      return(res(chk$label %||% sprintf("null_rate %s.%s", chk$table, chk$col), "null_rate",   # collapses to character(0)
+                 pass = FALSE, detail = "null_rate requires max_pct (the percent-missing ceiling)"))
+    r <- DBI::dbGetQuery(con, sprintf(
+      "SELECT sum(CASE WHEN %s IS NULL OR trim(cast(%s AS string)) = '' THEN 1 ELSE 0 END) AS bad, count(*) AS tot FROM %s%s",
+      bt(chk$col), bt(chk$col), fq(chk$source, chk$table), whereof(chk$filter)))
+    bad <- as.numeric(r$bad[1]); tot <- as.numeric(r$tot[1])
+    if (tot == 0)   # a zero-row relation is NOT 0% missing — don't let an empty table silently pass a gate
+      return(res(chk$label %||% sprintf("null_rate %s.%s", chk$table, chk$col), "null_rate",
+                 pass = isTRUE(chk$allow_empty), n_bad = 0, total = 0,
+                 detail = "no rows to evaluate (set allow_empty=TRUE to pass)"))
+    pct <- 100 * bad / tot
+    res(chk$label %||% sprintf("null_rate %s.%s", chk$table, chk$col), "null_rate",
+        pass = pct <= chk$max_pct, n_bad = bad, total = tot,
+        detail = sprintf("%.1f%% missing (%s of %s); limit %.1f%%", pct, fmi(bad), fmi(tot), chk$max_pct))
+  },
+  rate = function(chk, con) {
+    if (is.null(chk$max_pct))   # required ceiling (see null_rate): a missing max_pct would crash render, not this check
+      return(res(chk$label %||% "rate", "rate", pass = FALSE, detail = "rate requires max_pct (the percent ceiling)"))
+    # NOTE: `predicate` is authored verbatim; this verb does NOT validate that its operands parse. If the
+    # predicate casts (e.g. try_cast(x AS date)), a non-null-but-unparseable value makes the predicate NULL
+    # and is NOT counted — make the predicate handle it (e.g. OR try_cast(x AS date) IS NULL) if that matters.
+    from <- if (!is.null(chk$right))
+              sprintf("%s l %s JOIN %s r ON %s", rel(chk$left), toupper(chk$kind %||% "INNER"), rel(chk$right), join_on(chk$by))
+            else sprintf("%s x", rel(chk))
+    r <- DBI::dbGetQuery(con, sprintf("SELECT sum(CASE WHEN %s THEN 1 ELSE 0 END) AS bad, count(*) AS tot FROM %s", chk$predicate, from))
+    bad <- as.numeric(r$bad[1]); tot <- as.numeric(r$tot[1])
+    if (tot == 0)   # empty denominator: not "0% match" — flag unless explicitly allowed
+      return(res(chk$label %||% "rate", "rate", pass = isTRUE(chk$allow_empty), n_bad = 0, total = 0,
+                 detail = "no rows to evaluate (set allow_empty=TRUE to pass)"))
+    pct <- 100 * bad / tot
+    res(chk$label %||% "rate", "rate", pass = pct <= chk$max_pct, n_bad = bad, total = tot,
+        detail = sprintf("%.2f%% of %s rows match predicate (limit %.2f%%)", pct, fmi(tot), chk$max_pct))
+  },
+  unique_key = function(chk, con) {
+    keys <- paste(vapply(chk$keys, bt, character(1)), collapse = ", ")
+    nbad <- q1(con, sprintf("SELECT count(*) FROM (SELECT %s FROM %s%s GROUP BY %s HAVING count(*) > 1)",
+                            keys, fq(chk$source, chk$table), whereof(chk$filter), keys))
+    res(chk$label %||% sprintf("unique_key %s (%s)", chk$table, paste(chk$keys, collapse = ",")), "unique_key",
+        pass = nbad == 0, n_bad = nbad, detail = sprintf("%d duplicate key combinations", nbad))
+  },
+  referential = function(chk, con) {
+    lcols <- chk$left$col; rcols <- chk$right$col
+    if (length(lcols) != length(rcols) || length(lcols) < 1)   # unequal key vectors would recycle into a wrong join
+      stop(sprintf("referential: left$col and right$col must be non-empty and equal length (%d vs %d)", length(lcols), length(rcols)))
+    lk  <- paste(vapply(lcols, bt, character(1)), collapse = ", ")
+    rk  <- paste(vapply(rcols, bt, character(1)), collapse = ", ")
+    lnn <- paste(vapply(lcols, function(c) sprintf("%s IS NOT NULL", bt(c)), character(1)), collapse = " AND ")
+    onj <- paste(sprintf("l.%s = r.%s", vapply(lcols, bt, character(1)), vapply(rcols, bt, character(1))), collapse = " AND ")
+    nbad <- q1(con, sprintf(
+      "SELECT count(*) FROM (SELECT DISTINCT %s FROM %s WHERE %s) l LEFT ANTI JOIN (SELECT DISTINCT %s FROM %s%s) r ON %s",
+      lk, fq(chk$left$source, chk$left$table), and_filter(lnn, chk$left$filter),
+      rk, fq(chk$right$source, chk$right$table), whereof(chk$right$filter), onj))
+    res(chk$label %||% sprintf("referential %s.%s in %s.%s", chk$left$table, paste(lcols, collapse = ","),
+        chk$right$table, paste(rcols, collapse = ",")), "referential",
+        pass = nbad == 0, n_bad = nbad, detail = sprintf("%d orphan keys not found in the right table", nbad))
+  },
+  row_count = function(chk, con) {
+    n  <- q1(con, sprintf("SELECT count(*) FROM %s", rel(chk)))
+    # An unconstrained row_count (no expected/min/max/compare) asserts NOTHING but would otherwise pass
+    # unconditionally AND satisfy the "at least one assertion" guard — a vacuous gate. Treat it as a config
+    # error (FAIL loud), unless informational=TRUE, which reports the count as a non-gating info row.
+    if (is.null(chk$expected) && is.null(chk$min) && is.null(chk$max) && is.null(chk$compare))
+      return(res(chk$label %||% sprintf("row_count %s", chk$table), "row_count",
+                 pass = if (isTRUE(chk$informational)) NA else FALSE,
+                 n_bad = if (isTRUE(chk$informational)) NA else 1, total = n, info = isTRUE(chk$informational),
+                 detail = if (isTRUE(chk$informational)) sprintf("%s rows (informational)", fmi(n))
+                          else sprintf("%s rows — row_count asserts nothing without expected/min/max/compare (or set informational=TRUE)", fmi(n))))
+    ok <- TRUE; detail <- sprintf("%s rows", fmi(n))
+    if (!is.null(chk$expected)) ok <- n == chk$expected
+    if (!is.null(chk$min))      ok <- ok && n >= chk$min
+    if (!is.null(chk$max))      ok <- ok && n <= chk$max
+    if (!is.null(chk$compare)) {
+      m  <- q1(con, sprintf("SELECT count(*) FROM %s", rel(chk$compare)))
+      op <- chk$relation %||% "=="
+      if (!op %in% c("==", "<=", "<", ">=", ">"))     # reject a typo'd operator instead of silently using ==
+        stop(sprintf("row_count: unknown relation '%s' (==, <=, <, >=, >)", op))
+      ok <- ok && switch(op, "==" = n == m, "<=" = n <= m, "<" = n < m, ">=" = n >= m, ">" = n > m)
+      detail <- sprintf("%s rows %s %s", fmi(n), op, fmi(m))
+    }
+    res(chk$label %||% sprintf("row_count %s", chk$table), "row_count",
+        pass = ok, n_bad = if (ok) 0 else 1, total = n, detail = detail)
+  },
+  no_fanout = function(chk, con) {
+    n_left <- q1(con, sprintf("SELECT count(*) FROM %s l", rel(chk$left)))
+    n_join <- q1(con, sprintf("SELECT count(*) FROM %s l LEFT JOIN %s r ON %s", rel(chk$left), rel(chk$right), join_on(chk$by)))
+    res(chk$label %||% sprintf("no_fanout %s <- %s", chk$left$table, chk$right$table), "no_fanout",
+        pass = n_join == n_left, n_bad = max(0, n_join - n_left), total = n_left,
+        detail = sprintf("LEFT JOIN row count %s -> %s", fmi(n_left), fmi(n_join)))
+  },
+  no_row_loss = function(chk, con) {
+    # Count left rows with NO match (LEFT ANTI JOIN) rather than comparing inner-join size: an INNER JOIN
+    # can both DROP unmatched rows and FAN OUT matched ones, so equal counts don't prove no loss.
+    n_left <- q1(con, sprintf("SELECT count(*) FROM %s l", rel(chk$left)))
+    n_lost <- q1(con, sprintf("SELECT count(*) FROM %s l LEFT ANTI JOIN %s r ON %s", rel(chk$left), rel(chk$right), join_on(chk$by)))
+    res(chk$label %||% sprintf("no_row_loss %s <- %s", chk$left$table, chk$right$table), "no_row_loss",
+        pass = n_lost == 0, n_bad = n_lost, total = n_left,
+        detail = sprintf("%s of %s left rows have no match in the right table", fmi(n_lost), fmi(n_left)))
+  },
+  derive_equals = function(chk, con) {
+    pfq  <- fq(chk$product_source %||% "product", chk$product_table)
+    rfq  <- fq(chk$raw$source, chk$raw$table); rkey <- chk$raw$key %||% chk$key
+    if (!is.null(chk$raw$expr)) {                                   # value-mapping: raw side is assumed 1:1 on the key
+      # The mapping subquery does NOT group, so a duplicated raw key fans the product row out in the LEFT JOIN
+      # and a consistent-but-duplicated key can leave n_bad=0 without proving the intended 1:1 mapping. The
+      # aggregate branch is immune (it GROUPs BY key). require_unique_raw=TRUE asserts raw-key uniqueness first.
+      if (isTRUE(chk$require_unique_raw)) {
+        dup <- q1(con, sprintf("SELECT count(*) FROM (SELECT %s FROM %s%s GROUP BY %s HAVING count(*) > 1)",
+                               bt(rkey), rfq, whereof(chk$raw$filter), bt(rkey)))
+        if (dup > 0)
+          return(res(chk$label %||% sprintf("derive_equals %s == mapping", chk$product), "derive_equals",
+                     pass = FALSE, n_bad = dup,
+                     detail = sprintf("raw mapping key %s is not unique: %s duplicate key(s) — the 1:1 assumption fails", rkey, fmi(dup))))
+      }
+      rsub  <- sprintf("(SELECT %s AS k, %s AS rv FROM %s%s)", bt(rkey), chk$raw$expr, rfq, whereof(chk$raw$filter))
+      rdesc <- "mapping"
+    } else {                                                        # aggregate of a raw column, grouped by key
+      agg <- tolower(chk$raw$agg)
+      if (!agg %in% c("min", "max", "sum", "avg", "count"))
+        stop(sprintf("derive_equals: unsupported agg '%s' (min/max/sum/avg/count) or set raw$expr", chk$raw$agg))
+      rsub  <- sprintf("(SELECT %s AS k, %s(%s) AS rv FROM %s%s GROUP BY %s)", bt(rkey), agg, bt(chk$raw$col), rfq, whereof(chk$raw$filter), bt(rkey))
+      rdesc <- sprintf("%s(%s)", agg, chk$raw$col)
+    }
+    # FAIL-CLOSED by default. `r.k IS NULL` (from the LEFT JOIN) is the UNMATCHED signal — keyed on the raw
+    # KEY, not on value nullness, so a product row with a NULL value AND no raw match is still a violation
+    # (a value-only test would let p.pv=NULL, r.rv=NULL slip through). `val_bad` is the matched-row mismatch:
+    # exact = null-safe inequality; tolerance = one-side-null OR both present and beyond the band.
+    # allow_unmatched=TRUE compares ONLY matched keys (unmatched product rows are not counted).
+    # The "both present and beyond the band" clause. Both tolerance bands are FAIL-CLOSED on a non-null value
+    # that fails to parse: its try_cast would be NULL, the diff would be NULL, and a NULL is not a violation —
+    # so a garbage measure/date would silently pass the band. tolerance_days casts to date; tolerance casts to
+    # double. (The exact path uses <=> and needs no cast.)
+    diff_over <- if (!is.null(chk$tolerance_days))
+                   sprintf("try_cast(p.pv AS date) IS NULL OR try_cast(r.rv AS date) IS NULL OR abs(datediff(try_cast(p.pv AS date), try_cast(r.rv AS date))) > %d", as.integer(chk$tolerance_days))
+                 else if (!is.null(chk$tolerance))
+                   sprintf("try_cast(p.pv AS double) IS NULL OR try_cast(r.rv AS double) IS NULL OR abs(try_cast(p.pv AS double) - try_cast(r.rv AS double)) > %s", chk$tolerance)
+                 else NULL
+    val_bad <- if (is.null(diff_over)) "NOT (p.pv <=> r.rv)"
+               else sprintf("((p.pv IS NULL) <> (r.rv IS NULL)) OR (p.pv IS NOT NULL AND r.rv IS NOT NULL AND (%s))", diff_over)
+    cmp <- if (isTRUE(chk$allow_unmatched)) sprintf("r.k IS NOT NULL AND (%s)", val_bad)
+           else                             sprintf("r.k IS NULL OR (%s)", val_bad)
+    nbad <- q1(con, sprintf(
+      "SELECT count(*) FROM (SELECT %s AS k, %s AS pv FROM %s%s) p LEFT JOIN %s r ON p.k = r.k WHERE %s",
+      bt(chk$key), bt(chk$product), pfq, whereof(chk$product_filter), rsub, cmp))
+    tot  <- q1(con, sprintf("SELECT count(*) FROM %s%s", pfq, whereof(chk$product_filter)))
+    res(chk$label %||% sprintf("derive_equals %s == %s", chk$product, rdesc), "derive_equals",
+        pass = nbad == 0, n_bad = nbad, total = tot,
+        detail = sprintf("%s of %s rows where %s != %s", fmi(nbad), fmi(tot), chk$product, rdesc))
+  },
+  bound = function(chk, con) {
+    agg <- tolower(chk$agg %||% "max"); op <- chk$relation %||% "<="
+    if (!op %in% c("<=", "<", ">=", ">", "=="))                    # reject a typo'd operator instead of silently using <=
+      stop(sprintf("bound: unknown relation '%s' (<=, <, >=, >, ==)", op))
+    if (!agg %in% c("min", "max", "sum", "avg"))                   # "count" would defeat the empty-data guard below
+      stop(sprintf("bound: unsupported agg '%s' (min/max/sum/avg) — count() returns 0 (not NULL) on an empty relation, so it would silently pass 0<=0; use row_count for counts", chk$agg))
+    # Cast BEFORE aggregating when the columns are numbers/dates stored as strings: max()/min() on a string
+    # column are LEXICOGRAPHIC ("1000" < "95"), so a real out-of-range product value could pass. `cast` (e.g.
+    # "double", "date", "decimal(38,6)") wraps each side in try_cast; default = no cast (native numeric/date).
+    cst <- function(colexpr) if (nzchar(chk$cast %||% "")) sprintf("try_cast(%s AS %s)", colexpr, chk$cast) else colexpr
+    # A cast aggregate SKIPS values that fail to parse (try_cast -> NULL, ignored by min/max/sum/avg), so a
+    # bound can pass while some source values were invalid. require_valid=TRUE (with cast) additionally FAILS
+    # if either side has a non-blank value that doesn't parse — same fail-closed intent as not_future/ordering.
+    if (isTRUE(chk$require_valid) && nzchar(chk$cast %||% "")) {
+      n_invalid <- function(spec) q1(con, sprintf(
+        "SELECT count(*) FROM %s WHERE %s",
+        fq(spec$source, spec$table),
+        and_filter(sprintf("%s IS NOT NULL AND trim(cast(%s AS string)) <> '' AND try_cast(%s AS %s) IS NULL",
+                           bt(spec$col), bt(spec$col), bt(spec$col), chk$cast), spec$filter)))
+      np <- n_invalid(chk$product); nr <- n_invalid(chk$raw)
+      if (np + nr > 0)
+        return(res(chk$label %||% sprintf("bound %s(%s) %s %s(raw)", agg, chk$product$col, op, agg), "bound",
+                   pass = FALSE, n_bad = np + nr,
+                   detail = sprintf("%s product + %s raw value(s) don't parse as %s (the aggregate would silently skip them)", fmi(np), fmi(nr), chk$cast)))
+    }
+    if (is.null(chk$by)) {                                          # global bound: agg over the whole (filtered) sources
+      pv <- q1(con, sprintf("SELECT %s(%s) FROM %s%s", agg, cst(bt(chk$product$col)), fq(chk$product$source, chk$product$table), whereof(chk$product$filter)))
+      rv <- q1(con, sprintf("SELECT %s(%s) FROM %s%s", agg, cst(bt(chk$raw$col)),     fq(chk$raw$source, chk$raw$table),         whereof(chk$raw$filter)))
+      if (is.na(pv) || is.na(rv))   # a NULL aggregate means no data to compare — not a pass, unless allow_empty
+        return(res(chk$label %||% sprintf("bound %s(%s) %s %s(raw)", agg, chk$product$col, op, agg), "bound",
+                   pass = isTRUE(chk$allow_empty), n_bad = if (isTRUE(chk$allow_empty)) 0 else 1,
+                   detail = sprintf("no data to evaluate: %s(product)=%s, %s(raw)=%s (set allow_empty=TRUE to pass)", agg, fmt2(pv), agg, fmt2(rv))))
+      ok <- switch(op, "<=" = pv <= rv, "<" = pv < rv, ">=" = pv >= rv, ">" = pv > rv, "==" = pv == rv)
+      res(chk$label %||% sprintf("bound %s(%s) %s %s(raw)", agg, chk$product$col, op, agg), "bound",
+          pass = ok, n_bad = if (ok) 0 else 1, detail = sprintf("%s(product)=%s %s %s(raw)=%s", agg, fmt2(pv), op, agg, fmt2(rv)))
+    } else {
+      # Per-key bound. FAIL-CLOSED by default: a key present on only one side, or with a NULL aggregate on
+      # either side, counts as a violation (via FULL OUTER JOIN), so an unmatched key can't silently pass.
+      # allow_unmatched=TRUE reverts to comparing only keys present-and-non-null on BOTH sides (inner join).
+      pk <- chk$product$key %||% chk$by; rk <- chk$raw$key %||% chk$by
+      jt   <- if (isTRUE(chk$allow_unmatched)) "JOIN" else "FULL OUTER JOIN"
+      viol <- if (isTRUE(chk$allow_unmatched)) sprintf("NOT (p.v %s r.v)", op)
+              else sprintf("p.v IS NULL OR r.v IS NULL OR NOT (p.v %s r.v)", op)
+      nbad <- q1(con, sprintf(
+        "SELECT count(*) FROM (SELECT %s AS k, %s(%s) AS v FROM %s%s GROUP BY %s) p %s (SELECT %s AS k, %s(%s) AS v FROM %s%s GROUP BY %s) r ON p.k = r.k WHERE %s",
+        bt(pk), agg, cst(bt(chk$product$col)), fq(chk$product$source, chk$product$table), whereof(chk$product$filter), bt(pk),
+        jt, bt(rk), agg, cst(bt(chk$raw$col)), fq(chk$raw$source, chk$raw$table),         whereof(chk$raw$filter), bt(rk), viol))
+      res(chk$label %||% sprintf("bound per-key %s(%s) %s %s(raw)", agg, chk$product$col, op, agg), "bound",
+          pass = nbad == 0, n_bad = nbad, detail = sprintf("%s keys unmatched or where %s(product) not %s %s(raw)", fmi(nbad), agg, op, agg))
+    }
+  },
+  join_check = function(chk, con) {
+    kind   <- toupper(chk$kind %||% "INNER")
+    expect <- chk$expect %||% "no_violation"
+    if (expect == "no_loss") {                                     # every left row must match (anti-join is offset-proof,
+      n_left <- q1(con, sprintf("SELECT count(*) FROM %s l", rel(chk$left)))   # unlike an inner-join row-count compare)
+      n_lost <- q1(con, sprintf("SELECT count(*) FROM %s l LEFT ANTI JOIN %s r ON %s", rel(chk$left), rel(chk$right), join_on(chk$by)))
+      res(chk$label %||% sprintf("join_check %s <- %s (no_loss)", chk$left$table, chk$right$table), "join_check",
+          pass = n_lost == 0, n_bad = n_lost, total = n_left,
+          detail = sprintf("%s of %s left rows have no match", fmi(n_lost), fmi(n_left)))
+    } else if (expect == "no_fanout") {                            # a LEFT JOIN never loses rows, so > left iff a left row matched >1 right
+      n_left <- q1(con, sprintf("SELECT count(*) FROM %s l", rel(chk$left)))
+      n_join <- q1(con, sprintf("SELECT count(*) FROM %s l LEFT JOIN %s r ON %s", rel(chk$left), rel(chk$right), join_on(chk$by)))
+      res(chk$label %||% sprintf("join_check %s <- %s (no_fanout)", chk$left$table, chk$right$table), "join_check",
+          pass = n_join == n_left, n_bad = max(0, n_join - n_left), total = n_left,
+          detail = sprintf("LEFT JOIN row count %s -> %s", fmi(n_left), fmi(n_join)))
+    } else {                                                        # predicate: no joined row may satisfy the violation predicate
+      # `predicate` is authored verbatim and this verb does NOT validate operand parseability: if it casts
+      # (e.g. try_cast(x AS date)), a non-null-but-unparseable value makes the predicate NULL and is NOT
+      # counted. Make the predicate catch that itself (OR try_cast(x AS date) IS NULL) when it matters.
+      joined <- sprintf("%s l %s JOIN %s r ON %s", rel(chk$left), kind, rel(chk$right), join_on(chk$by))
+      nbad <- q1(con, sprintf("SELECT count(*) FROM %s WHERE %s", joined, chk$predicate))
+      res(chk$label %||% sprintf("join_check %s <- %s", chk$left$table, chk$right$table), "join_check",
+          pass = nbad == 0, n_bad = nbad, detail = sprintf("%d joined rows violate the predicate", nbad))
+    }
+  },
+  expr = function(chk, con) {
+    # expr runs arbitrary R with the live connection in scope — expert-only, and not structurally read-only.
+    # A governed run can set QC_NO_EXPR=1 to reject every expr check instead of evaluating it.
+    if (nzchar(Sys.getenv("QC_NO_EXPR", "")))
+      return(res(chk$label %||% "expr", "expr", pass = FALSE,
+                 detail = "expr checks are disabled in this run (QC_NO_EXPR) — use declarative verbs"))
+    load_src <- function(source, table) as_tibble(DBI::dbGetQuery(con, sprintf("SELECT * FROM %s", fq(source, table))))
+    env <- list2env(list(con = con, fq = fq, load = load_src), parent = globalenv())
+    val <- eval(parse(text = chk$r), envir = env)
+    nbad <- suppressWarnings(as.numeric(val[1]))
+    res(chk$label %||% "expr", "expr", pass = !is.na(nbad) && nbad == 0, n_bad = nbad,
+        detail = sprintf("expression returned %s violation(s)", ifelse(is.na(nbad), "non-numeric", fmi(nbad))))
+  },
+  profile = function(chk, con) {
+    s  <- CFG$sources[[chk$source]]
+    # Catalog/schema are required in DBI mode (blank-required, so a mis-config can't silently profile the wrong
+    # schema); local source_mode reads files from DC_LOCAL_DIR + DC_TABLES and ignores catalog/schema, so don't
+    # force dummy values there — mirror the profiler, which only requires catalog/schema in DBI mode.
+    local_mode <- identical(tolower(chk$source_mode %||% ""), "local")
+    if (!local_mode && (is.null(s) || !nzchar(s$catalog %||% "") || !nzchar(s$schema %||% "")))
+      return(res(chk$label %||% sprintf("profile %s", chk$source), "profile", pass = FALSE,
+                 detail = sprintf("source '%s' is undefined or has a blank catalog/schema (DBI mode) — set CFG$sources$%s, or use source_mode='local'", chk$source, chk$source)))
+    od <- file.path(out_dir, sprintf("profile_%s", chk$source))
+    # system2(env=) ADDS to the child's inherited environment, it doesn't replace it — so a DC_* still
+    # exported in the parent shell (e.g. a hand DC_NEW_ONLY=1, or DC_DEFINE_ONLY=1) would leak into the child
+    # and change its mode/cut/baseline. Set EVERY DC_* the profiler reads explicitly (unset string -> empty
+    # so the profiler falls back to its own default; flags -> explicit 0/1), so the CFG fully determines the
+    # child run. Only DATABRICKS_DSN/PWD (credentials) are intentionally inherited.
+    # SHELL-SAFE: system2 prepends these env entries and appends args to a /bin/sh string WITHOUT quoting
+    # (only the command is shQuoted), so a value with a space (DC_MISSING_TOKENS="Unknown,Not documented"), a
+    # regex metachar (DC_CUT_REGEX="_(a|b)$") or a path with spaces would break the launch — shQuote each value.
+    kv <- function(name, x) sprintf("%s=%s", name, shQuote(if (is.null(x)) "" else as.character(x)))  # unset -> '' (child default)
+    fl <- function(x) if (isTRUE(x)) "1" else "0"                 # explicit boolean (never inherit)
+    env <- c(
+      kv("DC_CATALOG", s$catalog),          kv("DC_SCHEMA", s$schema),
+      kv("DC_CUT", chk$cut),                kv("DC_TABLES", chk$tables),
+      kv("DC_SAMPLE_N", chk$sample_n %||% "0"), kv("DC_SAMPLE_SEED", chk$sample_seed),
+      kv("DC_TOPN", chk$top_n),             kv("DC_NUMERIC_CAT_MAX", chk$numeric_cat_max),
+      kv("DC_SOURCE_MODE", chk$source_mode), kv("DC_LOCAL_DIR", chk$local_dir),
+      kv("DC_BASELINE_COLS", chk$baseline),  kv("DC_PRODUCT_ID", chk$product_id),
+      kv("DC_MISSING_TOKENS", chk$missing_tokens), kv("DC_KIND_OVERRIDES", chk$kind_overrides),
+      kv("DC_CUT_REGEX", chk$cut_regex),    kv("DC_CUT_FILTER_REGEX", chk$cut_filter_regex),
+      kv("DC_KNOWN_NEW_TABLES", chk$known_new_tables), kv("DC_KNOWN_NEW_COLS", chk$known_new_cols),
+      kv("DC_INVENTORY_ONLY", fl(chk$inventory_only)), kv("DC_NEW_ONLY", fl(chk$new_only)),
+      kv("DC_REQUIRE_BASELINE", fl(chk$require_baseline)),
+      kv("DC_DEFINE_ONLY", ""),                     # ensure the child actually RUNS even if the parent set the parse-only guard
+      kv("DC_OUT_DIR", od))
+    st <- system2("Rscript", shQuote(abspath(CFG$profiler_script)), env = env, stdout = FALSE, stderr = FALSE)
+    # A nonzero exit (Rscript missing, profiler error, bad path) is a FAILURE that must gate the run;
+    # a clean exit is informational (non-gating) success.
+    res(chk$label %||% sprintf("profile %s", chk$source), "profile",
+        pass = if (st == 0) NA else FALSE, n_bad = if (st == 0) NA else 1, info = st == 0,
+        detail = sprintf("data_profiler.R exit %d -> %s", st, od))
+  },
+  drift = function(chk, con) {
+    # Drift needs COMPLETE profiles: a profile_new_<cut>.tsv is a partial (new-columns-only) profile and
+    # would produce a bogus comparison, so reject it as a FAIL rather than silently drift a subset.
+    bad_in <- grep("profile_new", c(chk$old, chk$new), value = TRUE)
+    if (length(bad_in))
+      return(res(chk$label %||% "drift", "drift", pass = FALSE, n_bad = 1,
+                 detail = sprintf("partial profile input(s) %s — drift needs full profile_<cut>.tsv, not profile_new_*", paste(basename(bad_in), collapse = ", "))))
+    # Unique per-check output folder (from `out`, else a slug of the label) so several drift checks in one
+    # config don't overwrite each other's comparison in a single shared "drift" folder.
+    slug <- if (!is.null(chk$out)) chk$out
+            else if (!is.null(chk$label)) sprintf("drift_%s", gsub("[^a-z0-9]+", "_", tolower(chk$label)))
+            else "drift"
+    od <- file.path(out_dir, slug)
+    # Hermetic child env, same policy as the profile handler: system2(env=) ADDS to the inherited environment,
+    # so a CMP_* still exported in the parent shell would leak in. A leaked CMP_DEFINE_ONLY is the dangerous
+    # one — compare_snapshots.R quits status 0 the moment it sees it, WITHOUT reading a profile or writing a
+    # report, which would score an un-run drift as informational success. Leaked CMP_*_PTS/PCT/SMD would
+    # silently move the thresholds. Clear the guard, pass old/new as CLI args (also blank the CMP_OLD/NEW
+    # fallbacks), and pin every threshold from the check's CFG (unset -> "" so the child uses its own default).
+    # SHELL-SAFE like the profile handler: shQuote each env value and each path arg, since system2 doesn't
+    # quote them and CMP_OUT / the profile paths can contain spaces (e.g. a restricted-archive run folder).
+    kv <- function(name, x) sprintf("%s=%s", name, shQuote(if (is.null(x)) "" else as.character(x)))
+    env <- c(kv("CMP_OUT", od), kv("CMP_DEFINE_ONLY", ""), kv("CMP_OLD", ""), kv("CMP_NEW", ""),
+             kv("CMP_MISS_PTS", chk$miss_pts),   kv("CMP_ROWS_PCT", chk$rows_pct),
+             kv("CMP_DISTINCT_PCT", chk$distinct_pct), kv("CMP_SMD", chk$smd),
+             kv("CMP_CAT_PTS", chk$cat_pts),     kv("CMP_CAT_MIN", chk$cat_min))
+    st <- system2("Rscript", shQuote(c(abspath(CFG$compare_script), abspath(chk$old), abspath(chk$new))),
+                  env = env, stdout = FALSE, stderr = FALSE)
+    # A clean exit alone is not proof drift ran: confirm the report was actually written (guards against a
+    # child that exits 0 without comparing, e.g. a leaked parse-only guard that slipped past the clear above).
+    wrote <- file.exists(file.path(od, "snapshot_comparison.html"))
+    ok <- st == 0 && wrote
+    res(chk$label %||% "drift", "drift",
+        pass = if (ok) NA else FALSE, n_bad = if (ok) NA else 1, info = ok,
+        detail = if (ok) sprintf("compare_snapshots.R exit 0 -> %s", od)
+                 else if (st == 0) sprintf("compare_snapshots.R exit 0 but wrote no report to %s (drift did not run)", od)
+                 else sprintf("compare_snapshots.R exit %d -> %s", st, od))
+  }
+)
+
+# A check still carrying a "<...>" placeholder table name (e.g. an example copied from CFG$examples but
+# not yet edited) is a template, not a runnable check — skip it as an info row instead of erroring.
+# `$table` is only read from a relation-spec LIST: for derive_equals, chk$product is the product COLUMN
+# (a string), so a bare chk$product$table would error ("$ invalid for atomic vectors") and abort the run.
+table_names_of <- function(chk) {
+  sub_table <- function(x) if (is.list(x)) x$table else NULL
+  c(chk$table, chk$product_table, sub_table(chk$left), sub_table(chk$right),
+    sub_table(chk$compare), sub_table(chk$product), sub_table(chk$raw))
+}
+has_placeholder <- function(chk) { tn <- table_names_of(chk); length(tn) > 0 && any(grepl("[<>]", tn)) }
+
+# ---- run every check (queries execute here, once) ----
+run_checks <- function() {
+  # Lazy connection: only open the DB when a check actually needs it, so a drift/profile-only run (which
+  # shells out to child scripts) — or a config that's all placeholder templates — needs no DB credentials.
+  cst <- new.env(); cst$tried <- FALSE; cst$val <- NULL
+  conn <- function() { if (!cst$tried) { cst$tried <- TRUE; cst$val <- tryCatch(get_con(), error = function(e) e) }; cst$val }
+  lapply(CFG$checks, function(chk) {
+    h <- handlers[[chk$type]]
+    if (is.null(h)) return(res(chk$label %||% chk$type, chk$type, pass = FALSE,
+                               detail = sprintf("unknown check type '%s'", chk$type)))
+    if (has_placeholder(chk))
+      return(res(chk$label %||% chk$type, chk$type, info = TRUE,
+                 detail = "template check — replace the placeholder <...> table name(s) in CFG before running"))
+    needs_db <- !chk$type %in% c("profile", "drift")   # profile/drift shell out to child scripts; they don't use `con`
+    con <- if (needs_db) conn() else NULL
+    if (needs_db && inherits(con, "error"))
+      return(res(chk$label %||% chk$type, chk$type, pass = FALSE, detail = paste("no connection:", conditionMessage(con))))
+    tryCatch(h(chk, con), error = function(e)
+      res(chk$label %||% chk$type, chk$type, pass = FALSE, detail = paste("error:", conditionMessage(e))))
+  })
+}
+
+# ---- report ----
+esc <- function(x) { x <- as.character(x); x <- gsub("&","&amp;",x,fixed=TRUE)
+  x <- gsub("<","&lt;",x,fixed=TRUE); gsub(">","&gt;",x,fixed=TRUE) }
+status_of <- function(r) if (isTRUE(r$info)) "info" else if (isTRUE(r$pass)) "pass" else "FAIL"
+render <- function(results, gen_time) {
+  npass <- sum(vapply(results, function(r) isTRUE(r$pass), logical(1)))
+  nfail <- sum(vapply(results, function(r) !isTRUE(r$info) && !isTRUE(r$pass), logical(1)))
+  ninfo <- sum(vapply(results, function(r) isTRUE(r$info), logical(1)))
+  # Resolved source provenance in the report, so an archived HTML says which catalog.schema each end used.
+  src_txt <- paste(vapply(names(CFG$sources), function(nm) { s <- CFG$sources[[nm]]
+    sprintf("%s=%s.%s", nm, s$catalog %||% "?", if (nzchar(s$schema %||% "")) s$schema else "?") }, character(1)), collapse = " · ")
+  ordr  <- order(vapply(results, function(r) if (status_of(r)=="FAIL") 0L else if (status_of(r)=="info") 2L else 1L, integer(1)))
+  rows_html <- vapply(results[ordr], function(r) sprintf(
+    "<tr class='%s'><td>%s</td><td>%s</td><td>%s</td><td class='det'>%s%s</td></tr>",
+    tolower(status_of(r)), esc(status_of(r)), esc(r$type), esc(r$label), esc(r$detail),
+    if (nzchar(r$sample)) sprintf(" <span class='samp'>[%s]</span>", esc(r$sample)) else ""), character(1))
+  html <- paste0(
+    "<!doctype html><html><head><meta charset='utf-8'><title>QC report</title><style>",
+    "body{font:14px/1.5 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#1a1a1a;margin:0;padding:32px;max-width:1100px}",
+    "h1{font-size:22px;margin:0 0 4px}.sub{color:#666;margin:0 0 16px}",
+    "table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:6px 10px;border-bottom:1px solid #eee;vertical-align:top}",
+    "th{font-size:12px;text-transform:uppercase;letter-spacing:.03em;color:#555;background:#fafafa}",
+    ".det{font-size:13px;color:#333}.samp{color:#b45309}",
+    "tr.fail td:first-child{color:#b91c1c;font-weight:600}tr.pass td:first-child{color:#15803d}tr.info td:first-child{color:#666}</style></head><body>",
+    "<h1>QC report</h1><p class='sub'>", sprintf("%d passed &middot; %d failed &middot; %d info &middot; generated %s<br>sources: %s", npass, nfail, ninfo, esc(gen_time), esc(src_txt)),
+    "</p><table><thead><tr><th>status</th><th>type</th><th>check</th><th>detail</th></tr></thead><tbody>",
+    paste(rows_html, collapse = "\n"), "</tbody></table></body></html>")
+  md <- c(sprintf("# QC report\n\n%d passed · %d failed · %d info — generated %s\n\nsources: %s\n", npass, nfail, ninfo, gen_time, src_txt),
+    "| status | type | check | detail |", "|---|---|---|---|",
+    vapply(results[ordr], function(r) sprintf("| %s | %s | %s | %s%s |", status_of(r), r$type, r$label,
+      gsub("|","\\|", r$detail, fixed = TRUE), if (nzchar(r$sample)) sprintf(" [%s]", gsub("|","\\|", r$sample, fixed=TRUE)) else ""), character(1)))
+  list(html = html, md = paste(md, collapse = "\n"), npass = npass, nfail = nfail, ninfo = ninfo)
+}
+
+# ---- drive: report + exit code (Rscript), and register testthat cases when under a test runner ----
+# Both outputs from one file: always writes the HTML/md report; registers a test_that() per check so
+# testthat::test_file() collects them; exits non-zero on failure under Rscript (but never quits a
+# testthat run). QC_DEFINE_ONLY=1 defines everything without connecting — a credential-free parse check.
+run_all <- function() {
+  results  <- run_checks()
+  has_tt   <- requireNamespace("testthat", quietly = TRUE)
+  under_tt <- has_tt && isTRUE(tryCatch(testthat::is_testing(), error = function(e) FALSE))
+  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+  # No runnable assertion (only info/placeholder/empty results) is a failure unless explicitly allowed —
+  # otherwise a mis-wired config would exit 0 without checking anything. Add the failure as a real result row
+  # BEFORE rendering, so the report itself shows it (counts, exit code, and testthat then all stay aligned).
+  allow_info_only <- tolower(getcfg("QC_ALLOW_INFO_ONLY", as.character(isTRUE(CFG$allow_info_only)))) %in% c("true","1","yes","t")
+  n_assert <- sum(vapply(results, function(r) !isTRUE(r$info), logical(1)))
+  if (n_assert == 0 && !allow_info_only)
+    results <- c(results, list(res("qc_runner ran at least one assertion", "meta", pass = FALSE, n_bad = 1,
+      detail = "no runnable pass/fail assertion ran (only info/placeholder/empty) — set QC_ALLOW_INFO_ONLY=1 to allow")))
+  rep <- render(results, format(Sys.time(), "%Y-%m-%d %H:%M"))
+  writeLines(rep$html, file.path(out_dir, "qc_report.html"))
+  writeLines(rep$md,   file.path(out_dir, "qc_report.md"))
+  message(sprintf("QC: %d passed, %d failed, %d info -> %s", rep$npass, rep$nfail, rep$ninfo,
+                  file.path(out_dir, "qc_report.html")))
+  if (has_tt) for (r in results) if (!isTRUE(r$info))
+    testthat::test_that(r$label, testthat::expect_true(isTRUE(r$pass), info = r$detail))
+  if (!under_tt) quit(save = "no", status = if (rep$nfail == 0) 0L else 1L)
+  invisible(results)
+}
+if (!nzchar(Sys.getenv("QC_DEFINE_ONLY"))) run_all()
+#==FILE==# compare_snapshots.R
+# Snapshot comparison — diff two profile_<cut>.tsv files (from data_profiler.R) into a data-level
+# drift report: what changed between an OLD and a NEW snapshot, beyond just added/dropped columns.
+# Standalone, tumor/product-agnostic. tidyverse/dplyr, no Spark, no Databricks — it only reads the
+# two metrics files the profiler already wrote, so it never re-queries and never overwrites them.
+#
+# TO RUN: point it at the two profiles (edit CFG, or pass them as arguments):
+#   Rscript compare_snapshots.R outputs/2026m03/profile_2026m03.tsv outputs/2026m06/profile_2026m06.tsv
+# Every CFG value is also overridable by its CMP_* env var (env wins).
+#
+# What it reports, per column present in both snapshots:
+#   - missingness drift as a RATE (pct_missing), with n_rows / n_missing shown so a shift can be
+#     traced to numerator vs denominator (missingness counts alone aren't comparable across drops);
+#   - continuous drift via SMD = (mean_new - mean_old) / pooled_sd (the standard "Table 1" effect
+#     size; |SMD|<0.1 ~ negligible), plus per-quantile shifts for shape/tails;
+#   - categorical drift: top values that entered/left the top list or shifted share;
+#   - cardinality drift (distinct per non-missing, so it isn't just an artifact of more rows);
+#   - kind/type changes; and added/dropped tables & columns (schema diff).
+# Flags are magnitude-based CANDIDATES to review — clinical significance is a human judgment.
+
+library(dplyr); library(stringr)
+
+# ============================ CONFIG — edit these, then run ============================
+CFG <- list(
+  old = "",       # path to the OLD snapshot's profile_<cut>.tsv   (or 1st CLI arg / CMP_OLD)
+  new = "",       # path to the NEW snapshot's profile_<cut>.tsv   (or 2nd CLI arg / CMP_NEW)
+  out_dir = "",   # where the report is written; "" = ./outputs next to this script   (CMP_OUT)
+  # -- flag thresholds: what counts as a shift worth reviewing --
+  miss_pts     = 5,     # flag |Δ % missing| >= this many percentage points        (CMP_MISS_PTS)
+  rows_pct     = 10,    # note |Δ table row count| >= this %                        (CMP_ROWS_PCT)
+  distinct_pct = 20,    # flag |Δ distinct-per-non-missing| >= this %               (CMP_DISTINCT_PCT)
+  smd          = 0.10,  # flag continuous |SMD| >= this                             (CMP_SMD)
+  cat_pts      = 10,    # flag categorical |Δ share| >= this many points, or a top  (CMP_CAT_PTS)
+                        #   value entering/leaving the top list
+  cat_min      = 1      # ignore categories below this % share                      (CMP_CAT_MIN)
+)
+# ======================================================================================
+
+getcfg  <- function(env, default) { v <- Sys.getenv(env, ""); if (nzchar(v)) v else default }
+getcfgn <- function(env, default) { v <- Sys.getenv(env, ""); if (nzchar(v)) as.numeric(v) else as.numeric(default) }
+args <- commandArgs(trailingOnly = TRUE)
+old_path <- if (length(args) >= 1) args[1] else getcfg("CMP_OLD", CFG$old)
+new_path <- if (length(args) >= 2) args[2] else getcfg("CMP_NEW", CFG$new)
+miss_pts     <- getcfgn("CMP_MISS_PTS",     CFG$miss_pts)
+rows_pct     <- getcfgn("CMP_ROWS_PCT",     CFG$rows_pct)
+distinct_pct <- getcfgn("CMP_DISTINCT_PCT", CFG$distinct_pct)
+smd_thresh   <- getcfgn("CMP_SMD",          CFG$smd)
+cat_pts      <- getcfgn("CMP_CAT_PTS",      CFG$cat_pts)
+cat_min      <- getcfgn("CMP_CAT_MIN",      CFG$cat_min)
+
+this_dir <- tryCatch(dirname(sub("^--file=", "", grep("^--file=", commandArgs(FALSE), value = TRUE))),
+                     error = function(e) ".")
+if (!length(this_dir) || this_dir == "") this_dir <- "."
+out_dir <- { v <- getcfg("CMP_OUT", CFG$out_dir); if (nzchar(v)) v else file.path(this_dir, "outputs") }
+
+# ---- read ----
+NUM_COLS <- c("n_rows","n_rows_total","n_nonmissing","n_missing","pct_missing","distinct",
+              "mean","sd","min","p1","p5","p10","p25","p50","p75","p90","p95","p99","max","unparseable")
+read_profile <- function(path, label) {
+  if (!nzchar(path)) stop(sprintf("%s profile path is empty — set it in CFG, CMP_%s, or as a CLI arg.",
+                                  label, toupper(label)))
+  if (!file.exists(path)) stop(sprintf("%s profile not found: %s", label, path))
+  df <- utils::read.delim(path, sep = "\t", quote = "", na.strings = "",
+                          stringsAsFactors = FALSE, check.names = FALSE, colClasses = "character")
+  need <- c("table_base","column","kind")
+  if (!all(need %in% names(df)))
+    stop(sprintf("%s (%s) doesn't look like a profile_<cut>.tsv — missing %s",
+                 label, path, paste(setdiff(need, names(df)), collapse = ", ")))
+  for (c in intersect(NUM_COLS, names(df))) df[[c]] <- suppressWarnings(as.numeric(df[[c]]))
+  as_tibble(df)
+}
+# CMP_DEFINE_ONLY: syntax/parse check only. The interpreter has already parsed the whole file by now
+# (a syntax error anywhere would have failed before this line), so quit before touching any input file.
+if (nzchar(Sys.getenv("CMP_DEFINE_ONLY"))) { message("CMP_DEFINE_ONLY: parsed OK"); quit(save = "no", status = 0L) }
+old <- read_profile(old_path, "old")
+new <- read_profile(new_path, "new")
+samp_note <- {
+  os <- "sampled" %in% names(old) && any(toupper(as.character(old$sampled)) == "TRUE")
+  ns <- "sampled" %in% names(new) && any(toupper(as.character(new$sampled)) == "TRUE")
+  if (os || ns) sprintf("%s%s%s profiled from a sample — a flagged difference may be sampling variation; re-run the profiler with DC_SAMPLE_N=0 for exact metrics.",
+    if (os) "OLD" else "", if (os && ns) " and " else "", if (ns) "NEW" else "") else ""
+}
+
+# ---- schema diff ----
+o_tbls <- unique(old$table_base); n_tbls <- unique(new$table_base)
+added_tbls   <- sort(setdiff(n_tbls, o_tbls))
+dropped_tbls <- sort(setdiff(o_tbls, n_tbls))
+o_keys <- paste(old$table_base, old$column, sep = "|")
+n_keys <- paste(new$table_base, new$column, sep = "|")
+added_cols   <- sort(n_keys[!(n_keys %in% o_keys)])
+dropped_cols <- sort(o_keys[!(o_keys %in% n_keys)])
+
+# ---- per-column deltas (columns present in both) ----
+j <- inner_join(old, new, by = c("table_base","column"), suffix = c(".o",".n"))
+j <- j %>% mutate(
+  colname   = paste(table_base, column, sep = "."),
+  d_miss    = pct_missing.n - pct_missing.o,
+  ratio.o   = distinct.o / pmax(1, n_nonmissing.o),
+  ratio.n   = distinct.n / pmax(1, n_nonmissing.n),
+  d_distinct_rel    = ifelse(ratio.o > 0, abs(ratio.n - ratio.o) / ratio.o, NA_real_),  # magnitude -> flag
+  d_distinct_signed = ifelse(ratio.o > 0, (ratio.n - ratio.o) / ratio.o, NA_real_),     # signed  -> display
+  pooled_sd = sqrt((sd.o^2 + sd.n^2) / 2),
+  smd       = ifelse(is.na(pooled_sd) | pooled_sd == 0, NA_real_, (mean.n - mean.o) / pooled_sd),
+  # Shape/tail drift the mean-based SMD misses: max standardized shift across p10..p90 (an unchanged
+  # mean can still hide a fatter tail). Same pooled-SD denominator as SMD, so it reads in the same units.
+  q_shift_max = ifelse(is.na(pooled_sd) | pooled_sd == 0, NA_real_,   # suppress the all-NA pmax warning on categorical rows (result discarded by the ifelse)
+                suppressWarnings(pmax(abs(p5.n - p5.o), abs(p10.n - p10.o), abs(p25.n - p25.o), abs(p50.n - p50.o),
+                     abs(p75.n - p75.o), abs(p90.n - p90.o), abs(p95.n - p95.o), na.rm = TRUE)) / pooled_sd),
+  kind_change     = kind.o != kind.n,
+  date_min_change = kind.o == "date" & kind.n == "date" &
+                    (coalesce(date_min.o, "") != coalesce(date_min.n, "")),
+  d_unparse        = coalesce(unparseable.n, 0) - coalesce(unparseable.o, 0),
+  unparse_up       = coalesce(unparseable.n, 0) > coalesce(unparseable.o, 0),   # more parse failures = QA regression
+  date_max_regress = kind.o == "date" & kind.n == "date" & !is.na(date_max.o) & !is.na(date_max.n) &
+                     (date_max.n < date_max.o),   # max moved backwards = truncated history (an advance is expected, not flagged)
+  type_change      = type.o != type.n & kind.o == kind.n,   # same-kind storage change (e.g. integer -> double)
+  const_shift      = kind.o == "numeric" & kind.n == "numeric" & is.na(smd) &
+                     !is.na(mean.o) & !is.na(mean.n) & (mean.o != mean.n))  # zero-variance column whose value moved (SMD undefined)
+
+# Categorical drift: parse "count:value|..." into per-value shares and compare the two snapshots.
+parse_topv <- function(s, nn) {
+  if (is.na(s) || !nzchar(s) || is.na(nn) || nn <= 0) return(setNames(numeric(0), character(0)))
+  items <- str_split(s, "\\|")[[1]]
+  cnts  <- suppressWarnings(as.numeric(sub(":.*$", "", items)))   # count = before the first ':'
+  vals  <- sub("^[0-9]+:", "", items)                            # value = after the first ':'
+  ok <- !is.na(cnts) & nzchar(vals)
+  setNames(100 * cnts[ok] / nn, vals[ok])
+}
+cat_compare <- function(tv_o, nn_o, tv_n, nn_n) {
+  so <- parse_topv(tv_o, nn_o); sn <- parse_topv(tv_n, nn_n)
+  msgs <- character(0)
+  for (v in union(names(so), names(sn))) {
+    a <- if (v %in% names(so)) so[[v]] else NA_real_
+    b <- if (v %in% names(sn)) sn[[v]] else NA_real_
+    if (is.na(a)) { if (!is.na(b) && b >= cat_min) msgs <- c(msgs, sprintf("+%s (%.0f%%)", v, b)) }
+    else if (is.na(b)) { if (a >= cat_min) msgs <- c(msgs, sprintf("-%s (%.0f%%)", v, a)) }
+    else if (abs(b - a) >= cat_pts) msgs <- c(msgs, sprintf("%s %.0f%%->%.0f%%", v, a, b))
+  }
+  list(flag = length(msgs) > 0, desc = paste(msgs, collapse = "; "))
+}
+cat_flag <- rep(FALSE, nrow(j)); cat_desc <- rep("", nrow(j))
+is_cat <- j$kind.o == "categorical" & j$kind.n == "categorical"
+for (i in which(is_cat)) {
+  cc <- cat_compare(j$top_values.o[i], j$n_nonmissing.o[i], j$top_values.n[i], j$n_nonmissing.n[i])
+  cat_flag[i] <- cc$flag; cat_desc[i] <- cc$desc
+}
+j$cat_flag <- cat_flag; j$cat_desc <- cat_desc
+
+j <- j %>% mutate(
+  flag_miss     = !is.na(d_miss) & abs(d_miss) >= miss_pts,
+  flag_smd      = !is.na(smd) & abs(smd) >= smd_thresh,
+  flag_quantile = !is.na(q_shift_max) & q_shift_max >= smd_thresh,
+  flag_distinct = !is.na(d_distinct_rel) & d_distinct_rel >= distinct_pct / 100,
+  flag_kind     = kind_change,
+  flag_type     = type_change,
+  flag_const    = const_shift,
+  flag_date     = date_min_change | unparse_up | date_max_regress,
+  any_flag      = flag_miss | flag_smd | flag_quantile | flag_distinct | flag_kind | flag_type | flag_const | flag_date | cat_flag)
+
+# Table-level row-count change ("change in numbers"): n_rows_total is constant within a table.
+tbl_rows <- j %>% group_by(table_base) %>%
+  summarise(rows_o = dplyr::first(n_rows_total.o), rows_n = dplyr::first(n_rows_total.n), .groups = "drop") %>%
+  mutate(d_rel = ifelse(rows_o > 0, 100 * (rows_n - rows_o) / rows_o, NA_real_),
+         flag  = !is.na(d_rel) & abs(d_rel) >= rows_pct) %>%
+  arrange(desc(abs(d_rel)))
+
+# ---- assemble the flagged rows (what changed, most-shifted first) ----
+fmtn <- function(v) ifelse(is.na(v), "", ifelse(abs(v - round(v)) < 1e-9,
+                    formatC(v, format = "f", digits = 0, big.mark = ","), formatC(v, format = "f", digits = 2, big.mark = ",")))
+note_for <- function(r) {
+  m <- character(0)
+  if (r$flag_kind)  m <- c(m, sprintf("kind %s->%s", r$kind.o, r$kind.n))
+  if (isTRUE(r$flag_type))  m <- c(m, sprintf("type %s->%s", r$type.o, r$type.n))
+  if (isTRUE(r$flag_const)) m <- c(m, sprintf("constant value %s->%s", fmtn(r$mean.o), fmtn(r$mean.n)))
+  if (r$flag_miss)  m <- c(m, sprintf("missing %.1f%%->%.1f%% (%+.1fpt)", r$pct_missing.o, r$pct_missing.n, r$d_miss))
+  if (r$flag_smd)   m <- c(m, sprintf("SMD %+.2f (mean %s->%s)", r$smd, fmtn(r$mean.o), fmtn(r$mean.n)))
+  if (isTRUE(r$flag_quantile) || isTRUE(r$flag_smd))
+    m <- c(m, sprintf("quantiles p25/p50/p75: %s->%s / %s->%s / %s->%s (max shift %.2f SD)",
+      fmtn(r$p25.o), fmtn(r$p25.n), fmtn(r$p50.o), fmtn(r$p50.n), fmtn(r$p75.o), fmtn(r$p75.n), r$q_shift_max))
+  if (r$flag_distinct) m <- c(m, sprintf("distinct/nonmiss %+.0f%%", 100 * r$d_distinct_signed))
+  if (r$flag_date) m <- c(m, sprintf("date range %s..%s -> %s..%s%s",
+    coalesce(r$date_min.o, "n/a"), coalesce(r$date_max.o, "n/a"),
+    coalesce(r$date_min.n, "n/a"), coalesce(r$date_max.n, "n/a"),
+    if (isTRUE(r$unparse_up)) sprintf("; unparseable %s->%s", fmtn(coalesce(r$unparseable.o, 0)), fmtn(coalesce(r$unparseable.n, 0))) else ""))
+  if (nzchar(r$cat_desc)) m <- c(m, sprintf("categories: %s", r$cat_desc))
+  paste(m, collapse = " | ")
+}
+flagged <- j %>% filter(any_flag) %>%
+  arrange(desc(abs(coalesce(smd, 0)) + coalesce(q_shift_max, 0) + abs(coalesce(d_miss, 0)) / 10 + flag_kind * 100))
+flag_rows <- if (nrow(flagged)) lapply(seq_len(nrow(flagged)), function(i) {
+  r <- flagged[i, ]
+  list(col = r$colname, kind = r$kind.n,
+       miss = sprintf("%.1f%% -> %.1f%%", r$pct_missing.o, r$pct_missing.n),
+       n = sprintf("%s -> %s", fmtn(r$n_rows.o), fmtn(r$n_rows.n)),
+       note = note_for(r))
+}) else list()
+
+# ---- render ----
+esc <- function(x) { x <- as.character(x); x <- gsub("&","&amp;",x,fixed=TRUE)
+  x <- gsub("<","&lt;",x,fixed=TRUE); gsub(">","&gt;",x,fixed=TRUE) }
+li  <- function(v) if (length(v)) esc(paste(v, collapse = ", ")) else "&mdash;"
+gen_time <- format(Sys.time(), "%Y-%m-%d %H:%M")
+sub_txt  <- sprintf("old: %s  |  new: %s  |  generated %s", basename(old_path), basename(new_path), gen_time)
+thr_txt  <- sprintf("Flag thresholds: missing >=%gpt, SMD >=%g, distinct >=%g%%, category share >=%gpt (>=%g%% share), row count >=%g%%.",
+                    miss_pts, smd_thresh, distinct_pct, cat_pts, cat_min, rows_pct)
+
+render_html <- function() {
+  frows <- paste(vapply(flag_rows, function(r) sprintf(
+    "<tr><td>%s</td><td>%s</td><td>%s</td><td class='num'>%s</td><td class='note'>%s</td></tr>",
+    esc(r$col), esc(r$kind), esc(r$miss), esc(r$n), esc(r$note)), character(1)), collapse = "\n")
+  trows <- if (nrow(tbl_rows)) paste(apply(tbl_rows, 1, function(t) sprintf(
+    "<tr><td>%s</td><td class='num'>%s</td><td class='num'>%s</td><td class='num'>%s%%%s</td></tr>",
+    esc(t[["table_base"]]), esc(fmtn(as.numeric(t[["rows_o"]]))), esc(fmtn(as.numeric(t[["rows_n"]]))),
+    esc(sprintf("%+.1f", as.numeric(t[["d_rel"]]))),
+    if (as.logical(t[["flag"]])) " &#9888;" else "")), collapse = "\n") else ""
+  paste0(
+    "<!doctype html><html><head><meta charset='utf-8'><title>Snapshot comparison</title><style>",
+    "body{font:14px/1.5 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#1a1a1a;margin:0;padding:32px;max-width:1100px}",
+    "h1{font-size:22px;margin:0 0 4px}h2{font-size:17px;margin:28px 0 6px;border-top:1px solid #e5e5e5;padding-top:18px}",
+    ".sub{color:#666;margin:0 0 4px}.caveat{color:#b45309;font-size:12px;margin:6px 0 14px}",
+    ".changes{background:#f6f8fa;border:1px solid #e5e5e5;border-radius:8px;padding:8px 18px;margin:8px 0}",
+    ".changes li{margin:3px 0}table{border-collapse:collapse;width:100%;margin:6px 0}",
+    "th,td{text-align:left;padding:6px 10px;border-bottom:1px solid #eee;vertical-align:top}",
+    "th{font-size:12px;text-transform:uppercase;letter-spacing:.03em;color:#555;background:#fafafa}",
+    "td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}.note{font-size:13px;color:#333}</style></head><body>",
+    "<h1>Snapshot comparison</h1><p class='sub'>", esc(sub_txt), "</p>",
+    if (nzchar(samp_note)) sprintf("<p class='caveat'>%s</p>", esc(samp_note)) else "",
+    "<p class='caveat'>Flags are magnitude-based candidates to review — clinical significance is a human judgment. ",
+    esc(thr_txt), "</p>",
+    "<div class='changes'><h2>Schema changes</h2><ul>",
+    sprintf("<li><b>Added tables (%d):</b> %s</li>", length(added_tbls), li(added_tbls)),
+    sprintf("<li><b>Dropped tables (%d):</b> %s</li>", length(dropped_tbls), li(dropped_tbls)),
+    sprintf("<li><b>Added columns (%d):</b> %s</li>", length(added_cols), li(added_cols)),
+    sprintf("<li><b>Dropped columns (%d):</b> %s</li>", length(dropped_cols), li(dropped_cols)),
+    "</ul></div>",
+    "<h2>Row counts by table</h2><table><thead><tr><th>table</th><th class='num'>old rows</th>",
+    "<th class='num'>new rows</th><th class='num'>&Delta;%</th></tr></thead><tbody>", trows, "</tbody></table>",
+    sprintf("<h2>Flagged shifts (%d of %d shared columns)</h2>", length(flag_rows), nrow(j)),
+    if (length(flag_rows))
+      paste0("<table><thead><tr><th>table.column</th><th>kind</th><th>missing (old&rarr;new)</th>",
+             "<th class='num'>n (old&rarr;new)</th><th>what changed</th></tr></thead><tbody>", frows, "</tbody></table>")
+    else "<p>No column crossed a flag threshold.</p>",
+    "</body></html>")
+}
+render_md <- function() {
+  c(sprintf("# Snapshot comparison\n\n%s\n%s\n_%s_\n\n_%s_\n", sub_txt,
+            if (nzchar(samp_note)) sprintf("\n**%s**\n", samp_note) else "",
+            "Flags are magnitude-based candidates to review — clinical significance is a human judgment.", thr_txt),
+    "## Schema changes\n",
+    sprintf("- **Added tables (%d):** %s", length(added_tbls), if (length(added_tbls)) paste(added_tbls, collapse=", ") else "—"),
+    sprintf("- **Dropped tables (%d):** %s", length(dropped_tbls), if (length(dropped_tbls)) paste(dropped_tbls, collapse=", ") else "—"),
+    sprintf("- **Added columns (%d):** %s", length(added_cols), if (length(added_cols)) paste(added_cols, collapse=", ") else "—"),
+    sprintf("- **Dropped columns (%d):** %s", length(dropped_cols), if (length(dropped_cols)) paste(dropped_cols, collapse=", ") else "—"),
+    "\n## Row counts by table\n", "| table | old rows | new rows | Δ% |", "|---|---:|---:|---:|",
+    if (nrow(tbl_rows)) apply(tbl_rows, 1, function(t) sprintf("| %s | %s | %s | %+.1f%%%s |", t[["table_base"]],
+      fmtn(as.numeric(t[["rows_o"]])), fmtn(as.numeric(t[["rows_n"]])), as.numeric(t[["d_rel"]]),
+      if (as.logical(t[["flag"]])) " ⚠" else "")) else character(0),
+    sprintf("\n## Flagged shifts (%d of %d shared columns)\n", length(flag_rows), nrow(j)),
+    if (length(flag_rows)) c("| table.column | kind | missing (old→new) | n (old→new) | what changed |",
+                             "|---|---|---|---:|---|",
+      vapply(flag_rows, function(r) sprintf("| %s | %s | %s | %s | %s |", r$col, r$kind, r$miss, r$n,
+             gsub("|","\\|", r$note, fixed = TRUE)), character(1)))
+    else "_No column crossed a flag threshold._")
+}
+
+run <- function() {
+  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+  html <- file.path(out_dir, "snapshot_comparison.html")
+  md   <- file.path(out_dir, "snapshot_comparison.md")
+  writeLines(render_html(), html)
+  writeLines(paste(render_md(), collapse = "\n"), md)
+  message(sprintf("compared %d shared columns; %d flagged. wrote %s",
+                  nrow(j), length(flag_rows), html))
+  invisible(list(flagged = flagged, tbl_rows = tbl_rows))
+}
+if (!nzchar(Sys.getenv("CMP_DEFINE_ONLY"))) run()
+#==FILE==# oc_exploration.R
+# OC Panoramic exploration — LOT and platinum items. Builds one report (HTML + md)
+# of patient counts by treatment setting, lines of therapy, and platinum use.
+# tidyverse/dplyr over ODBC, no Spark.
+#   DATABRICKS_DSN=RWDE DATABRICKS_PWD=... Rscript oc_exploration.R
+# Lines are built from the non-maintenance drug episodes. Two items need columns that the
+# profiler surfaces first — recurrence date (2e) and the Panoramic platinum-status table
+# (3b/3c); set them below (or via env). If absent, those items are marked pending, not run.
+
+library(dplyr); library(tidyr); library(stringr)
+
+# ---- config ----
+catalog         <- Sys.getenv("OC_CATALOG", "hive_metastore")
+schema          <- Sys.getenv("OC_SCHEMA",  "clnprw_flatiron_pano_ovar_use")
+drugepisode_tbl <- Sys.getenv("OC_DRUGEP",  "t_drugepisode_2026m06")
+platinum_drugs  <- "carboplatin|cisplatin|oxaliplatin"     # platinum drugs
+settings_keep   <- c("Neoadjuvant", "Adjuvant", "Advanced")
+
+# Expected column names for items 2e / 3b / 3c. Two live caveats: recurrence date can lag
+# the data dictionary (confirm it is delivered and check its null rate on the first feed);
+# the platinum table has one row per platinum-containing line, values Sensitive / Resistant
+# / Refractory / null, so a non-platinum line has no row.
+recur_tbl   <- Sys.getenv("OC_RECUR_TBL",   "t_enh_ov_2026m06")
+recur_col   <- Sys.getenv("OC_RECUR_COL",   "recurrencedate")
+plat_tbl    <- Sys.getenv("OC_PLAT_TBL",    "t_enh_ov_platstatus_2026m06")
+plat_line   <- Sys.getenv("OC_PLAT_LINE",   "linenumber")
+plat_status <- Sys.getenv("OC_PLAT_STATUS", "platinumstatus")
+
+this_dir <- tryCatch(dirname(sub("^--file=", "", grep("^--file=", commandArgs(FALSE), value = TRUE))),
+                     error = function(e) ".")
+if (!length(this_dir) || this_dir == "") this_dir <- "."
+out_dir <- Sys.getenv("OC_OUT_DIR", file.path(this_dir, "outputs"))
+
+is_nonmaint <- function(x) str_to_lower(str_trim(as.character(x))) %in% c("false","f","n","no","0")
+# Live linesetting is uppercase (ADVANCED/ADJUVANT/NEOADJUVANT); make it title case
+# so comparisons don't depend on the feed's casing. Vectorized (used per episode).
+canon_setting <- function(x) { s <- str_squish(as.character(x))
+  ifelse(is.na(s) | s == "", NA_character_, str_to_title(s)) }
+# The drugs actually given in a segment, as a sorted set, from the episode-level drug names.
+# Splits combined names and de-duplicates, so order and repeats don't matter ("Carbo, Pac" ==
+# "Pac + Carbo"). Takes all of a segment's drug names at once and returns one "a|b" string.
+drug_set <- function(v) {
+  toks <- unlist(str_split(str_squish(str_to_lower(as.character(v))), "\\s*[,/+;&|]\\s*"))
+  toks <- toks[!is.na(toks) & toks != ""]
+  paste(sort(unique(toks)), collapse = "|") }
+
+# ---- connection ----
+get_con <- function() {
+  if (exists("con", envir = .GlobalEnv)) return(get("con", envir = .GlobalEnv))
+  pwd <- Sys.getenv("DATABRICKS_PWD", "")
+  if (!nzchar(pwd)) stop("set DATABRICKS_PWD, or provide a DBI `con`.")
+  DBI::dbConnect(odbc::odbc(), dsn = Sys.getenv("DATABRICKS_DSN", "RWDE"),
+                 pwd = pwd, timeout = 120, bigint = "numeric")
+}
+fqtn <- function(tbl) paste(c(catalog, schema, tbl), collapse = ".")
+load_tbl <- function(con, tbl, cols = NULL) {
+  sel <- if (is.null(cols)) "*" else paste(cols, collapse = ", ")
+  df <- as_tibble(DBI::dbGetQuery(con, sprintf("SELECT %s FROM %s", sel, fqtn(tbl))))
+  names(df) <- tolower(names(df)); df
+}
+
+# ---- analysis ----
+run_analysis <- function(con) {
+  # Drop rows with no patient or line key: they can't be placed on a line, and R and SQL treat
+  # missing keys differently in joins/counts, so removing them up front keeps the two in step.
+  drugep <- load_tbl(con, drugepisode_tbl,
+    c("patientid","linenumber","linesetting","ismaintenancetherapy","linename","linestartdate","episodedate","drugname")) %>%
+    filter(!is.na(patientid), !is.na(linenumber))
+
+  # Non-maintenance episodes, with a title-cased setting PER EPISODE. A line number can span
+  # settings (neoadjuvant then adjuvant on line 1), so setting is not one-per-line.
+  ep <- drugep %>% filter(is_nonmaint(ismaintenancetherapy)) %>%
+    mutate(setting = canon_setting(linesetting),
+           linestartdate = as.Date(linestartdate), episodedate = as.Date(episodedate))
+
+  # One row per line-segment: (patient, line, setting). Because a line can span settings, the
+  # regimen and start are built from the segment's own episodes, not the whole-line fields:
+  # regimen from the drug names in this setting, start from the first episode in this setting.
+  seg <- ep %>% filter(!is.na(setting)) %>%
+    group_by(patientid, linenumber, setting) %>%
+    summarise(regimen = drug_set(drugname),
+              start   = suppressWarnings(min(episodedate, na.rm = TRUE)), .groups = "drop") %>%
+    mutate(start = as.Date(ifelse(is.finite(start), start, NA), origin = "1970-01-01"))
+
+  # Lines whose number spans more than one setting. The platinum-status table is line-level,
+  # so for these the status can't be pinned to a single setting (used as a QC flag in 3b/3c).
+  span_lines <- seg %>% distinct(patientid, linenumber, setting) %>%
+    count(patientid, linenumber, name = "n_set") %>% filter(n_set > 1) %>%
+    distinct(patientid, linenumber)
+
+  out <- list()   # each element: list(title, note, table)
+
+  # 2a. patients by non-maintenance setting combination
+  combo <- seg %>% filter(setting %in% settings_keep) %>% distinct(patientid, setting) %>%
+    group_by(patientid) %>% summarise(combo = paste(sort(unique(setting)), collapse = " + "), .groups = "drop")
+  out$q2a <- list(
+    title = "2a. Patients by non-maintenance treatment setting combination",
+    note  = sprintf("Denominator = %d patients with >=1 non-maintenance line in Neoadjuvant/Adjuvant/Advanced (Off-Systemic-Therapy and missing settings excluded).",
+                    n_distinct(combo$patientid)),
+    table = combo %>% count(combo, name = "patients") %>%
+      mutate(pct = sprintf("%.1f%%", 100 * patients / sum(patients))) %>% arrange(desc(patients)))
+
+  # 2b. patients with >1 non-maintenance adjuvant line
+  adj_lines <- seg %>% filter(setting == "Adjuvant") %>% distinct(patientid, linenumber)
+  n_multi_adj <- adj_lines %>% count(patientid, name = "n") %>% filter(n > 1) %>% nrow()
+  out$q2b <- list(title = "2b. Patients with multiple non-maintenance adjuvant lines", note = "",
+    table = tibble(metric = "patients with >1 adjuvant line", patients = n_multi_adj))
+
+  # 2c. among advanced-setting patients, distribution of total LOT count. Count only treatment
+  # settings (Neo/Adj/Adv), so Off-Systemic-Therapy doesn't inflate the line count — same scope
+  # as 2a.
+  adv_pts <- seg %>% filter(setting == "Advanced") %>% distinct(patientid) %>% pull(patientid)
+  lot_ct  <- seg %>% filter(patientid %in% adv_pts, setting %in% settings_keep) %>%
+    distinct(patientid, linenumber) %>% count(patientid, name = "n_lot")
+  out$q2c <- list(
+    title = "2c. Advanced-setting patients by total number of lines of therapy",
+    note  = sprintf("Denominator = %d patients with >=1 Advanced line. LOT = distinct non-maintenance lines in Neoadjuvant/Adjuvant/Advanced (Off-Systemic-Therapy excluded), not Advanced-only. Confirm whether Advanced-only is intended instead.", length(adv_pts)),
+    table = lot_ct %>% count(n_lot, name = "patients") %>%
+      mutate(pct = sprintf("%.1f%%", 100 * patients / sum(patients))) %>% arrange(n_lot))
+
+  # 2d. same regimen in the last adjuvant line and the first-line Advanced regimen. regimen is
+  # already a sorted drug set, so equality is order-independent. L1 = first Advanced line (line
+  # number 1 is the earliest line overall, so nothing is "prior to it" — that reading is vacuous).
+  first_adv <- seg %>% filter(setting == "Advanced") %>%
+    arrange(patientid, linenumber) %>% group_by(patientid) %>% slice(1L) %>% ungroup() %>%
+    transmute(patientid, adv_regimen = regimen, adv_start = start)
+  # last adjuvant line that STARTS BEFORE the first Advanced line ("last one prior to L1"). Ties
+  # on start break by the higher line number, so R and SQL pick the same line.
+  adj_last_pre <- seg %>% filter(setting == "Adjuvant") %>% inner_join(first_adv, by = "patientid") %>%
+    filter(!is.na(start), !is.na(adv_start), start < adv_start) %>%
+    arrange(patientid, desc(start), desc(linenumber)) %>%
+    group_by(patientid) %>% slice(1L) %>% ungroup()
+  n_same <- adj_last_pre %>% filter(nzchar(regimen) & regimen == adv_regimen) %>% nrow()
+  out$q2d <- list(
+    title = "2d. Patients whose last adjuvant regimen matches their first-line Advanced regimen",
+    note  = "L1 = first Advanced line; adjuvant line = the last one starting before it; regimens compared as drug sets (blanks excluded). (2e uses line number 1; 2d can't, since nothing starts before line 1.)",
+    table = tibble(metric = c("patients with an adjuvant line before their first-Advanced line", "same regimen"),
+                   patients = c(nrow(adj_last_pre), n_same)))
+
+  # 2e. L1 start < recurrence date  (needs recurrence date). L1 = line number 1. This uses
+  # linestartdate (the line-start field), since the ask says "1L start date" — not the per-episode
+  # date 2d uses. A line can span settings, so take the earliest line start across them. Built from `ep`
+  # (BEFORE the setting filter), because 2e is setting-independent — a line-1 row with a missing setting
+  # still counts; the SQL mirrors this by building l1 from the drug episodes directly, not from oc_lines.
+  l1 <- ep %>% filter(linenumber == 1) %>% group_by(patientid) %>%
+    summarise(l1_start = suppressWarnings(min(linestartdate, na.rm = TRUE)), .groups = "drop") %>%
+    mutate(l1_start = as.Date(ifelse(is.finite(l1_start), l1_start, NA), origin = "1970-01-01"))
+  rec <- tryCatch(load_tbl(con, recur_tbl, c("patientid", recur_col)), error = function(e) e)
+  out$q2e <- if (inherits(rec, "error")) list(title = "2e. Patients with 1L start date < recurrence date",
+      note = sprintf("PENDING: confirm recurrence date column (tried %s.%s). %s", recur_tbl, recur_col, conditionMessage(rec)),
+      table = NULL)
+    else {
+      names(rec)[2] <- "recur"
+      # One recurrence date per patient (earliest), so a table with >1 row per patient can't
+      # fan out the join and overcount — matches the SQL's min(recurrencedate).
+      rec <- rec %>% mutate(recur = as.Date(recur)) %>% filter(!is.na(recur)) %>%
+        group_by(patientid) %>% summarise(recur = min(recur), .groups = "drop")
+      n_l1 <- l1 %>% filter(!is.na(l1_start)) %>% nrow()
+      j <- l1 %>% inner_join(rec, by = "patientid") %>% filter(!is.na(l1_start))
+      list(title = "2e. Patients with 1L start date < recurrence date",
+           note = "1L = line number 1, the first line of therapy (confirmed). The drop from row 1 to row 2 is patients with no recurrence date.",
+           table = tibble(metric = c("patients with an L1 start", "of those, have a recurrence date", "L1 start < recurrence"),
+                          patients = c(n_l1, nrow(j), sum(j$l1_start < j$recur))))
+    }
+
+  # 3a. among adjuvant-setting patients, % who received platinum chemo. The platinum has to be
+  # on an adjuvant episode itself: a line can span settings, so joining on the line number would
+  # wrongly credit platinum given in the neoadjuvant part of the same line.
+  adj_pts  <- seg %>% filter(setting == "Adjuvant") %>% distinct(patientid) %>% pull(patientid)
+  plat_adj <- ep %>% filter(setting == "Adjuvant", str_detect(str_to_lower(drugname), platinum_drugs)) %>%
+    distinct(patientid) %>% pull(patientid)
+  out$q3a <- list(
+    title = "3a. Adjuvant-setting patients who received platinum-based chemotherapy",
+    note  = sprintf("Platinum = drug name contains %s, on an adjuvant non-maintenance episode.", platinum_drugs),
+    table = tibble(metric = c("adjuvant-setting patients", "received platinum", "%"),
+                   value  = c(as.character(length(adj_pts)), as.character(length(plat_adj)),
+                              sprintf("%.1f%%", 100 * length(plat_adj) / max(1, length(adj_pts))))))
+
+  # 3b/3c. platinum status by setting  (needs the Panoramic platinum-status table)
+  # Patient-level: one line per patient. A conflict (line with >1 distinct status) is flagged,
+  # not silently resolved; matched-but-blank and no-matching-row are shown separately, so the
+  # denominator stays all patients in the setting.
+  plat_status_block <- function(pt_lines, title, note) {
+    ps <- tryCatch(load_tbl(con, plat_tbl, c("patientid", plat_line, plat_status)), error = function(e) e)
+    if (inherits(ps, "error")) return(list(title = title, table = NULL,
+      note = sprintf("PENDING: confirm platinum-status table/columns (tried %s: %s, %s). %s",
+                     plat_tbl, plat_line, plat_status, conditionMessage(ps))))
+    names(ps) <- c("patientid", "linenumber", "status")
+    # Trim before comparing (keep the trimmed text, not the raw), so " Sensitive " and "Sensitive"
+    # are one status — same as the SQL's nullif(trim(platinumstatus),'').
+    ps <- ps %>% mutate(status = str_trim(status),
+                        status = ifelse(is.na(status) | status == "", NA_character_, status),
+                        matched = TRUE)
+    cls <- pt_lines %>% left_join(ps, by = c("patientid","linenumber")) %>%
+      group_by(patientid) %>%
+      summarise(matched = any(!is.na(matched)),
+                n_stat  = n_distinct(status[!is.na(status)]),
+                one     = { s <- unique(status[!is.na(status)]); if (length(s) == 1) s else NA_character_ },
+                .groups = "drop") %>%
+      mutate(status = case_when(n_stat == 1 ~ one,
+                                n_stat >  1 ~ "Conflicting status (multiple rows)",
+                                matched     ~ "Status row present but blank",
+                                TRUE        ~ "No status row"))
+    # The status table has one row per line, but a line can cover more than one setting. Count how
+    # many of these lines do, so that risk is shown, not hidden.
+    n_span <- pt_lines %>% distinct(patientid, linenumber) %>%
+      semi_join(span_lines, by = c("patientid","linenumber")) %>% nrow()
+    if (n_span > 0) note <- sprintf(
+      "%s QC: %d of these lines also have episodes in another setting, so their status can't be tied to just one setting — confirm how to count those.",
+      note, n_span)
+    list(title = title, note = note,
+         table = cls %>% count(status, name = "patients") %>%
+           mutate(pct = sprintf("%.1f%%", 100 * patients / sum(patients))) %>% arrange(desc(patients)))
+  }
+
+  # All adjuvant lines: the status table only has platinum lines, so the last adjuvant line
+  # may not be the one with a status. The block aggregates per patient and flags conflicts.
+  adj_all <- seg %>% filter(setting == "Adjuvant") %>% distinct(patientid, linenumber)
+  out$q3b <- plat_status_block(adj_all, "3b. Platinum status in the adjuvant setting (patients)",
+    "Panoramic PlatinumStatus across a patient's adjuvant lines; denominator = all adjuvant-setting patients (non-platinum lines have no status row).")
+
+  first_adv_line <- seg %>% filter(setting == "Advanced") %>%
+    arrange(patientid, linenumber) %>% group_by(patientid) %>% slice(1L) %>% ungroup() %>%
+    distinct(patientid, linenumber)
+  out$q3c <- plat_status_block(first_adv_line, "3c. Platinum status in the first-line advanced setting (patients)",
+    "Panoramic PlatinumStatus. One row per patient = their earliest Advanced line; denominator = all first-line-advanced patients.")
+
+  out
+}
+
+# ---- rendering ----
+esc <- function(x) { x <- as.character(x); x <- gsub("&","&amp;",x,fixed=TRUE)
+  x <- gsub("<","&lt;",x,fixed=TRUE); gsub(">","&gt;",x,fixed=TRUE) }
+df_to_md <- function(df) {
+  if (is.null(df) || !nrow(df)) return("_no rows_")
+  head <- paste0("| ", paste(names(df), collapse = " | "), " |")
+  sep  <- paste0("| ", paste(rep("---", ncol(df)), collapse = " | "), " |")
+  body <- apply(df, 1, function(r) paste0("| ", paste(r, collapse = " | "), " |"))
+  paste(c(head, sep, body), collapse = "\n")
+}
+df_to_html <- function(df) {
+  if (is.null(df) || !nrow(df)) return("<p class='pending'>no rows</p>")
+  th <- paste0("<th>", paste(esc(names(df)), collapse = "</th><th>"), "</th>")
+  tr <- apply(df, 1, function(r) paste0("<tr><td>", paste(esc(r), collapse = "</td><td>"), "</td></tr>"))
+  paste0("<table><thead><tr>", th, "</tr></thead><tbody>", paste(tr, collapse = ""), "</tbody></table>")
+}
+render <- function(out, gen_time) {
+  md <- c(sprintf("# OC Panoramic exploration — LOT & platinum\n\n%s.%s — generated %s\n",
+                  catalog, schema, gen_time))
+  html_secs <- character()
+  for (s in out) {
+    note_md <- if (nzchar(s$note)) paste0("\n", s$note, "\n") else ""
+    md <- c(md, sprintf("\n## %s\n%s", s$title, note_md), df_to_md(s$table))
+    pend <- grepl("^PENDING", s$note)
+    html_secs <- c(html_secs, sprintf("<h2%s>%s</h2>%s%s",
+      if (pend) " class='pend'" else "", esc(s$title),
+      if (nzchar(s$note)) sprintf("<p class='note'>%s</p>", esc(s$note)) else "",
+      df_to_html(s$table)))
+  }
+  html <- paste0(
+    "<!doctype html><html><head><meta charset='utf-8'><title>OC exploration — LOT &amp; platinum</title><style>",
+    "body{font:14px/1.5 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#1a1a1a;margin:0;padding:32px;max-width:900px}",
+    "h1{font-size:22px;margin:0 0 4px}h2{font-size:17px;margin:28px 0 6px;border-top:1px solid #e5e5e5;padding-top:18px}",
+    "h2.pend{color:#b45309}.sub{color:#666;margin:0 0 20px}.note{color:#666;font-size:13px;margin:0 0 8px}",
+    "table{border-collapse:collapse;margin:6px 0}th,td{text-align:left;padding:6px 12px;border-bottom:1px solid #eee}",
+    "th{font-size:12px;text-transform:uppercase;letter-spacing:.03em;color:#555;background:#fafafa}",
+    "td{font-variant-numeric:tabular-nums}</style></head><body><h1>OC Panoramic exploration — LOT &amp; platinum</h1>",
+    sprintf("<p class='sub'>%s.%s &middot; generated %s</p>", esc(catalog), esc(schema), esc(gen_time)),
+    paste(html_secs, collapse = "\n"), "</body></html>")
+  list(md = paste(md, collapse = "\n"), html = html)
+}
+
+run <- function() {
+  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+  con <- get_con()
+  out <- run_analysis(con)
+  r <- render(out, format(Sys.time(), "%Y-%m-%d %H:%M"))
+  writeLines(r$html, file.path(out_dir, "oc_exploration.html"))
+  writeLines(r$md,   file.path(out_dir, "oc_exploration.md"))
+  cat(r$md, "\n")
+  message(sprintf("wrote %s", file.path(out_dir, "oc_exploration.html")))
+  invisible(out)
+}
+if (!nzchar(Sys.getenv("OC_DEFINE_ONLY"))) run()
+#==FILE==# oc_exploration.sql
+-- OC exploration — LOT & platinum items in SQL (mirrors oc_exploration.R). Run top to bottom.
+-- Each numbered block returns one result set. Sources:
+--   t_drugepisode_2026m06        — lines, settings, drugs (items 2a-2d, 3a)
+--   t_enh_ov_2026m06             — recurrence date (item 2e; may lag the dictionary)
+--   t_enh_ov_platstatus_2026m06  — platinum status (items 3b/3c; one row per platinum line)
+USE CATALOG hive_metastore;
+USE SCHEMA  clnprw_flatiron_pano_ovar_use;
+
+-- Shared view: one row per line-SEGMENT (patient, line, setting). A line number can span settings
+-- (neoadjuvant then adjuvant on line 1), so setting is not one-per-line and is normalized per
+-- episode. Because a line can span settings, regimen and start_date come from the segment's own
+-- episodes (its drug names and episode dates), not the whole-line fields; line_start keeps the
+-- line-start field for item 2e. Rows with no patient or line key are dropped so R and SQL agree.
+CREATE OR REPLACE TEMP VIEW oc_lines AS
+WITH ep AS (   -- non-maintenance episodes, setting normalized and drug names split per episode
+  SELECT patientid, linenumber,
+         CASE WHEN lower(trim(linesetting)) = 'neoadjuvant' THEN 'Neoadjuvant'
+              WHEN lower(trim(linesetting)) = 'adjuvant'    THEN 'Adjuvant'
+              WHEN lower(trim(linesetting)) = 'advanced'    THEN 'Advanced'
+              WHEN lower(trim(linesetting)) LIKE 'off%systemic%' THEN 'Off-Systemic-Therapy'
+              WHEN nullif(trim(linesetting), '') IS NULL THEN NULL
+              ELSE initcap(lower(trim(linesetting))) END AS setting,
+         split(regexp_replace(lower(trim(drugname)), '\\s+', ' '), '\\s*[,/+;&|]\\s*') AS drug_tokens,
+         episodedate, linestartdate
+  FROM t_drugepisode_2026m06
+  WHERE lower(trim(ismaintenancetherapy)) IN ('false','f','n','no','0')
+    AND patientid IS NOT NULL AND linenumber IS NOT NULL
+)
+SELECT patientid, linenumber, setting,
+       array_join(array_sort(array_distinct(filter(flatten(collect_list(drug_tokens)), x -> x <> ''))), '|') AS regimen,
+       min(episodedate)   AS start_date,
+       min(linestartdate) AS line_start
+FROM ep
+WHERE setting IS NOT NULL
+GROUP BY patientid, linenumber, setting;
+
+-- 2a. Patients by non-maintenance treatment setting combination (Neoadjuvant/Adjuvant/Advanced).
+WITH pc AS (
+  SELECT patientid, concat_ws(' + ', sort_array(collect_set(setting))) AS combo
+  FROM oc_lines WHERE setting IN ('Neoadjuvant','Adjuvant','Advanced')
+  GROUP BY patientid
+)
+SELECT combo, count(*) AS patients, round(100.0 * count(*) / sum(count(*)) OVER (), 1) AS pct
+FROM pc GROUP BY combo ORDER BY patients DESC;
+
+-- 2b. Patients with more than one non-maintenance adjuvant line.
+SELECT count(*) AS patients_with_multiple_adjuvant_lines FROM (
+  SELECT patientid FROM oc_lines WHERE setting = 'Adjuvant'
+  GROUP BY patientid HAVING count(DISTINCT linenumber) > 1
+);
+
+-- 2c. Advanced-setting patients by total number of lines. Counts only treatment settings
+--     (Neo/Adj/Adv), so Off-Systemic-Therapy doesn't inflate the line count — same scope as 2a.
+WITH adv AS (SELECT DISTINCT patientid FROM oc_lines WHERE setting = 'Advanced'),
+lot AS (
+  SELECT l.patientid, count(DISTINCT l.linenumber) AS n_lot
+  FROM oc_lines l JOIN adv a ON l.patientid = a.patientid
+  WHERE l.setting IN ('Neoadjuvant','Adjuvant','Advanced')
+  GROUP BY l.patientid
+)
+SELECT n_lot, count(*) AS patients, round(100.0 * count(*) / sum(count(*)) OVER (), 1) AS pct
+FROM lot GROUP BY n_lot ORDER BY n_lot;
+
+-- 2d. Patients whose last adjuvant regimen matches their first-line Advanced regimen. regimen is
+--     already a sorted drug set, so equality is order-independent (blanks excluded). L1 = first
+--     Advanced line; adjuvant = the last one starting before it.
+WITH fa AS (   -- first Advanced line per patient
+  SELECT patientid, regimen AS adv_regimen, start_date AS adv_start FROM (
+    SELECT patientid, regimen, start_date,
+           row_number() OVER (PARTITION BY patientid ORDER BY linenumber) AS rn
+    FROM oc_lines WHERE setting = 'Advanced'
+  ) WHERE rn = 1
+),
+la AS (   -- last adjuvant line before the first Advanced line (ties break by higher line number)
+  SELECT patientid, adj_regimen, adv_regimen FROM (
+    SELECT o.patientid, o.regimen AS adj_regimen, fa.adv_regimen,
+           row_number() OVER (PARTITION BY o.patientid ORDER BY o.start_date DESC, o.linenumber DESC) AS rn
+    FROM oc_lines o JOIN fa ON o.patientid = fa.patientid
+    WHERE o.setting = 'Adjuvant' AND o.start_date IS NOT NULL AND fa.adv_start IS NOT NULL
+      AND o.start_date < fa.adv_start
+  ) WHERE rn = 1
+)
+SELECT count(*) AS patients_with_adjuvant_before_first_advanced,
+       sum(CASE WHEN adj_regimen <> '' AND adj_regimen = adv_regimen THEN 1 ELSE 0 END) AS same_regimen
+FROM la;
+
+-- 2e. Patients with 1L start date < recurrence date  (needs recurrencedate in t_enh_ov_2026m06).
+--     1L = line number 1. Uses linestartdate (the line-start field), since the ask says "1L start date".
+--     Built straight from the drug episodes, NOT oc_lines: 2e is setting-independent, so a line-1 row with
+--     a missing linesetting must still count — oc_lines drops those (WHERE setting IS NOT NULL), which would
+--     diverge from the R (which builds l1 from ep, before the setting filter). Row 1 minus row 2 = no recurrence date.
+WITH l1  AS (
+  SELECT patientid, min(linestartdate) AS l1_start
+  FROM t_drugepisode_2026m06
+  WHERE lower(trim(ismaintenancetherapy)) IN ('false','f','n','no','0')
+    AND patientid IS NOT NULL AND linenumber IS NOT NULL AND linenumber = 1
+  GROUP BY patientid),
+rec AS (SELECT patientid, min(recurrencedate) AS recur FROM t_enh_ov_2026m06 GROUP BY patientid)
+SELECT
+  count(CASE WHEN l1.l1_start IS NOT NULL THEN 1 END)                                                     AS l1_patients,
+  count(CASE WHEN l1.l1_start IS NOT NULL AND r.recur IS NOT NULL THEN 1 END)                             AS with_recurrence_date,
+  count(CASE WHEN l1.l1_start IS NOT NULL AND r.recur IS NOT NULL AND l1.l1_start < r.recur THEN 1 END)   AS l1_start_before_recurrence
+FROM l1 LEFT JOIN rec r ON l1.patientid = r.patientid;
+
+-- 3a. Adjuvant-setting patients who received platinum chemo (carboplatin/cisplatin/oxaliplatin).
+--     Platinum must be on an adjuvant episode itself: a line can span settings, so matching on the
+--     line number alone would credit platinum given in the neoadjuvant part of the same line.
+WITH adj AS (SELECT DISTINCT patientid FROM oc_lines WHERE setting = 'Adjuvant'),
+plat AS (
+  SELECT DISTINCT patientid
+  FROM t_drugepisode_2026m06
+  WHERE lower(trim(ismaintenancetherapy)) IN ('false','f','n','no','0')
+    AND patientid IS NOT NULL
+    AND lower(trim(linesetting)) = 'adjuvant'
+    AND (lower(drugname) LIKE '%carboplatin%' OR lower(drugname) LIKE '%cisplatin%'
+      OR lower(drugname) LIKE '%oxaliplatin%')
+)
+SELECT (SELECT count(DISTINCT patientid) FROM adj)  AS adjuvant_patients,
+       (SELECT count(*) FROM plat)                  AS received_platinum,
+       round(100.0 * (SELECT count(*) FROM plat) / nullif((SELECT count(DISTINCT patientid) FROM adj), 0), 1) AS pct;
+
+-- 3b. Platinum status in the adjuvant setting (patients). Checks all of a patient's adjuvant
+--     lines; a conflict (>1 distinct status) is flagged; a non-platinum line has no status row.
+--     Caveat: the status table is keyed by line only, but a line can span settings — for a line
+--     that does, its status can't be pinned to the adjuvant setting. QC block at the end counts
+--     how many. Confirm the attribution rule before treating 3b as exact.
+WITH adj AS (SELECT DISTINCT patientid, linenumber FROM oc_lines WHERE setting = 'Adjuvant'),
+ps  AS (SELECT patientid, linenumber, nullif(trim(platinumstatus), '') AS status, 1 AS in_ps
+        FROM t_enh_ov_platstatus_2026m06),
+j AS (
+  SELECT a.patientid, count(DISTINCT ps.status) AS n_stat,
+         max(coalesce(ps.in_ps, 0)) AS has_row, max(ps.status) AS any_status
+  FROM adj a LEFT JOIN ps ON a.patientid = ps.patientid AND a.linenumber = ps.linenumber
+  GROUP BY a.patientid
+),
+cls AS (
+  SELECT patientid,
+    CASE WHEN n_stat = 1 THEN any_status
+         WHEN n_stat > 1 THEN 'Conflicting status (multiple rows)'
+         WHEN has_row = 1 THEN 'Status row present but blank'
+         ELSE 'No status row' END AS status
+  FROM j
+)
+SELECT status, count(*) AS patients, round(100.0 * count(*) / sum(count(*)) OVER (), 1) AS pct
+FROM cls GROUP BY status ORDER BY patients DESC;
+
+-- 3c. Platinum status in the first-line advanced setting (patients). Uses each patient's
+--     earliest Advanced line. Same line-vs-setting caveat as 3b (see the QC block at the end).
+WITH fa AS (
+  SELECT patientid, linenumber FROM (
+    SELECT patientid, linenumber, row_number() OVER (PARTITION BY patientid ORDER BY linenumber) AS rn
+    FROM oc_lines WHERE setting = 'Advanced'
+  ) WHERE rn = 1
+),
+ps AS (SELECT patientid, linenumber, nullif(trim(platinumstatus), '') AS status, 1 AS in_ps
+       FROM t_enh_ov_platstatus_2026m06),
+j AS (
+  SELECT f.patientid, count(DISTINCT ps.status) AS n_stat,
+         max(coalesce(ps.in_ps, 0)) AS has_row, max(ps.status) AS any_status
+  FROM fa f LEFT JOIN ps ON f.patientid = ps.patientid AND f.linenumber = ps.linenumber
+  GROUP BY f.patientid
+),
+cls AS (
+  SELECT patientid,
+    CASE WHEN n_stat = 1 THEN any_status
+         WHEN n_stat > 1 THEN 'Conflicting status (multiple rows)'
+         WHEN has_row = 1 THEN 'Status row present but blank'
+         ELSE 'No status row' END AS status
+  FROM j
+)
+SELECT status, count(*) AS patients, round(100.0 * count(*) / sum(count(*)) OVER (), 1) AS pct
+FROM cls GROUP BY status ORDER BY patients DESC;
+
+-- QC for 3b/3c. Among the lines used above, how many span more than one setting (so the
+-- line-level platinum status can't be attributed to one setting). Ideally these are ~0.
+WITH span AS (
+  SELECT patientid, linenumber FROM oc_lines
+  GROUP BY patientid, linenumber HAVING count(DISTINCT setting) > 1
+),
+adj AS (SELECT DISTINCT patientid, linenumber FROM oc_lines WHERE setting = 'Adjuvant'),
+fa AS (
+  SELECT patientid, linenumber FROM (
+    SELECT patientid, linenumber, row_number() OVER (PARTITION BY patientid ORDER BY linenumber) AS rn
+    FROM oc_lines WHERE setting = 'Advanced'
+  ) WHERE rn = 1
+)
+SELECT '3b adjuvant lines' AS keyset,
+       (SELECT count(*) FROM adj a JOIN span s ON a.patientid = s.patientid AND a.linenumber = s.linenumber) AS lines_spanning_settings
+UNION ALL
+SELECT '3c first-advanced lines',
+       (SELECT count(*) FROM fa f JOIN span s ON f.patientid = s.patientid AND f.linenumber = s.linenumber);
+#==FILE==# fralpha_by_treatment.R
 # FRalpha status at index by treatment (Mirvetuximab vs ICC), for ovarian patients on 2L-4L
 # lines. A patient can be in both arms; each arm uses its own first dose date. ICC must be a
 # single drug, unless the line also has mirvetuximab. Builds Table 1 (counts and %).
@@ -236,10 +2361,7 @@ run_analysis <- function() {
 }
 
 if (!nzchar(Sys.getenv("FRA_DEFINE_ONLY"))) run_analysis()
-
-
-SQLL!!
-
+#==FILE==# qc_profiling.sql
 -- FRalpha analysis — data profiling + QC (Databricks / Spark SQL).
 -- Run these first to check the data; section 10 rebuilds Table 1 as an independent cross-check.
 -- Change the catalog below if yours is not hive_metastore.
@@ -467,161 +2589,67 @@ SELECT pk.cohort, pk.arm,
 FROM picked pk LEFT JOIN fra ON pk.arm=fra.arm AND pk.cohort=fra.cohort AND pk.patientid=fra.patientid
 GROUP BY pk.cohort, pk.arm, coalesce(fra.fra, 'Unknown/untested')
 ORDER BY pk.cohort, pk.arm, fra_status;
+#==EOF==#
 
 
-SQL###
--- OC exploration — LOT & platinum items in SQL (mirrors oc_exploration.R). Run top to bottom.
--- Each numbered block returns one result set. Sources:
---   t_drugepisode_2026m06        — lines, settings, drugs (items 2a-2d, 3a)
---   t_enh_ov_2026m06             — recurrence date (item 2e; may lag the dictionary)
---   t_enh_ov_platstatus_2026m06  — platinum status (items 3b/3c; one row per platinum line)
-USE CATALOG hive_metastore;
-USE SCHEMA  clnprw_flatiron_pano_ovar_use;
 
--- Shared view: one row per non-maintenance line, with a title-cased setting, its regimen,
--- and its start date. Setting is normalized so it doesn't depend on the feed's casing.
-CREATE OR REPLACE TEMP VIEW oc_lines AS
-SELECT patientid, linenumber,
-       CASE WHEN s = 'neoadjuvant' THEN 'Neoadjuvant'
-            WHEN s = 'adjuvant'    THEN 'Adjuvant'
-            WHEN s = 'advanced'    THEN 'Advanced'
-            WHEN s LIKE 'off%systemic%' THEN 'Off-Systemic-Therapy'
-            ELSE initcap(s) END AS setting,
-       regimen, start_date
-FROM (
-  SELECT patientid, linenumber,
-         lower(trim(max(nullif(trim(linesetting), '')))) AS s,
-         max(nullif(trim(linename), '')) AS regimen,
-         min(linestartdate)              AS start_date
-  FROM t_drugepisode_2026m06
-  WHERE lower(trim(ismaintenancetherapy)) IN ('false','f','n','no','0')
-  GROUP BY patientid, linenumber
-);
+#!/usr/bin/env python3
+# Unpack the RWD OC tools bundle into individual source files.
+#
+#   python unpack_bundle.py [bundle.txt] [dest_dir]
+#
+# Defaults: bundle = rwd_oc_tools_bundle.txt, dest = current folder.
+# Output files are written as UTF-8 (NOT ASCII), with Windows CRLF line
+# endings and no BOM, so they open cleanly in VS Code on Windows.
+#
+# Line endings: the parser first normalizes whatever endings the transfer
+# may have introduced (LF / CRLF / CR) to a single canonical form, then
+# re-emits every file with CRLF -- so the result is correct regardless of
+# how the bundle itself arrived on the Windows box.
 
--- 2a. Patients by non-maintenance treatment setting combination (Neoadjuvant/Adjuvant/Advanced).
-WITH pc AS (
-  SELECT patientid, concat_ws(' + ', sort_array(collect_set(setting))) AS combo
-  FROM oc_lines WHERE setting IN ('Neoadjuvant','Adjuvant','Advanced')
-  GROUP BY patientid
-)
-SELECT combo, count(*) AS patients, round(100.0 * count(*) / sum(count(*)) OVER (), 1) AS pct
-FROM pc GROUP BY combo ORDER BY patients DESC;
+import io
+import os
+import re
+import sys
 
--- 2b. Patients with more than one non-maintenance adjuvant line.
-SELECT count(*) AS patients_with_multiple_adjuvant_lines FROM (
-  SELECT patientid FROM oc_lines WHERE setting = 'Adjuvant'
-  GROUP BY patientid HAVING count(DISTINCT linenumber) > 1
-);
+FILE_MARK = re.compile(r"(?m)^#==FILE==# (.+?)[ \t]*\n")
+EOF_MARK  = re.compile(r"(?m)^#==EOF==#[ \t]*\n?\Z")
 
--- 2c. Advanced-setting patients by total number of lines (all settings, non-maintenance).
-WITH adv AS (SELECT DISTINCT patientid FROM oc_lines WHERE setting = 'Advanced'),
-lot AS (
-  SELECT l.patientid, count(DISTINCT l.linenumber) AS n_lot
-  FROM oc_lines l JOIN adv a ON l.patientid = a.patientid
-  GROUP BY l.patientid
-)
-SELECT n_lot, count(*) AS patients, round(100.0 * count(*) / sum(count(*)) OVER (), 1) AS pct
-FROM lot GROUP BY n_lot ORDER BY n_lot;
 
--- 2d. Patients whose last adjuvant regimen matches their first-line Advanced regimen.
---     L1 = first Advanced line; adjuvant = the last one starting before it; regimens are
---     compared as drug sets (order-independent, blanks excluded).
-WITH fa AS (   -- first Advanced line per patient
-  SELECT patientid, regimen AS adv_regimen, start_date AS adv_start FROM (
-    SELECT patientid, regimen, start_date,
-           row_number() OVER (PARTITION BY patientid ORDER BY linenumber) AS rn
-    FROM oc_lines WHERE setting = 'Advanced'
-  ) WHERE rn = 1
-),
-la AS (   -- last adjuvant line starting before the first Advanced line
-  SELECT patientid, adj_regimen, adv_regimen FROM (
-    SELECT o.patientid, o.regimen AS adj_regimen, fa.adv_regimen,
-           row_number() OVER (PARTITION BY o.patientid ORDER BY o.start_date DESC) AS rn
-    FROM oc_lines o JOIN fa ON o.patientid = fa.patientid
-    WHERE o.setting = 'Adjuvant' AND o.start_date IS NOT NULL AND fa.adv_start IS NOT NULL
-      AND o.start_date < fa.adv_start
-  ) WHERE rn = 1
-),
-cmp AS (
-  SELECT patientid,
-    array_join(array_sort(array_distinct(filter(
-      split(regexp_replace(lower(trim(coalesce(adj_regimen,''))),'\\s+',' '), '\\s*[,/+;&|]\\s*'), x -> x <> ''))), '|') AS a,
-    array_join(array_sort(array_distinct(filter(
-      split(regexp_replace(lower(trim(coalesce(adv_regimen,''))),'\\s+',' '), '\\s*[,/+;&|]\\s*'), x -> x <> ''))), '|') AS b
-  FROM la
-)
-SELECT count(*) AS patients_with_adjuvant_before_first_advanced,
-       sum(CASE WHEN a <> '' AND a = b THEN 1 ELSE 0 END) AS same_regimen
-FROM cmp;
+def main():
+    bundle = sys.argv[1] if len(sys.argv) > 1 else "rwd_oc_tools_bundle.txt"
+    dest   = sys.argv[2] if len(sys.argv) > 2 else "."
 
--- 2e. Patients with 1L start date < recurrence date  (needs recurrencedate in t_enh_ov_2026m06).
---     1L = line number 1. Row 1 minus row 2 = patients with no recurrence date.
-WITH l1  AS (SELECT patientid, start_date AS l1_start FROM oc_lines WHERE linenumber = 1),
-rec AS (SELECT patientid, min(recurrencedate) AS recur FROM t_enh_ov_2026m06 GROUP BY patientid)
-SELECT
-  count(CASE WHEN l1.l1_start IS NOT NULL THEN 1 END)                                                     AS l1_patients,
-  count(CASE WHEN l1.l1_start IS NOT NULL AND r.recur IS NOT NULL THEN 1 END)                             AS with_recurrence_date,
-  count(CASE WHEN l1.l1_start IS NOT NULL AND r.recur IS NOT NULL AND l1.l1_start < r.recur THEN 1 END)   AS l1_start_before_recurrence
-FROM l1 LEFT JOIN rec r ON l1.patientid = r.patientid;
+    if not os.path.isfile(bundle):
+        sys.exit("bundle not found: %s" % bundle)
 
--- 3a. Adjuvant-setting patients who received platinum chemo (carboplatin/cisplatin/oxaliplatin).
-WITH adj AS (SELECT DISTINCT patientid, linenumber FROM oc_lines WHERE setting = 'Adjuvant'),
-plat AS (
-  SELECT DISTINCT d.patientid
-  FROM t_drugepisode_2026m06 d JOIN adj a ON d.patientid = a.patientid AND d.linenumber = a.linenumber
-  WHERE lower(trim(d.ismaintenancetherapy)) IN ('false','f','n','no','0')
-    AND (lower(d.drugname) LIKE '%carboplatin%' OR lower(d.drugname) LIKE '%cisplatin%'
-      OR lower(d.drugname) LIKE '%oxaliplatin%')
-)
-SELECT (SELECT count(DISTINCT patientid) FROM adj)  AS adjuvant_patients,
-       (SELECT count(*) FROM plat)                  AS received_platinum,
-       round(100.0 * (SELECT count(*) FROM plat) / nullif((SELECT count(DISTINCT patientid) FROM adj), 0), 1) AS pct;
+    with io.open(bundle, "r", encoding="utf-8") as f:
+        data = f.read()
 
--- 3b. Platinum status in the adjuvant setting (patients). Checks all of a patient's adjuvant
---     lines; a conflict (>1 distinct status) is flagged; a non-platinum line has no status row.
-WITH adj AS (SELECT DISTINCT patientid, linenumber FROM oc_lines WHERE setting = 'Adjuvant'),
-ps  AS (SELECT patientid, linenumber, nullif(trim(platinumstatus), '') AS status, 1 AS in_ps
-        FROM t_enh_ov_platstatus_2026m06),
-j AS (
-  SELECT a.patientid, count(DISTINCT ps.status) AS n_stat,
-         max(coalesce(ps.in_ps, 0)) AS has_row, max(ps.status) AS any_status
-  FROM adj a LEFT JOIN ps ON a.patientid = ps.patientid AND a.linenumber = ps.linenumber
-  GROUP BY a.patientid
-),
-cls AS (
-  SELECT patientid,
-    CASE WHEN n_stat = 1 THEN any_status
-         WHEN n_stat > 1 THEN 'Conflicting status (multiple rows)'
-         WHEN has_row = 1 THEN 'Status row present but blank'
-         ELSE 'No status row' END AS status
-  FROM j
-)
-SELECT status, count(*) AS patients, round(100.0 * count(*) / sum(count(*)) OVER (), 1) AS pct
-FROM cls GROUP BY status ORDER BY patients DESC;
+    # Canonicalize any CR / CRLF the transfer introduced, so parsing and the
+    # per-file content are on plain \n before we re-emit as CRLF.
+    data = data.replace("\r\n", "\n").replace("\r", "\n")
 
--- 3c. Platinum status in the first-line advanced setting (patients). Uses each patient's
---     earliest Advanced line.
-WITH fa AS (
-  SELECT patientid, linenumber FROM (
-    SELECT patientid, linenumber, row_number() OVER (PARTITION BY patientid ORDER BY linenumber) AS rn
-    FROM oc_lines WHERE setting = 'Advanced'
-  ) WHERE rn = 1
-),
-ps AS (SELECT patientid, linenumber, nullif(trim(platinumstatus), '') AS status, 1 AS in_ps
-       FROM t_enh_ov_platstatus_2026m06),
-j AS (
-  SELECT f.patientid, count(DISTINCT ps.status) AS n_stat,
-         max(coalesce(ps.in_ps, 0)) AS has_row, max(ps.status) AS any_status
-  FROM fa f LEFT JOIN ps ON f.patientid = ps.patientid AND f.linenumber = ps.linenumber
-  GROUP BY f.patientid
-),
-cls AS (
-  SELECT patientid,
-    CASE WHEN n_stat = 1 THEN any_status
-         WHEN n_stat > 1 THEN 'Conflicting status (multiple rows)'
-         WHEN has_row = 1 THEN 'Status row present but blank'
-         ELSE 'No status row' END AS status
-  FROM j
-)
-SELECT status, count(*) AS patients, round(100.0 * count(*) / sum(count(*)) OVER (), 1) AS pct
-FROM cls GROUP BY status ORDER BY patients DESC;
+    parts = FILE_MARK.split(data)          # [preamble, name1, body1, name2, body2, ...]
+    pairs = list(zip(parts[1::2], parts[2::2]))
+    if not pairs:
+        sys.exit("no '#==FILE==#' sections found -- is this the right bundle?")
+
+    if dest not in ("", "."):
+        os.makedirs(dest, exist_ok=True)
+
+    count = 0
+    for name, body in pairs:
+        name = name.strip()
+        body = EOF_MARK.sub("", body)      # trim the trailing #==EOF==# from the last section
+        outpath = os.path.join(dest, name)
+        with io.open(outpath, "w", encoding="utf-8", newline="\r\n") as out:
+            out.write(body)
+        count += 1
+        print("wrote %s (%d bytes UTF-8, CRLF)" % (outpath, len(body.encode("utf-8"))))
+
+    print("done: %d files -> %s" % (count, os.path.abspath(dest)))
+
+
+if __name__ == "__main__":
+    main()
