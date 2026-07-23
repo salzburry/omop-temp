@@ -1,4 +1,692 @@
 #!/usr/bin/env Rscript
+# July-20 refresh of the regimen dashboards: same dashboard, steroids removed,
+# plus an "All regimens" section with a downloadable long list per LOT.
+#
+#   LOT_COHORT=NDMM    Rscript jul20_refresh_dashboard.R   (default)
+#   LOT_COHORT=OVERALL Rscript jul20_refresh_dashboard.R
+#
+# A standalone wrapper around the existing dashboards (neither is modified):
+# it sources 06_ndmm_dashboard.R with its no-autorun option (which itself
+# sources 05_regimen_dashboard.R) and rebuilds the matching dashboard,
+# section for section and in the same order, with exactly the two requested
+# changes and nothing else:
+#
+#   REMOVED  - the steroid augmentation (LOT_BASE_MEDS_AUG is a passthrough of
+#              the engine's LOT_BASE_MEDS, which never contains a steroid), so
+#              every regimen string in every Sankey / table is steroid-free;
+#   REMOVED  - the STEROIDS section (prevalence / missing-steroid / timing QC);
+#   ADDED    - an "All regimens" section: every regimen per LOT (no top-N cut),
+#              displayed in the same modal/clinical order the current dashboard
+#              uses, downloadable from each table's CSV button and also written
+#              as one CSV file per LOT next to the dashboard.
+#
+# NDMM mode (default - the cohort the July-20 questions name, and the same
+# default as the sibling jul20_studyteam_qs.R) builds the COHORT and all LOT
+# RESULTS from the persisted NDMM cohort only, so nothing that affects a
+# regimen count can mix data vintages:
+#
+#   - it READS the persisted NDMM_LOT_LONG_FILT and NDMM_FLAGS_ALL from the
+#     last production 06_ndmm_dashboard.R run and rebinds them as the session
+#     views the builders expect; it stops with a remediation message if
+#     either is missing; cohort membership and every LOT result (regimens,
+#     counts, start/end dates) come from these two persisted tables;
+#   - TWO supporting views are refreshed from the CURRENTLY available sources,
+#     not the persisted run: the agent DISPLAY ORDER (build_modal_map reads
+#     MAP_STACKED) and the PAYER split (build_payer_lot_qc reads
+#     member_enrollment). They do not change any regimen count; the overview
+#     card states this, and the fix is operational - run this refresh right
+#     after 06_ndmm_dashboard.R so those sources match the cohort;
+#   - it verifies the two persisted tables select the SAME PATID set with an
+#     exact NOT-EXISTS anti-join in both directions plus a NULL-PATID check
+#     (equal counts alone do not prove it), and marks the run incomplete +
+#     warns on the dashboard if they diverge. This proves a matching patient
+#     set, not that both tables came from the same engine build (no build id
+#     is persisted to check);
+#   - it shows KPI snapshot, a steroid-free NDMM overview card (cohort +
+#     six-filter description + final count), a per-filter status table derived
+#     from the persisted flags (a flag excluding zero patients is either
+#     genuinely non-excluding or was skipped in the producing run - that run's
+#     own dashboard/log records which), payer, LOT-pair regimen Sankeys,
+#     category Sankeys + coverage, all regimens, patient gallery, and
+#     validation with the NDMM filter flags;
+#   - the FULL attrition funnel and the other-cancer drop / override QC are
+#     deliberately NOT reconstructed here (rebuilding them would require the
+#     current parent/raw tables and could mix vintages). They remain in the
+#     authoritative production ndmm_dashboard.html; the overview card says so.
+#
+# OVERALL mode mirrors 05_regimen_dashboard.R: KPI snapshot, overview,
+# parent-cohort attrition, payer, Sankeys, category views, all regimens,
+# gallery, validation.
+#
+# Both modes keep the current regimen display order (REGIMEN_MODAL_MAP via
+# build_modal_map), so the only visible regimen difference vs the current
+# dashboards is the absence of steroid tokens. Two deliberate departures,
+# both surfaced on the dashboard itself: the run-comparison view is omitted
+# (it appends rows to the permanent lot_dashboard_run_summary table, and this
+# script writes no permanent tables), and a steroid audit table is added to
+# the Validation section proving no known steroid token occurs in any LOT
+# regimen string.
+#
+# Run sequence for the July-20 pair (state the cohort explicitly when sending
+# run instructions; do not rely on defaults):
+#   LOT_COHORT=NDMM Rscript jul20_refresh_dashboard.R
+#   LOT_COHORT=NDMM Rscript jul20_studyteam_qs.R
+#
+# Output: regimen_dashboard_refresh_ndmm.html (or _overall.html) in
+# cfg$output_dir, plus jul20_all_regimens_lot<N>_<cohort>_<stamp>.csv files.
+# Writes no permanent tables (only session temp views). Safe to run any time.
+
+.script_dir <- local({
+  args <- commandArgs(trailingOnly = FALSE)
+  file_arg <- grep("^--file=", args, value = TRUE)
+  if (length(file_arg) > 0)
+    return(dirname(normalizePath(sub("^--file=", "", file_arg[1]))))
+  for (i in seq_len(sys.nframe())) {
+    ofile <- tryCatch(sys.frame(i)$ofile, error = function(e) NULL)
+    if (!is.null(ofile)) return(dirname(normalizePath(ofile)))
+  }
+  getwd()
+})
+
+# Source the existing NDMM dashboard WITHOUT running it; it sources the
+# overall regimen dashboard (05) itself, so all shared helpers, builders,
+# palettes and both dashboards' section builders arrive through it.
+options(ndmm_dashboard.no_autorun = TRUE,
+        ndmm_dashboard.script_dir = .script_dir,
+        regimen_dashboard.no_autorun = TRUE,
+        regimen_dashboard.script_dir = .script_dir)
+source(file.path(.script_dir, "06_ndmm_dashboard.R"))
+
+`%||%` <- function(a, b) if (is.null(a)) b else a
+
+# The steroid short-codes used across the repo's codelists; the audit checks
+# regimens against this fixed list (same list as the July-11 Q1 audit).
+AUDIT_STEROID_TOKENS <- c("DEX", "DEXA", "DEXAMETHASONE", "DEXAMETH",
+                          "PRED", "PREDNISONE", "PREDNISOLONE",
+                          "METHYLPRED", "METHYLPREDNISOLONE", "MPRED")
+
+# ===========================================================================
+# The new section: every regimen per LOT, one table per line, in the same
+# display order the rest of the dashboard uses (modal start-order, clinical
+# fallback). Counting stays on the canonical alphabetical LOT_BASE_MEDS key;
+# display_regimen is display-only. Each table is downloadable via its CSV
+# button, and the full list is also written as a CSV file per LOT.
+# ===========================================================================
+# Returns a status list so the caller can gate the run:
+#   list(ok, expected_lots, csvs_written, csv_failures, has_dt, reasons)
+build_all_regimens_section <- function(con, lot_long, out_dir, stamp,
+                                       cohort_tag,
+                                       section = "All regimens") {
+  # has_dt here matches save_table()'s own gate exactly (DT + htmlwidgets), so
+  # it is TRUE only when the in-dashboard tables and CSV buttons will render.
+  dt_ready <- isTRUE(has_dt) && requireNamespace("htmlwidgets", quietly = TRUE)
+  st <- list(ok = FALSE, expected_lots = 0L, csvs_written = 0L,
+             csv_failures = character(0), has_dt = dt_ready,
+             reasons = character(0))
+  denom <- db_q(con, glue("
+    SELECT LOT_NUM, count(DISTINCT cast(PATID as string)) AS n_patients
+    FROM {lot_long} GROUP BY LOT_NUM ORDER BY LOT_NUM"))
+  if (nrow(denom) == 0) {
+    add_html_card(paste0(
+      '<div style="font-family:system-ui;padding:12px;max-width:760px">',
+      '<h3>All regimens unavailable</h3><p style="color:#555;font-size:13px">',
+      'No LOT rows were found in <code>', esc_html(lot_long), '</code>.</p></div>'),
+      section = section, title = "All regimens (unavailable)")
+    st$reasons <- "no LOT rows found for the all-regimens lists"
+    return(st)
+  }
+  st$expected_lots <- length(unique(as.integer(as.numeric(denom$LOT_NUM))))
+  if (!st$has_dt)
+    st$reasons <- c(st$reasons,
+      "DT/htmlwidgets unavailable - the in-dashboard all-regimen tables and their CSV buttons will be missing (the per-LOT CSV files are still written beside the dashboard)")
+
+  all_reg <- db_q(con, glue("
+    WITH l AS (
+      SELECT LOT_NUM, cast(PATID as string) AS PATID,
+             CASE WHEN LOT_BASE_MEDS IS NULL OR trim(LOT_BASE_MEDS) = ''
+                  THEN concat('(no drug regimen - ',
+                              coalesce(LOT_START_TYPE, 'unknown'), ' start)')
+                  ELSE LOT_BASE_MEDS END AS regimen,
+             CASE WHEN LOT_BASE_MEDS IS NULL OR trim(LOT_BASE_MEDS) = ''
+                  THEN 0 ELSE 1 END AS is_drug_regimen
+      FROM {lot_long}
+    )
+    SELECT LOT_NUM, regimen, max(is_drug_regimen) AS is_drug_regimen,
+           count(DISTINCT PATID) AS n_patients,
+           count(*)              AS n_lines
+    FROM l GROUP BY LOT_NUM, regimen
+    ORDER BY LOT_NUM, n_patients DESC, regimen"))
+
+  denom_map <- setNames(as.numeric(denom$n_patients),
+                        as.character(as.integer(as.numeric(denom$LOT_NUM))))
+
+  for (ln in sort(unique(as.integer(as.numeric(all_reg$LOT_NUM))))) {
+    d <- all_reg[as.integer(as.numeric(all_reg$LOT_NUM)) == ln, , drop = FALSE]
+    dn <- denom_map[[as.character(ln)]] %||% NA_real_
+    disp <- as.character(d$regimen)
+    is_drug <- as.numeric(d$is_drug_regimen) == 1
+    disp[is_drug] <- disp_regimen(disp[is_drug])
+    df <- data.frame(
+      rank             = seq_len(nrow(d)),
+      display_regimen  = disp,
+      regimen_key      = as.character(d$regimen),
+      n_patients       = as.integer(as.numeric(d$n_patients)),
+      pct_of_line      = ifelse(rep(isTRUE(dn > 0), nrow(d)),
+                                round(100 * as.numeric(d$n_patients) / dn, 1),
+                                NA_real_),
+      n_lines          = as.integer(as.numeric(d$n_lines)),
+      stringsAsFactors = FALSE)
+
+    f <- file.path(out_dir, paste0("jul20_all_regimens_lot", ln, "_",
+                                   cohort_tag, "_", stamp, ".csv"))
+    ok <- isTRUE(tryCatch({ write.csv(df, f, row.names = FALSE); TRUE },
+                          error = function(e) {
+                            log_msg("  WARN: could not write ", f, " - ",
+                                    conditionMessage(e))
+                            FALSE
+                          }))
+    if (ok) {
+      st$csvs_written <- st$csvs_written + 1L
+      log_msg("  wrote all-regimens LOT", ln, " -> ", f, " (", nrow(df), " rows)")
+    } else {
+      st$csv_failures <- c(st$csv_failures, paste0("LOT", ln))
+    }
+
+    save_table(df, section = section,
+               title = paste0("LOT", ln, " - all regimens (", nrow(df),
+                              " distinct; every row, no top-N cut)"))
+  }
+
+  denom_df <- data.frame(line = paste0("LOT", as.integer(as.numeric(denom$LOT_NUM))),
+                         n_line_patients = as.integer(as.numeric(denom$n_patients)),
+                         stringsAsFactors = FALSE)
+  save_table(denom_df, section = section,
+             title = "Per-line patient denominators (behind pct_of_line)")
+
+  add_html_card(paste0(
+    '<div style="font-family:system-ui;padding:12px;max-width:860px">',
+    '<h3 style="margin:0 0 6px">Reading these lists</h3>',
+    '<p style="color:#555;font-size:13px">One table per line of therapy, every ',
+    'regimen string included. <code>display_regimen</code> uses the same ',
+    'most-common real-world agent order as the rest of this dashboard; ',
+    '<code>regimen_key</code> is the engine&#39;s canonical alphabetical form ',
+    'that the counts group on. Transplant / CAR-T-only lines appear as a ',
+    'labelled &quot;(no drug regimen ...)&quot; row so each list reconciles to ',
+    'its line denominator. Steroids never enter these strings. Use each ',
+    'table&#39;s CSV button to download the full list, or take the ',
+    'per-LOT CSV files written next to this dashboard.</p></div>'),
+    section = section, title = "About the all-regimens lists")
+
+  if (length(st$csv_failures))
+    st$reasons <- c(st$reasons,
+      paste0("CSV file(s) failed to write: ", paste(st$csv_failures, collapse = ", ")))
+  # Julia asked for a dashboard tab with downloadable lists, so completeness
+  # requires BOTH the in-dashboard tables/buttons (DT) and the physical CSVs.
+  st$ok <- (st$csvs_written == st$expected_lots) &&
+           (length(st$csv_failures) == 0) && isTRUE(st$has_dt)
+  st
+}
+
+# ===========================================================================
+# Steroid audit for the Validation section: no known steroid token should
+# occur in any LOT regimen string (the engine excludes steroids from LOT
+# membership by construction; this proves it on the data being displayed).
+# ===========================================================================
+build_steroid_audit_table <- function(con, lot_long, section = "Validation") {
+  ster_arr <- paste(sprintf("'%s'", AUDIT_STEROID_TOKENS), collapse = ", ")
+  audit <- tryCatch(db_q(con, glue("
+    WITH ll AS (
+      SELECT filter(split(LOT_BASE_MEDS, ' '), x -> length(x) > 0) AS meds
+      FROM {lot_long}
+      WHERE LOT_BASE_MEDS IS NOT NULL AND trim(LOT_BASE_MEDS) <> ''
+    )
+    SELECT count(*) AS n_lot_regimen_rows,
+           sum(CASE WHEN size(array_intersect(meds, array({ster_arr}))) > 0
+                    THEN 1 ELSE 0 END) AS n_rows_with_steroid_token
+    FROM ll")), error = function(e) NULL)
+  if (is.null(audit) || nrow(audit) == 0) {
+    add_html_card(paste0(
+      '<div style="font-family:system-ui;padding:12px;max-width:760px">',
+      '<h3>Steroid audit unavailable</h3><p style="color:#555;font-size:13px">',
+      'The steroid-in-regimen audit query could not run; the regimen strings ',
+      'are still built steroid-free by the engine, but this run could not ',
+      're-verify it.</p></div>'),
+      section = section, title = "Steroid audit (unavailable)")
+    return(invisible(NULL))
+  }
+  hits <- suppressWarnings(as.integer(as.numeric(audit$n_rows_with_steroid_token[1])))
+  save_table(audit, section = section,
+             title = paste0("Steroid audit - steroid tokens in any LOT regimen ",
+                            "(expected 0",
+                            if (isTRUE(hits > 0)) "; FAILED - investigate" else "",
+                            ")"))
+  if (isTRUE(hits > 0))
+    log_msg("WARNING: steroid audit FAILED - ", hits,
+            " regimen row(s) contain a steroid token.")
+  invisible(hits)
+}
+
+# ===========================================================================
+# NDMM helpers for the read-only refresh: rebind the session views the 06
+# builders expect onto the PERSISTED tables from the last production NDMM
+# run, and derive filter-status evidence from the flags themselves.
+# ===========================================================================
+ndmm_bind_persisted_views <- function(con) {
+  db_exec(con, glue("
+    CREATE OR REPLACE TEMPORARY VIEW {NDMM_FLAGS_ALL} AS
+    SELECT * FROM {wrk(NDMM_FLAGS_ALL_TBL)}"))
+  db_exec(con, glue("
+    CREATE OR REPLACE TEMPORARY VIEW {NDMM_LOT_LONG_FILT} AS
+    SELECT * FROM {wrk(NDMM_LOT_LONG_FILT_TBL)}"))
+  # Same final-selection predicate 06 uses when it builds NDMM_PATIDS.
+  db_exec(con, glue("
+    CREATE OR REPLACE TEMPORARY VIEW {NDMM_PATIDS} AS
+    SELECT PATID FROM {NDMM_FLAGS_ALL}
+    WHERE CE_pre_lot1_12mo        = 1
+      AND NO_BELANTAMAB           = 1
+      AND NO_PRIOR_MM_TX          = 1
+      AND NO_OTHER_CANCER_PRE_LOT1 = 1
+      AND CE_lot1_3mo_fu          = 1
+      AND NO_PREGNANCY            = 1"))
+  invisible(TRUE)
+}
+
+# Exact-PATID consistency between the two persisted NDMM tables: every
+# NDMM_LOT_LONG_FILT patient must be selected by the flags and vice versa.
+# Equal counts alone do not prove this (two 300-patient sets can differ), so
+# this anti-joins both directions. Uses NOT EXISTS (not NOT IN, which returns
+# UNKNOWN on a NULL PATID and can hide a real mismatch) and counts NULL
+# PATIDs separately. This proves the two tables select the same PATID set; it
+# does NOT prove they were built by the same engine run (no build id is
+# persisted). Returns list(ok, n_filt, n_flags, only_in_filt, only_in_flags,
+# n_null).
+ndmm_consistency_check <- function(con) {
+  d <- db_q(con, glue("
+    WITH filt AS (SELECT DISTINCT cast(PATID as string) AS PATID FROM {NDMM_LOT_LONG_FILT}),
+         sel  AS (SELECT DISTINCT cast(PATID as string) AS PATID FROM {NDMM_PATIDS})
+    SELECT (SELECT count(*) FROM filt WHERE PATID IS NOT NULL)           AS n_filt,
+           (SELECT count(*) FROM sel  WHERE PATID IS NOT NULL)           AS n_flags,
+           (SELECT count(*) FROM filt f
+             WHERE f.PATID IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM sel s WHERE s.PATID = f.PATID)) AS only_in_filt,
+           (SELECT count(*) FROM sel s
+             WHERE s.PATID IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM filt f WHERE f.PATID = s.PATID)) AS only_in_flags,
+           (SELECT count(*) FROM filt WHERE PATID IS NULL)
+             + (SELECT count(*) FROM sel WHERE PATID IS NULL)            AS n_null"))
+  n <- function(x) as.numeric(x)
+  only_filt  <- n(d$only_in_filt[1])
+  only_flags <- n(d$only_in_flags[1])
+  n_null     <- n(d$n_null[1])
+  list(ok = isTRUE(only_filt == 0 && only_flags == 0 && n_null == 0),
+       n_filt = n(d$n_filt[1]), n_flags = n(d$n_flags[1]),
+       only_in_filt = only_filt, only_in_flags = only_flags, n_null = n_null)
+}
+
+# A steroid-free NDMM overview card. Purpose-built for the refresh so no
+# steroid narrative leaks in (unlike reusing build_ndmm_overview_card with
+# zero codes). Describes the cohort and its NDMM filters, states the
+# persisted final count, and points to the authoritative production dashboard
+# for the full attrition funnel and the other-cancer QC (which this read-only
+# refresh does not reconstruct - see the P1 note in the header).
+build_refresh_ndmm_overview_card <- function(n_final, n_cat_rules, sync,
+                                             section = "OVERVIEW",
+                                             title = "What this dashboard shows") {
+  sync_html <- if (sync$ok)
+    paste0('<p style="color:#1a7a3a;font-size:13px;margin:6px 0 0">Consistency ',
+           'check passed: the persisted <code>NDMM_LOT_LONG_FILT</code> and ',
+           '<code>NDMM_FLAGS_ALL</code> select the same ',
+           format(sync$n_filt, big.mark = ","), ' patients (exact PATID ',
+           'anti-join, both directions, no NULL PATIDs). This confirms a ',
+           'matching patient SET; it does not by itself prove both tables were ',
+           'built by the same engine run (no build identifier is persisted).</p>')
+  else
+    paste0('<p style="color:#b00020;font-size:13px;margin:6px 0 0"><b>WARNING - ',
+           'persisted NDMM tables are OUT OF SYNC.</b> ',
+           format(sync$only_in_filt, big.mark = ","), ' patient(s) are in ',
+           '<code>NDMM_LOT_LONG_FILT</code> but not selected by the flags, ',
+           format(sync$only_in_flags, big.mark = ","), ' are selected by the ',
+           'flags but absent from the filtered table',
+           if (isTRUE(sync$n_null > 0)) paste0(', and ', format(sync$n_null, big.mark = ","),
+             ' NULL PATID(s) were found') else '',
+           '. The two tables do not describe the same cohort - re-run ',
+           '<code>06_ndmm_dashboard.R</code> before using this dashboard.</p>')
+  add_html_card(paste0(
+    '<div style="font-family:system-ui;padding:14px;max-width:900px">',
+    '<h3>NDMM (1L newly-diagnosed) planned cohort - July-20 refresh (steroid display removed)</h3>',
+    '<p style="color:#555;font-size:13px">Regimen-transition dashboard on the ',
+    'planned NDMM cohort: parent <code>ELIG_COH_FINAL</code> plus a NDMM-side ',
+    'LOT1 cutoff (<code>LOT_START_DT &ge; ', NDMM_LOT1_FROM, '</code>) and six ',
+    'NDMM post-filters - 12-mo CE before LOT1, 3-mo follow-up CE, no belantamab ',
+    'in any LOT, no MM oncology therapy in the 12-mo 1L baseline, no other active ',
+    'cancer in the 12-mo 1L baseline, and no pregnancy. Final cohort: <b>',
+    format(n_final, big.mark = ","), '</b> patients.</p>',
+    '<p style="color:#555;font-size:13px">Cohort membership and all LOT results ',
+    '(regimens, counts, start/end dates) come from the persisted ',
+    '<code>', esc_html(wrk(NDMM_LOT_LONG_FILT_TBL)), '</code> and ',
+    '<code>', esc_html(wrk(NDMM_FLAGS_ALL_TBL)), '</code> tables from the last ',
+    'production <code>06_ndmm_dashboard.R</code> run. Two changes vs that ',
+    'dashboard: the steroid display augmentation is bypassed (regimen strings ',
+    'are the engine&#39;s <code>LOT_BASE_MEDS</code>, which the engine builds ',
+    'without steroids; the steroid audit under Validation checks that no steroid ',
+    'token appears in any regimen), and an All-regimens section with CSV ',
+    'downloads is added.</p>',
+    '<p style="color:#555;font-size:13px"><b>Refreshed supporting views:</b> the ',
+    'agent display order (from <code>MAP_STACKED</code>) and the payer split ',
+    '(from <code>member_enrollment</code>) are drawn from the currently ',
+    'available sources, not from the persisted NDMM run. They do not affect the ',
+    'regimen counts; run this refresh right after ',
+    '<code>06_ndmm_dashboard.R</code> so those sources match the cohort.</p>',
+    '<p style="color:#a06000;font-size:13px;margin:6px 0 0"><b>Authoritative ',
+    'attrition &amp; QC:</b> the full attrition funnel and the other-cancer ',
+    'drop / override QC are NOT reconstructed here (rebuilding them from ',
+    'current parent tables could mix data vintages). They live in the ',
+    'production <code>ndmm_dashboard.html</code> from the run that produced this ',
+    'cohort. The per-filter status table below is derived only from the same ',
+    'persisted flags, so it shares this cohort&#39;s vintage.</p>',
+    sync_html,
+    '<ul style="font-size:13px;color:#1a7a3a;margin-top:10px">',
+    '<li><b>Category transitions</b>: regimen-category Sankeys per LOT pair (',
+    n_cat_rules, ' regimen rules loaded).</li>',
+    '<li><b>All regimens</b>: every regimen per LOT with a CSV download.</li>',
+    '<li><b>Progressor flows</b>: non-progressors dropped (inner-join LOTn &rarr; LOTn+1).</li>',
+    '</ul></div>'),
+    section = section, title = title)
+}
+
+# Per-filter exclusion counts from the persisted flags. A filter excluding
+# zero patients is either genuinely non-excluding or was skipped in the
+# producing run (a skipped filter passes all patients); the producing run's
+# own dashboard/log records which.
+ndmm_filter_status <- function(con) {
+  d <- db_q(con, glue("
+    SELECT count(*) AS n_flag_rows,
+           sum(CASE WHEN CE_pre_lot1_12mo         = 0 THEN 1 ELSE 0 END) AS x_ce12,
+           sum(CASE WHEN NO_BELANTAMAB            = 0 THEN 1 ELSE 0 END) AS x_bela,
+           sum(CASE WHEN NO_PRIOR_MM_TX           = 0 THEN 1 ELSE 0 END) AS x_priortx,
+           sum(CASE WHEN NO_OTHER_CANCER_PRE_LOT1 = 0 THEN 1 ELSE 0 END) AS x_othercancer,
+           sum(CASE WHEN CE_lot1_3mo_fu           = 0 THEN 1 ELSE 0 END) AS x_fuce,
+           sum(CASE WHEN NO_PREGNANCY             = 0 THEN 1 ELSE 0 END) AS x_preg
+    FROM {NDMM_FLAGS_ALL}"))
+  n <- function(x) as.integer(as.numeric(x))
+  df <- data.frame(
+    ndmm_filter = c("12-mo CE pre-LOT1", "No belantamab in any LOT",
+                    "No MM oncology Tx in 12-mo pre-LOT1",
+                    "No other active cancer in 12-mo pre-LOT1",
+                    "3-mo follow-up CE (from LOT1)", "No pregnancy"),
+    n_patients_failing = c(n(d$x_ce12[1]), n(d$x_bela[1]), n(d$x_priortx[1]),
+                           n(d$x_othercancer[1]), n(d$x_fuce[1]), n(d$x_preg[1])),
+    stringsAsFactors = FALSE)
+  df$note <- ifelse(df$n_patients_failing == 0,
+    "0 failures: either genuinely non-excluding, or the filter was skipped in the producing run (see that run's dashboard/log)",
+    "")
+  df
+}
+
+# TRUE only if the dashboard HTML was (re)written by THIS run - i.e. it exists
+# and its mtime is at/after the recorded run-start time. A file-existence
+# check alone would pass on a leftover HTML from a prior run when the current
+# build_dashboard() silently no-ops (no items, or jsonlite/base64enc missing).
+dashboard_written_this_run <- function(path, run_start) {
+  if (!file.exists(path)) return(FALSE)
+  isTRUE(tryCatch(file.info(path)$mtime >= run_start, error = function(e) FALSE))
+}
+
+# Writes the Q1 run-status file: TECHNICALLY COMPLETE - PENDING MANUAL REVIEW
+# when the dashboard built and every requested download was produced, else
+# INCOMPLETE with the reasons. Q1's analogue of the Q2/Q3 gate.
+write_refresh_status <- function(out_dir, cohort_tag, stamp, gaps, dash_written,
+                                 authoritative_dashboard = "production dashboard") {
+  f <- file.path(out_dir, paste0("jul20_refresh_run_status_", cohort_tag, "_", stamp, ".txt"))
+  lines <- if (length(gaps) == 0 && dash_written) {
+    c("RUN STATUS: TECHNICALLY COMPLETE - PENDING MANUAL REVIEW",
+      paste0("Generated ", stamp, " (", cohort_tag, ")."),
+      "The dashboard built and every requested all-regimen download was produced. This is NOT sign-off to share.",
+      paste0("Manual review still required: confirm the cohort matches the ",
+             authoritative_dashboard, ", and eyeball the all-regimen lists."))
+  } else {
+    c("RUN STATUS: INCOMPLETE",
+      paste0("Generated ", stamp, " (", cohort_tag, ")."),
+      if (!dash_written) "The dashboard HTML was not written (see the log)." else NULL,
+      if (length(gaps)) paste0(length(gaps), " issue(s):") else NULL,
+      paste0("  - ", gaps))
+  }
+  writeLines(lines, f)
+  log_msg("  wrote run status -> ", f)
+  invisible(f)
+}
+
+# ===========================================================================
+main_refresh <- function() {
+  stop_if_blank(cfg$pwd, "DATABRICKS_PWD environment variable is not set.")
+  cfg$build_dashboard <<- TRUE
+
+  con <- DBI::dbConnect(odbc::odbc(), dsn = cfg$dsn,
+                        pwd = cfg$pwd, timeout = 120)
+  on.exit(try(DBI::dbDisconnect(con), silent = TRUE), add = TRUE)
+
+  out_dir <- cfg$output_dir
+  if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  run_start <- Sys.time()
+  stamp <- format(run_start, "%Y%m%d_%H%M%S")
+
+  # NDMM by default, matching jul20_studyteam_qs.R so the July-20 pair always
+  # runs on one population unless the cohort is overridden explicitly.
+  cohort_mode <- toupper(Sys.getenv("LOT_COHORT", unset = "NDMM"))
+  if (cohort_mode %in% c("OVERALL", "FULL")) cohort_mode <- "OVERALL"
+  else cohort_mode <- "NDMM"
+
+  # Prefix every static PNG this refresh writes with cohort + timestamp so it
+  # can never overwrite a production dashboard PNG - or a previous July-refresh
+  # run's PNG - in a shared cfg$output_dir. The HTML the dashboard renders uses
+  # the in-memory plotly objects; this only namespaces the .png sidecar files.
+  cfg$plot_filename_prefix <<- paste0("jul20_refresh_", tolower(cohort_mode), "_", stamp, "_")
+
+  readable <- function(t) isTRUE(tryCatch(
+    nrow(db_q(con, glue("SELECT 1 FROM {t} LIMIT 1"))) >= 0,
+    error = function(e) FALSE))
+
+  log_msg(SEP)
+  log_msg("July-20 regimen dashboard refresh [", cohort_mode,
+          "] - steroid-free + all-regimen downloads")
+  log_msg(SEP)
+
+  gaps <- character()
+
+  if (cohort_mode == "NDMM") {
+    # ---- NDMM: build ONLY from the persisted NDMM cohort -----------------
+    # No current parent/raw tables are read for the funnel or QC, so nothing
+    # in this dashboard can mix data vintages. The authoritative attrition
+    # funnel and other-cancer QC stay in the production ndmm_dashboard.html.
+    if (!readable(wrk(NDMM_LOT_LONG_FILT_TBL)) ||
+        !readable(wrk(NDMM_FLAGS_ALL_TBL)))
+      stop("Cannot read ", wrk(NDMM_LOT_LONG_FILT_TBL), " and/or ",
+           wrk(NDMM_FLAGS_ALL_TBL), ". This refresh reads the persisted NDMM ",
+           "cohort - run 06_ndmm_dashboard.R first, or set LOT_COHORT=OVERALL ",
+           "for the overall-cohort refresh.")
+    ndmm_bind_persisted_views(con)
+    lot_view   <- NDMM_LOT_LONG_FILT
+    cohort_tag <- "ndmm"
+    out_name   <- "regimen_dashboard_refresh_ndmm.html"
+
+    # Exact-PATID consistency between the two persisted tables (not just a
+    # count match). A divergence means they come from different runs.
+    sync <- tryCatch(ndmm_consistency_check(con), error = function(e) {
+      log_msg("  WARN: NDMM consistency check failed to run (", conditionMessage(e), ")")
+      list(ok = FALSE, n_filt = NA, n_flags = NA, only_in_filt = NA, only_in_flags = NA)
+    })
+    if (!isTRUE(sync$ok)) {
+      log_msg("WARNING: persisted NDMM tables are OUT OF SYNC (only_in_filt=",
+              sync$only_in_filt, ", only_in_flags=", sync$only_in_flags,
+              ") - re-run 06_ndmm_dashboard.R.")
+      gaps <- c(gaps, paste0(
+        "persisted NDMM tables out of sync (", sync$only_in_filt,
+        " patients only in the filtered LOT table, ", sync$only_in_flags,
+        " only in the flags) - re-run 06_ndmm_dashboard.R"))
+    }
+    n_final <- sync$n_filt
+    filter_status <- tryCatch(ndmm_filter_status(con), error = function(e) NULL)
+
+    # Steroid augmentation BYPASSED: n_codes = 0 builds LOT_LONG_AUG as a
+    # plain passthrough temp view and returns before materialization, so the
+    # persisted REGIMEN_LOT_LONG_AUG of the production dashboards is never
+    # touched.
+    clear_steroid_counts()
+    augment_lot_long(con, lot_view,
+                     cdm_src(cfg$tbl_rx), cdm_src(cfg$tbl_medical), 0L)
+    REGIMEN_MODAL_MAP <<- build_modal_map(con, lot_view)
+    lookups <- load_categories()
+    n_rules <- length(lookups$lookup_1L) + length(lookups$lookup_2L)
+
+    # ---- Build: persisted-cohort sections, steroid-free, plus all regimens
+    dashboard_items <<- list()
+    build_cohort_kpis(con, lot_view, section = "OVERVIEW")
+    build_refresh_ndmm_overview_card(n_final, n_rules, sync)
+    if (!is.null(filter_status))
+      save_table(filter_status, section = "OVERVIEW",
+                 title = "NDMM per-filter status (from the persisted flags)")
+
+    # (STEROIDS section intentionally omitted - the July-20 request.)
+    # (Attrition funnel + other-cancer QC intentionally left to the
+    #  authoritative production dashboard - see the overview card.)
+    build_payer_lot_qc(con, section = "Payer")
+    for (n in 1:4) build_focused_pair(con, n, n + 1L)
+    for (n in 1:4) build_category_pair(con, n, n + 1L, lookups)
+    build_category_coverage(con, lookups)
+    reg_st <- build_all_regimens_section(con, lot_view, out_dir, stamp, cohort_tag)
+    build_patient_gallery(con, lot_view, section = "Patient examples")
+    build_validation_views(con, lot_view, section = "Validation",
+                           ndmm_flags_tbl = NDMM_FLAGS_ALL)
+    steroid_hits <- build_steroid_audit_table(con, lot_view, section = "Validation")
+    add_html_card(paste0(
+      '<div style="font-family:system-ui;padding:12px;max-width:760px">',
+      '<h3>Run comparison omitted</h3><p style="color:#555;font-size:13px">',
+      'The run-comparison view appends rows to the permanent ',
+      '<code>lot_dashboard_run_summary</code> table. This refresh script ',
+      'writes no permanent tables, so that view is left to the production ',
+      'dashboard runs.</p></div>'),
+      section = "Validation", title = "Run comparison (omitted by design)")
+
+    # Q1 completeness: missing downloads or a failed steroid audit are gaps.
+    if (!isTRUE(reg_st$ok))
+      gaps <- c(gaps, paste0("all-regimen downloads incomplete: ",
+                             paste(reg_st$reasons, collapse = "; ")))
+    steroid_clean <- isTRUE(!is.null(steroid_hits) && steroid_hits == 0)
+    if (!steroid_clean)
+      gaps <- c(gaps, "steroid audit did not confirm steroid-free regimens - the dashboard is NOT titled steroid-free")
+
+    title_tag <- if (steroid_clean) " &mdash; July-20 refresh (steroid-free)"
+                 else " &mdash; July-20 refresh (STEROID AUDIT UNCONFIRMED)"
+    build_dashboard(
+      out_name     = out_name,
+      header_title = paste0("MM LOT &mdash; NDMM (1L newly-diagnosed) planned cohort", title_tag),
+      header_sub   = paste0("ELIG_COH_FINAL &bull; LOT1 &ge; ", NDMM_LOT1_FROM,
+                            " &bull; 12-mo CE pre-LOT1 &bull; 3-mo FU CE",
+                            " &bull; no belantamab &bull; no MM Tx pre-LOT1",
+                            " &bull; no other cancer pre-LOT1 &bull; no pregnancy",
+                            " &bull; all regimens per LOT (CSV downloads)",
+                            " &bull; ", format(n_final, big.mark = ","),
+                            " patients"))
+    dash_written <- dashboard_written_this_run(
+      file.path(cfg$output_dir, out_name), run_start)
+    if (dash_written) log_msg("Wrote ", file.path(cfg$output_dir, out_name))
+    else gaps <- c(gaps, "dashboard HTML was not written by this run (build_dashboard skipped, or only a stale file from a prior run exists) - see the log")
+    write_refresh_status(out_dir, cohort_tag, stamp, gaps, dash_written,
+                         authoritative_dashboard = "authoritative production NDMM dashboard (ndmm_dashboard.html)")
+
+  } else {
+    # ---- OVERALL: mirror 05_regimen_dashboard.R --------------------------
+    lot_long   <- wrk("LOT_LONG")
+    cohort_tag <- "overall"
+    out_name   <- "regimen_dashboard_refresh_overall.html"
+    if (!readable(lot_long))
+      stop("Cannot read ", lot_long,
+           ". Build the LOT pipeline (02_lot1.R / 03_lot2_5.R) first.")
+
+    clear_steroid_counts()
+    augment_lot_long(con, lot_long,
+                     cdm_src(cfg$tbl_rx), cdm_src(cfg$tbl_medical), 0L)
+    REGIMEN_MODAL_MAP <<- build_modal_map(con, lot_long)
+    lookups <- load_categories()
+    n_rules <- length(lookups$lookup_1L) + length(lookups$lookup_2L)
+    log_msg("  ", n_rules, " category rules loaded; steroid augmentation bypassed.")
+
+    dashboard_items <<- list()
+    build_cohort_kpis(con, lot_long, section = "OVERVIEW")
+    add_html_card(paste0(
+      '<div style="font-family:system-ui;padding:14px;max-width:900px">',
+      '<h3>Regimen transitions - overall cohort (July-20 refresh: steroid display removed)</h3>',
+      '<p style="color:#555;font-size:13px">The same regimen dashboard, rebuilt ',
+      'with two changes requested on July 20 and nothing else:</p>',
+      '<ul style="font-size:13px;color:#1a7a3a;margin-top:0">',
+      '<li><b>Steroid display removed</b>: the steroid display augmentation is ',
+      'bypassed and the STEROIDS views are omitted. Regimen strings are the ',
+      'engine&#39;s <code>LOT_BASE_MEDS</code>, which the engine builds without ',
+      'steroids; the steroid audit under Validation checks that no steroid token ',
+      'appears in any regimen. LOT boundaries and counts are unchanged - ',
+      'steroids never entered the LOT rules.</li>',
+      '<li><b>All regimens per LOT</b>: a new section lists every regimen for ',
+      'each line, with a CSV download per list.</li>',
+      '</ul>',
+      '<p style="color:#555;font-size:13px">Category transitions (',
+      n_rules, ' regimen rules loaded) and all other views are built by the ',
+      'existing dashboard code, in the existing display order (agent order from ',
+      '<code>MAP_STACKED</code>, payer from <code>member_enrollment</code> - ',
+      'both from the currently available sources). ',
+      'Non-progressors are dropped from the Sankeys (inner-join LOTn &rarr; ',
+      'LOTn+1), as before.</p></div>'),
+      section = "OVERVIEW", title = "What this refresh shows")
+    build_overall_attrition(con)
+    # (STEROIDS section intentionally omitted - the July-20 request.)
+    build_payer_lot_qc(con, section = "Payer")
+    for (n in 1:4) build_focused_pair(con, n, n + 1L)
+    for (n in 1:4) build_category_pair(con, n, n + 1L, lookups)
+    build_category_coverage(con, lookups)
+    reg_st <- build_all_regimens_section(con, lot_long, out_dir, stamp, cohort_tag)
+    build_patient_gallery(con, lot_long, section = "Patient examples")
+    build_validation_views(con, lot_long, section = "Validation")
+    steroid_hits <- build_steroid_audit_table(con, lot_long, section = "Validation")
+    add_html_card(paste0(
+      '<div style="font-family:system-ui;padding:12px;max-width:760px">',
+      '<h3>Run comparison omitted</h3><p style="color:#555;font-size:13px">',
+      'The run-comparison view appends rows to the permanent ',
+      '<code>lot_dashboard_run_summary</code> table. This refresh script ',
+      'writes no permanent tables, so that view is left to the production ',
+      'dashboard runs.</p></div>'),
+      section = "Validation", title = "Run comparison (omitted by design)")
+
+    if (!isTRUE(reg_st$ok))
+      gaps <- c(gaps, paste0("all-regimen downloads incomplete: ",
+                             paste(reg_st$reasons, collapse = "; ")))
+    steroid_clean <- isTRUE(!is.null(steroid_hits) && steroid_hits == 0)
+    if (!steroid_clean)
+      gaps <- c(gaps, "steroid audit did not confirm steroid-free regimens - the dashboard is NOT titled steroid-free")
+
+    title_tag  <- if (steroid_clean) " &mdash; July-20 refresh (steroid-free)"
+                  else " &mdash; July-20 refresh (STEROID AUDIT UNCONFIRMED)"
+    sub_lead   <- if (steroid_clean) "Steroid-free regimens"
+                  else "Steroid display removed (audit unconfirmed)"
+    build_dashboard(
+      out_name     = out_name,
+      header_title = paste0("MM LOT &mdash; Regimen transitions (overall cohort)", title_tag),
+      header_sub   = paste0(sub_lead, " &bull; LOT-pair Sankeys ",
+                            "&bull; By category &bull; All regimens per LOT ",
+                            "(CSV downloads)")
+    )
+    dash_written <- dashboard_written_this_run(
+      file.path(cfg$output_dir, out_name), run_start)
+    if (dash_written) log_msg("Wrote ", file.path(cfg$output_dir, out_name))
+    else gaps <- c(gaps, "dashboard HTML was not written by this run (build_dashboard skipped, or only a stale file from a prior run exists) - see the log")
+    write_refresh_status(out_dir, cohort_tag, stamp, gaps, dash_written,
+                         authoritative_dashboard = "authoritative production overall dashboard (regimen_dashboard.html)")
+  }
+}
+
+if (!interactive() && !isTRUE(getOption("jul20_refresh_dashboard.no_autorun"))) {
+  main_refresh()
+}
+
+#!/usr/bin/env Rscript
 # July-20 study-team questions Q2 + Q3 -> focused CSVs + short summaries.
 #
 #   Rscript jul20_studyteam_qs.R
@@ -61,11 +749,14 @@
 #       line, so read literally no MELP ever advances a line. The summary file
 #       lists the questions the study team needs to answer before a scenario
 #       is built.
-#   (b) CAR-T: lists LOT1s currently ended by a CAR-T inside the 60-day
-#       induction window, what folding the CART-started LOT2 back into LOT1
-#       would look like, and the lines-per-patient shift. For affected
-#       patients with no LOT2 row, the merged LOT1 end cannot be derived from
-#       existing outputs; those rows are flagged.
+#   (b) CAR-T: covers EVERY patient whose first CAR-T falls inside the LOT1
+#       induction window (60 days by default; an override is surfaced as a
+#       gap because the rule names 60), classified by how the current engine
+#       handled the CAR-T. The fold-back merge and lines-per-patient shift
+#       are computed for the patients whose LOT1 ended by the CAR-T and whose
+#       LOT2 is CART-started; the other groups (no LOT2 row / LOT1 ended for
+#       another reason / LOT2 not CART-started) stay visible in the roster
+#       and are flagged, since only a scenario re-run can resolve them.
 #
 # Every run also writes a validation-summary file with automated
 # reconciliation checks (one row per patient, definition audits, category
@@ -701,39 +1392,56 @@ q3_cart_screen <- function(con, lot_long, sct_tbl, w1) {
       sum(CASE WHEN cart_in_window = 1 AND ended_by_cart = 1
                 AND L2 IS NULL THEN 1 ELSE 0 END)                       AS n_affected_without_lot2_end_not_derivable,
       sum(CASE WHEN cart_in_window = 1 AND ended_by_cart = 1
-                AND L2_TYPE = 'CART' THEN 1 ELSE 0 END)                 AS n_affected_lot2_type_cart
+                AND L2_TYPE = 'CART' THEN 1 ELSE 0 END)                 AS n_affected_lot2_type_cart,
+      sum(CASE WHEN cart_in_window = 1 AND ended_by_cart = 1
+                AND L2_TYPE = 'CART' AND L2 <> CART_DT
+               THEN 1 ELSE 0 END)                                       AS n_group1_lot2_not_on_cart_date
     FROM _jul20_cart"))
 
-  timing <- db_q(con, "
-    SELECT CASE
-             WHEN CART_DT IS NULL THEN '(no CAR-T on/after LOT1)'
-             WHEN days_from_lot1_start = 0 THEN 'day 0 (on the LOT1 start date)'
-             WHEN days_from_lot1_start BETWEEN 1 AND 29 THEN 'day 1-29'
-             WHEN days_from_lot1_start BETWEEN 30 AND 59 THEN 'day 30-59'
-             ELSE 'day 60+ (outside the induction window)'
-           END AS first_cart_timing,
+  mid <- max(2L, as.integer(floor(w1 / 2)))
+  timing <- db_q(con, glue("
+    SELECT first_cart_timing,
            count(*)            AS n_patients,
            sum(ended_by_cart)  AS n_lot1_ended_by_cart
-    FROM _jul20_cart
-    GROUP BY CASE
-             WHEN CART_DT IS NULL THEN '(no CAR-T on/after LOT1)'
-             WHEN days_from_lot1_start = 0 THEN 'day 0 (on the LOT1 start date)'
-             WHEN days_from_lot1_start BETWEEN 1 AND 29 THEN 'day 1-29'
-             WHEN days_from_lot1_start BETWEEN 30 AND 59 THEN 'day 30-59'
-             ELSE 'day 60+ (outside the induction window)'
-           END
-    ORDER BY first_cart_timing")
+    FROM (
+      SELECT CASE
+               WHEN CART_DT IS NULL THEN '(no CAR-T on/after LOT1)'
+               WHEN days_from_lot1_start = 0 THEN 'day 0 (on the LOT1 start date)'
+               WHEN days_from_lot1_start BETWEEN 1 AND {mid - 1} THEN 'day 1-{mid - 1}'
+               WHEN days_from_lot1_start BETWEEN {mid} AND {w1 - 1} THEN 'day {mid}-{w1 - 1}'
+               ELSE 'day {w1}+ (outside the induction window)'
+             END AS first_cart_timing,
+             ended_by_cart
+      FROM _jul20_cart
+    ) t
+    GROUP BY first_cart_timing
+    ORDER BY first_cart_timing"))
 
+  # The fold-back merge applies only to group 1 (LOT1 ended by the CAR-T and
+  # a CART-started LOT2 exists); groups 2-4 stay visible in the roster but do
+  # not move in the screened shift.
   shift <- db_q(con, "
     SELECT n_lots,
            count(*) AS n_patients,
            sum(CASE WHEN cart_in_window = 1 AND ended_by_cart = 1
-                     AND L2 IS NOT NULL THEN 1 ELSE 0 END) AS n_losing_one_line
+                     AND L2 IS NOT NULL AND L2_TYPE = 'CART'
+                    THEN 1 ELSE 0 END) AS n_losing_one_line
     FROM _jul20_cart
     GROUP BY n_lots ORDER BY n_lots")
 
+  # Every in-window CAR-T patient stays in the affected universe, classified
+  # by how the current engine handled the CAR-T.
   roster <- db_q(con, "
     SELECT PATID,
+           CASE
+             WHEN ended_by_cart = 1 AND L2 IS NOT NULL AND L2_TYPE = 'CART'
+               THEN '1: LOT1 ended by CAR-T; CART-started LOT2 folds back'
+             WHEN ended_by_cart = 1 AND L2 IS NULL
+               THEN '2: LOT1 ended by CAR-T; no LOT2 - merged end not derivable'
+             WHEN ended_by_cart = 1
+               THEN '4: LOT1 ended by CAR-T; LOT2 not CART-started - review individually'
+             ELSE '3: in-window CAR-T but LOT1 currently ends for another reason - needs the scenario re-run'
+           END AS screen_group,
            cast(L1 as string)      AS lot1_start_dt,
            cast(L1_END as string)  AS lot1_end_dt,
            END_REASON              AS lot1_end_reason,
@@ -744,14 +1452,16 @@ q3_cart_screen <- function(con, lot_long, sct_tbl, w1) {
            L2_REGIMEN              AS lot2_regimen,
            cast(L2_END as string)  AS lot2_end_dt,
            L2_END_REASON           AS lot2_end_reason,
-           CASE WHEN L2 IS NOT NULL THEN cast(L2_END as string)
-                ELSE '(not derivable - no LOT2 row; needs the scenario re-run)' END
+           CASE WHEN ended_by_cart = 1 AND L2 IS NOT NULL AND L2_TYPE = 'CART'
+                THEN cast(L2_END as string)
+                ELSE '(not derivable from existing outputs - needs the scenario re-run)' END
                                    AS screened_merged_lot1_end,
            n_lots                  AS n_lots_current,
-           CASE WHEN L2 IS NOT NULL THEN n_lots - 1 ELSE n_lots END AS n_lots_screened
+           CASE WHEN ended_by_cart = 1 AND L2 IS NOT NULL AND L2_TYPE = 'CART'
+                THEN n_lots - 1 ELSE n_lots END AS n_lots_screened
     FROM _jul20_cart
-    WHERE cart_in_window = 1 AND ended_by_cart = 1
-    ORDER BY PATID")
+    WHERE cart_in_window = 1
+    ORDER BY screen_group, PATID")
 
   list(inventory = inv, timing = timing, shift = shift, roster = roster)
 }
@@ -1075,17 +1785,43 @@ main <- function() {
   if (!isTRUE(tok$resolved))
     gaps <- c(gaps,
       "Agent tokens could not be resolved from cl_mma_codelist.csv - fell back to defaults (DARA/BORT/MELP); every token-based answer is unverified")
+  # Julia's CAR-T rule names the 60-day induction window explicitly. The
+  # screen uses the environment's configured window (VQS_W1), so an override
+  # must be surfaced rather than silently changing what the screen means.
+  if (VQS_W1 != 60L)
+    gaps <- c(gaps, sprintf(
+      "induction window is %d days in this environment but the July-20 CAR-T rule names 60 - confirm the setting before using the Q3b screen", VQS_W1))
 
-  # Automated reconciliation checks collected along the way.
+  # Automated reconciliation checks collected along the way. flag_only = TRUE
+  # records a visible FLAG (a caveat the reader must see) without marking the
+  # run incomplete; plain FALSE is a FAIL and forces INCOMPLETE.
   checks <- list()
-  add_check <- function(name, ok, detail) {
-    status <- if (is.na(ok)) "SKIPPED" else if (ok) "PASS" else "FAIL"
+  add_check <- function(name, ok, detail, flag_only = FALSE) {
+    status <- if (is.na(ok)) "SKIPPED"
+              else if (ok) "PASS"
+              else if (flag_only) "FLAG" else "FAIL"
     checks[[length(checks) + 1L]] <<- data.frame(
       check = name, status = status, detail = detail, stringsAsFactors = FALSE)
     if (identical(status, "FAIL")) {
       log_msg("  CHECK FAIL: ", name, " - ", detail)
       gaps <<- c(gaps, paste0("validation check failed: ", name, " (", detail, ")"))
     }
+    if (identical(status, "FLAG"))
+      log_msg("  CHECK FLAG: ", name, " - ", detail)
+  }
+
+  # Central required-output gate: every answer Julia asked for must either
+  # produce real data or force the run INCOMPLETE. A best_effort() status
+  # table anywhere in the required set registers a gap here, so "technically
+  # complete" can never coexist with a failed required output.
+  require_result <- function(x, label) {
+    if (is.null(x) || is_status_table(x)) {
+      msg <- if (is.data.frame(x) && nrow(x) > 0)
+        substr(as.character(x$status[1]), 1, 200) else "no result"
+      gaps <<- c(gaps, paste0("required output failed: ", label, " - ", msg))
+      return(FALSE)
+    }
+    TRUE
   }
 
   n_lot1 <- num(db_q(con, glue(
@@ -1122,6 +1858,7 @@ main <- function() {
     ctx <- best_effort(q2_context_counts(con, lot_long, tok$dara, tok$bort),
                        "exact-dual vs contains-both context")
     write_out(ctx, "dual_definition_and_context")
+    require_result(ctx, "Q2 exact-dual vs contains-both context")
     if (!is_status_table(ctx)) {
       n_exact_ctx <- ctx$n_patients[2]
       add_check("dual_definition_consistent", isTRUE(n_exact_ctx == n_dual),
@@ -1160,10 +1897,15 @@ main <- function() {
     }, error = function(e) FALSE))
     if (enr_ok) {
       have_payer <- !is_status_table(best_effort(q2_build_payer_view(con, enr), "payer lookup"))
-      payer_note <- paste0("Payer = member_enrollment.BUS on the enrollment span covering the ",
-                           "LOT1 start (MCR = Medicare, COM = Commercial; Medicare wins overlaps; ",
-                           "blank = Unknown; else Other(<BUS>)). Anchor is the LOT1 start date - ",
-                           "if payer at diagnosis / across LOT1 / ever is wanted instead, that is a different derivation.")
+      if (have_payer) {
+        payer_note <- paste0("Payer = member_enrollment.BUS on the enrollment span covering the ",
+                             "LOT1 start (MCR = Medicare, COM = Commercial; Medicare wins overlaps; ",
+                             "blank = Unknown; else Other(<BUS>)). Anchor is the LOT1 start date - ",
+                             "if payer at diagnosis / across LOT1 / ever is wanted instead, that is a different derivation.")
+      } else {
+        payer_note <- "The payer lookup could not be built (see the log), so payer is unavailable this run."
+        gaps <- c(gaps, "Q2d payer derivation failed - the payer lookup view could not be built")
+      }
     } else {
       payer_note <- "member_enrollment.BUS was not readable, so payer is unavailable this run."
       gaps <- c(gaps, "Q2d payer unavailable - member_enrollment.BUS not readable")
@@ -1175,14 +1917,20 @@ main <- function() {
     reg_src <- q2_region_source_from_env(con, describe_cols)
     if (!is.null(reg_src$tbl)) {
       have_region <- !is_status_table(best_effort(q2_build_region_view(con, reg_src), "region lookup"))
-      region_note <- sprintf(
-        "Region = %s.%s (approved via REGION_SOURCE_TABLE/REGION_SOURCE_COLUMN; %s). Values are passed through untouched - confirm them in the region_value_counts file.",
-        reg_src$tbl, reg_src$col,
-        if (reg_src$has_spans) "anchored to the enrollment span covering the LOT1 start"
-        else "per-patient modal value - the table has no span dates")
-      if (have_region)
+      if (have_region) {
+        region_note <- sprintf(
+          "Region = %s.%s (approved via REGION_SOURCE_TABLE/REGION_SOURCE_COLUMN; %s). Values are passed through untouched - confirm them in the region_value_counts file.",
+          reg_src$tbl, reg_src$col,
+          if (reg_src$has_spans) "anchored to the enrollment span covering the LOT1 start"
+          else "per-patient modal value - the table has no span dates")
         write_out(best_effort(q2_region_values(con), "region value counts"),
                   "region_value_counts")
+      } else {
+        region_note <- sprintf(
+          "The region lookup on the approved source %s.%s could not be built (see the log), so region is unavailable this run.",
+          reg_src$tbl, reg_src$col)
+        gaps <- c(gaps, "Q2d region derivation failed - the region lookup view could not be built")
+      }
     } else {
       region_note <- paste0("Region unavailable: ", reg_src$reason,
                             ". Candidate columns are listed in the region_candidate_columns file; ",
@@ -1193,7 +1941,27 @@ main <- function() {
     log_msg("  ", region_note)
 
     if (have_agent) {
+      # The exact-dual definition came from LOT_BASE_MEDS; the episodes come
+      # from the separately persisted MAP_STACKED. Every exact-dual patient
+      # must have at least one LOT1 episode of EACH agent - a shortfall means
+      # the two persisted tables are out of sync (e.g. a stale MAP_STACKED).
+      agt <- best_effort(db_q(con, glue("
+        SELECT sum(CASE WHEN agent = '{tok$dara}' THEN 1 ELSE 0 END) AS n_dara_patients,
+               sum(CASE WHEN agent = '{tok$bort}' THEN 1 ELSE 0 END) AS n_bort_patients
+        FROM _jul20_dual_agent")), "per-agent episode completeness")
+      if (!is_status_table(agt)) {
+        add_check("every_dual_patient_has_dara_episodes",
+                  isTRUE(num(agt$n_dara_patients[1]) == n_dual),
+                  sprintf("%s of %d dual patients have a DARA episode in LOT1 (MAP_STACKED may be stale/out of sync if lower)",
+                          agt$n_dara_patients[1], as.integer(n_dual)))
+        add_check("every_dual_patient_has_bort_episodes",
+                  isTRUE(num(agt$n_bort_patients[1]) == n_dual),
+                  sprintf("%s of %d dual patients have a BORT episode in LOT1 (MAP_STACKED may be stale/out of sync if lower)",
+                          agt$n_bort_patients[1], as.integer(n_dual)))
+      }
+
       q2_util <- best_effort(q2_utilization_summary(con, have_claims), "utilization per agent")
+      require_result(q2_util, "Q2a utilization summary")
       if (!is_status_table(q2_util)) {
         write_out(q2_util$summary, "utilization_summary")
         write_out(q2_util$distribution, "episode_distribution")
@@ -1214,6 +1982,7 @@ main <- function() {
 
       map_detail <- best_effort(q2_map_detail(con, map_tbl, tok$dara, tok$bort, VQS_W1),
                                 "DARA+BORT MAP detail")
+      require_result(map_detail, "Q2a per-episode MAP detail")
       if (!is_status_table(map_detail)) {
         during <- map_detail[num(map_detail$starts_in_lot1) == 1, , drop = FALSE]
         after  <- map_detail[num(map_detail$starts_in_lot1) != 1, , drop = FALSE]
@@ -1231,8 +2000,8 @@ main <- function() {
         write_out(map_detail, "dara_bort_maps_during_lot1")
       }
     } else {
-      gaps <- c(gaps, "Q2a episodes unavailable - MAP_STACKED unreadable")
-      add_check("roster_one_row_per_patient", NA, "skipped - MAP_STACKED unreadable")
+      gaps <- c(gaps, "Q2a episodes unavailable - the per-agent episode view could not be built (MAP_STACKED unreadable or view creation failed)")
+      add_check("roster_one_row_per_patient", NA, "skipped - per-agent episode view unavailable")
     }
 
     # Definition audit: every dual patient has exactly the two expected tokens.
@@ -1253,6 +2022,7 @@ main <- function() {
 
     q2_l2 <- best_effort(q2_lot2_regimens(con, lot_long, n_dual), "2L regimens of the dual cohort")
     write_out(q2_l2, "lot2_regimens")
+    require_result(q2_l2, "Q2b 2L regimen distribution")
     if (!is_status_table(q2_l2))
       add_check("lot2_categories_sum_to_dual",
                 isTRUE(sum(q2_l2$n_patients) == n_dual),
@@ -1262,6 +2032,7 @@ main <- function() {
     if (have_coh) {
       q2_dx <- best_effort(q2_diagnosis_years(con, coh_tbl, n_dual), "diagnosis years")
       write_out(q2_dx, "diagnosis_years")
+      require_result(q2_dx, "Q2c diagnosis years")
       if (!is_status_table(q2_dx))
         add_check("diagnosis_years_sum_to_dual",
                   isTRUE(sum(q2_dx$n_patients) == n_dual),
@@ -1273,6 +2044,7 @@ main <- function() {
 
     xt <- best_effort(q2_region_payer_crosstab(con, have_region, have_payer, n_dual),
                       "region x payer crosstab")
+    require_result(xt, "Q2d region x payer cross-tab")
     if (!is_status_table(xt)) {
       write_out(xt$long, "region_payer_counts")
       if (!is.null(xt$wide)) write_out(xt$wide, "region_payer_grid")
@@ -1296,19 +2068,29 @@ main <- function() {
     write_out(cart$timing, "cart_rule_timing")
     write_out(q3_cart_shift_table(cart$shift), "cart_rule_lines_shift")
     write_out(cart$roster, "cart_rule_affected_patients")
-    n_aff <- num(cart$inventory$n_affected_lot1_ended_by_cart[1])
-    n_bad_type <- num(cart$inventory$n_affected_with_lot2_to_merge[1]) -
-                  num(cart$inventory$n_affected_lot2_type_cart[1])
-    add_check("cart_affected_lot2_is_cart_started",
-              isTRUE(!is.na(n_bad_type) && n_bad_type == 0),
-              sprintf("%s affected patient(s) whose LOT2 is not CART-started (screen assumption violated)",
-                      n_bad_type))
-    add_check("cart_affected_all_have_expected_end_reason", TRUE,
-              sprintf("%s affected LOT1s, all with END_REASON SCT_CART/CART_INIT by construction",
-                      n_aff))
+    inv <- cart$inventory
+    n_group3 <- num(inv$n_in_window_not_ending_lot1[1])
+    n_group4 <- num(inv$n_affected_with_lot2_to_merge[1]) -
+                num(inv$n_affected_lot2_type_cart[1])
+    n_bad_l2_date <- num(inv$n_group1_lot2_not_on_cart_date[1])
+    add_check("cart_screened_shift_covers_all_in_window_patients",
+              isTRUE(!is.na(n_group3) && n_group3 == 0),
+              sprintf("%s in-window CAR-T patient(s) whose LOT1 currently ends for another reason (group 3) - in the roster but outside the fold-back shift; the scenario re-run must cover them",
+                      n_group3),
+              flag_only = TRUE)
+    add_check("cart_group4_lot2_not_cart_started",
+              isTRUE(!is.na(n_group4) && n_group4 == 0),
+              sprintf("%s patient(s) whose LOT1 ended by CAR-T but LOT2 is not CART-started (group 4; e.g. a same-day higher-priority transplant) - excluded from the fold-back, review individually",
+                      n_group4),
+              flag_only = TRUE)
+    add_check("cart_group1_lot2_starts_on_cart_date",
+              isTRUE(!is.na(n_bad_l2_date) && n_bad_l2_date == 0),
+              sprintf("%s group-1 patient(s) whose CART-started LOT2 does not start on the first CAR-T date - engine-output inconsistency, investigate",
+                      n_bad_l2_date))
   } else {
     write_out(cart, "cart_rule_inventory")
-    gaps <- c(gaps, "Q3b CAR-T screen unavailable - LOT1_SCT unreadable")
+    gaps <- c(gaps, paste0("Q3b CAR-T screen unavailable - ",
+                           substr(as.character(cart$status[1]), 1, 200)))
   }
 
   melp <- if (have_map)
@@ -1328,7 +2110,8 @@ main <- function() {
     }
   } else {
     write_out(melp, "melp_rule_totals")
-    gaps <- c(gaps, "Q3a MELP screen unavailable - MAP_STACKED unreadable")
+    gaps <- c(gaps, paste0("Q3a MELP screen unavailable - ",
+                           substr(as.character(melp$status[1]), 1, 200)))
   }
 
   # ======================================================================
@@ -1364,7 +2147,17 @@ main <- function() {
     "The melp_rule_inventory file buckets every MELP-attributable boundary by timing against the first MELP MAP of its line (including 'no earlier MELP' rows), so each candidate reading can be sized from the same table. The lines-shift file shows the current lines-per-patient distribution next to the screened distributions under the literal and the narrow (60-180-day-only) readings.",
     "",
     "-- (b) CAR-T induction-window rule --",
-    "Today a CAR-T on/after the LOT1 start - including inside the 60-day induction window - ends LOT1 the day before (SCT_CART, or CART_INIT within 45 days of an added agent) and opens a CART-started LOT2. The screen lists the LOT1s that would instead keep their CAR-T, what folding the CART LOT2 back into LOT1 would look like, and the lines-per-patient shift. Affected patients WITHOUT a LOT2 row are flagged: their merged LOT1 end cannot be derived from existing outputs.",
+    sprintf(paste0(
+      "Under the current engine a CAR-T occurring while LOT1 is open ends it the day before ",
+      "(SCT_CART, or CART_INIT when it lands within %d days of an added agent) and opens a ",
+      "CART-started LOT2. The screen covers EVERY patient whose first CAR-T falls inside the ",
+      "%d-day induction window (LOT1 start .. start+%dd) and classifies them: ",
+      "(1) LOT1 ended by the CAR-T and a CART-started LOT2 exists - the fold-back merge is computed for these; ",
+      "(2) LOT1 ended by the CAR-T but no LOT2 row exists - the merged end is not derivable from existing outputs; ",
+      "(3) the CAR-T is in-window but LOT1 currently ends for another reason - the rule may still touch these patients, and only the scenario re-run can say how; ",
+      "(4) LOT1 ended by the CAR-T but LOT2 is not CART-started (e.g. a same-day higher-priority transplant) - excluded from the fold-back. ",
+      "Groups 2-4 are flagged in the validation summary; the lines-per-patient shift covers group 1 only and is a lower bound on the change."),
+      VQS_CART, VQS_W1, VQS_W1 - 1),
     "",
     paste0("Files: see jul20_qs_*_", tolower(cohort_mode), "_", stamp,
            ".csv alongside this summary; the validation_summary file carries the automated reconciliation checks, and the run_status file distinguishes 'technically complete - pending manual review' from an incomplete run."))
@@ -1399,7 +2192,8 @@ main <- function() {
       if (nzchar(region_note)) region_note else "(not derived)",
       "PRELIMINARY affected-patient/boundary screen over existing LOT output; NOT an engine re-run; exact impact needs an isolated scenario re-derivation",
       "a line transition attributable to melphalan: prior line ended MED_ADD with MELP as the added drug, and/or the next line is MED-started on a MELP MAP start date",
-      "a LOT1 ended by CAR-T (SCT_CART/CART_INIT) whose first CAR-T date falls within LOT1 start .. start+59d"),
+      sprintf("any patient whose first CAR-T date falls within LOT1 start .. start+%dd (the %d-day induction window), classified by how the current engine handled the CAR-T; the fold-back merge is computed only for those whose LOT1 ended by the CAR-T and whose LOT2 is CART-started",
+              VQS_W1 - 1, VQS_W1)),
     stringsAsFactors = FALSE)
   write_out(defs, "definitions")
 
@@ -1433,345 +2227,4 @@ main <- function() {
 
 if (!interactive()) {
   main()
-}
-
-
-#!/usr/bin/env Rscript
-# July-20 refresh of the regimen dashboard: same dashboard, steroids removed,
-# plus an "All regimens" section with a downloadable long list per LOT.
-#
-#   Rscript jul20_refresh_dashboard.R
-#
-# A standalone wrapper around 05_regimen_dashboard.R (which is NOT modified).
-# It sources 05 with its no-autorun option and rebuilds the same dashboard,
-# section for section and in the same order, with exactly the two requested
-# changes and nothing else:
-#
-#   REMOVED  - the steroid augmentation (LOT_BASE_MEDS_AUG is a passthrough of
-#              the engine's LOT_BASE_MEDS, which never contains a steroid), so
-#              every regimen string in every Sankey / table is steroid-free;
-#   REMOVED  - the STEROIDS section (prevalence / missing-steroid / timing QC);
-#   ADDED    - an "All regimens" section: every regimen per LOT (no top-N cut),
-#              displayed in the same modal/clinical order the current dashboard
-#              uses, downloadable from each table's CSV button and also written
-#              as one CSV file per LOT next to the dashboard.
-#
-# Everything else is the existing dashboard, built by 05's own builders:
-# KPI snapshot, overview, cohort attrition, payer split, LOT-pair regimen
-# Sankeys, category Sankeys + coverage, patient gallery, validation views.
-# Regimen display order is unchanged (REGIMEN_MODAL_MAP via build_modal_map),
-# so the only visible regimen difference vs the current dashboard is the
-# absence of steroid tokens.
-#
-# Two deliberate departures, both surfaced on the dashboard itself:
-#   - The run-comparison view is omitted: it appends rows to the permanent
-#     <work>.lot_dashboard_run_summary table, and this answer script writes
-#     no permanent tables. A note card marks the omission.
-#   - A steroid audit table is added to the Validation section proving that
-#     no known steroid token occurs in any LOT regimen string.
-#
-# Cohort: the NDMM study cohort by default (NDMM_LOT_LONG_FILT) - the cohort
-# the July-20 questions name, and the same default as the sibling
-# jul20_studyteam_qs.R, so running the pair without env overrides always uses
-# one population. Set LOT_COHORT=OVERALL (or FULL) to refresh the overall-
-# cohort dashboard that 05 builds; the parent attrition card appears only in
-# overall mode (it describes the parent cohort funnel, not the NDMM subset).
-#
-# Run sequence for the pair (state the cohort explicitly when sending run
-# instructions; do not rely on defaults):
-#   LOT_COHORT=NDMM Rscript jul20_refresh_dashboard.R
-#   LOT_COHORT=NDMM Rscript jul20_studyteam_qs.R
-#
-# Output: regimen_dashboard_refresh_ndmm.html (or _overall.html) in
-# cfg$output_dir, plus jul20_all_regimens_lot<N>_<cohort>_<stamp>.csv files.
-# Writes no permanent tables (only session temp views). Safe to run any time.
-
-.script_dir <- local({
-  args <- commandArgs(trailingOnly = FALSE)
-  file_arg <- grep("^--file=", args, value = TRUE)
-  if (length(file_arg) > 0)
-    return(dirname(normalizePath(sub("^--file=", "", file_arg[1]))))
-  for (i in seq_len(sys.nframe())) {
-    ofile <- tryCatch(sys.frame(i)$ofile, error = function(e) NULL)
-    if (!is.null(ofile)) return(dirname(normalizePath(ofile)))
-  }
-  getwd()
-})
-
-# Source the existing regimen dashboard WITHOUT running it. 05 sources
-# load_inputs / config_lot / db_utils_lot / dashboard_lot / dashboard_validation
-# itself, so all shared helpers, builders and palettes arrive through it.
-options(regimen_dashboard.no_autorun = TRUE,
-        regimen_dashboard.script_dir = .script_dir)
-source(file.path(.script_dir, "05_regimen_dashboard.R"))
-
-`%||%` <- function(a, b) if (is.null(a)) b else a
-
-# The steroid short-codes used across the repo's codelists; the audit checks
-# regimens against this fixed list (same list as the July-11 Q1 audit).
-AUDIT_STEROID_TOKENS <- c("DEX", "DEXA", "DEXAMETHASONE", "DEXAMETH",
-                          "PRED", "PREDNISONE", "PREDNISOLONE",
-                          "METHYLPRED", "METHYLPREDNISOLONE", "MPRED")
-
-# ===========================================================================
-# The new section: every regimen per LOT, one table per line, in the same
-# display order the rest of the dashboard uses (modal start-order, clinical
-# fallback). Counting stays on the canonical alphabetical LOT_BASE_MEDS key;
-# display_regimen is display-only. Each table is downloadable via its CSV
-# button, and the full list is also written as a CSV file per LOT.
-# ===========================================================================
-build_all_regimens_section <- function(con, lot_long, out_dir, stamp,
-                                       cohort_tag,
-                                       section = "All regimens") {
-  denom <- db_q(con, glue("
-    SELECT LOT_NUM, count(DISTINCT cast(PATID as string)) AS n_patients
-    FROM {lot_long} GROUP BY LOT_NUM ORDER BY LOT_NUM"))
-  if (nrow(denom) == 0) {
-    add_html_card(paste0(
-      '<div style="font-family:system-ui;padding:12px;max-width:760px">',
-      '<h3>All regimens unavailable</h3><p style="color:#555;font-size:13px">',
-      'No LOT rows were found in <code>', esc_html(lot_long), '</code>.</p></div>'),
-      section = section, title = "All regimens (unavailable)")
-    return(invisible(NULL))
-  }
-
-  all_reg <- db_q(con, glue("
-    WITH l AS (
-      SELECT LOT_NUM, cast(PATID as string) AS PATID,
-             CASE WHEN LOT_BASE_MEDS IS NULL OR trim(LOT_BASE_MEDS) = ''
-                  THEN concat('(no drug regimen - ',
-                              coalesce(LOT_START_TYPE, 'unknown'), ' start)')
-                  ELSE LOT_BASE_MEDS END AS regimen,
-             CASE WHEN LOT_BASE_MEDS IS NULL OR trim(LOT_BASE_MEDS) = ''
-                  THEN 0 ELSE 1 END AS is_drug_regimen
-      FROM {lot_long}
-    )
-    SELECT LOT_NUM, regimen, max(is_drug_regimen) AS is_drug_regimen,
-           count(DISTINCT PATID) AS n_patients,
-           count(*)              AS n_lines
-    FROM l GROUP BY LOT_NUM, regimen
-    ORDER BY LOT_NUM, n_patients DESC, regimen"))
-
-  denom_map <- setNames(as.numeric(denom$n_patients),
-                        as.character(as.integer(as.numeric(denom$LOT_NUM))))
-
-  for (ln in sort(unique(as.integer(as.numeric(all_reg$LOT_NUM))))) {
-    d <- all_reg[as.integer(as.numeric(all_reg$LOT_NUM)) == ln, , drop = FALSE]
-    dn <- denom_map[[as.character(ln)]] %||% NA_real_
-    disp <- as.character(d$regimen)
-    is_drug <- as.numeric(d$is_drug_regimen) == 1
-    disp[is_drug] <- disp_regimen(disp[is_drug])
-    df <- data.frame(
-      rank             = seq_len(nrow(d)),
-      display_regimen  = disp,
-      regimen_key      = as.character(d$regimen),
-      n_patients       = as.integer(as.numeric(d$n_patients)),
-      pct_of_line      = ifelse(rep(isTRUE(dn > 0), nrow(d)),
-                                round(100 * as.numeric(d$n_patients) / dn, 1),
-                                NA_real_),
-      n_lines          = as.integer(as.numeric(d$n_lines)),
-      stringsAsFactors = FALSE)
-
-    f <- file.path(out_dir, paste0("jul20_all_regimens_lot", ln, "_",
-                                   cohort_tag, "_", stamp, ".csv"))
-    ok <- isTRUE(tryCatch({ write.csv(df, f, row.names = FALSE); TRUE },
-                          error = function(e) {
-                            log_msg("  WARN: could not write ", f, " - ",
-                                    conditionMessage(e))
-                            FALSE
-                          }))
-    if (ok) log_msg("  wrote all-regimens LOT", ln, " -> ", f,
-                    " (", nrow(df), " rows)")
-
-    save_table(df, section = section,
-               title = paste0("LOT", ln, " - all regimens (", nrow(df),
-                              " distinct; every row, no top-N cut)"))
-  }
-
-  denom_df <- data.frame(line = paste0("LOT", as.integer(as.numeric(denom$LOT_NUM))),
-                         n_line_patients = as.integer(as.numeric(denom$n_patients)),
-                         stringsAsFactors = FALSE)
-  save_table(denom_df, section = section,
-             title = "Per-line patient denominators (behind pct_of_line)")
-
-  add_html_card(paste0(
-    '<div style="font-family:system-ui;padding:12px;max-width:860px">',
-    '<h3 style="margin:0 0 6px">Reading these lists</h3>',
-    '<p style="color:#555;font-size:13px">One table per line of therapy, every ',
-    'regimen string included. <code>display_regimen</code> uses the same ',
-    'most-common real-world agent order as the rest of this dashboard; ',
-    '<code>regimen_key</code> is the engine&#39;s canonical alphabetical form ',
-    'that the counts group on. Transplant / CAR-T-only lines appear as a ',
-    'labelled &quot;(no drug regimen ...)&quot; row so each list reconciles to ',
-    'its line denominator. Steroids never enter these strings. Use each ',
-    'table&#39;s CSV button to download the full list, or take the ',
-    'per-LOT CSV files written next to this dashboard.</p></div>'),
-    section = section, title = "About the all-regimens lists")
-
-  invisible(denom_df)
-}
-
-# ===========================================================================
-# Steroid audit for the Validation section: no known steroid token should
-# occur in any LOT regimen string (the engine excludes steroids from LOT
-# membership by construction; this proves it on the data being displayed).
-# ===========================================================================
-build_steroid_audit_table <- function(con, lot_long, section = "Validation") {
-  ster_arr <- paste(sprintf("'%s'", AUDIT_STEROID_TOKENS), collapse = ", ")
-  audit <- tryCatch(db_q(con, glue("
-    WITH ll AS (
-      SELECT filter(split(LOT_BASE_MEDS, ' '), x -> length(x) > 0) AS meds
-      FROM {lot_long}
-      WHERE LOT_BASE_MEDS IS NOT NULL AND trim(LOT_BASE_MEDS) <> ''
-    )
-    SELECT count(*) AS n_lot_regimen_rows,
-           sum(CASE WHEN size(array_intersect(meds, array({ster_arr}))) > 0
-                    THEN 1 ELSE 0 END) AS n_rows_with_steroid_token
-    FROM ll")), error = function(e) NULL)
-  if (is.null(audit) || nrow(audit) == 0) {
-    add_html_card(paste0(
-      '<div style="font-family:system-ui;padding:12px;max-width:760px">',
-      '<h3>Steroid audit unavailable</h3><p style="color:#555;font-size:13px">',
-      'The steroid-in-regimen audit query could not run; the regimen strings ',
-      'are still built steroid-free by the engine, but this run could not ',
-      're-verify it.</p></div>'),
-      section = section, title = "Steroid audit (unavailable)")
-    return(invisible(NULL))
-  }
-  hits <- suppressWarnings(as.integer(as.numeric(audit$n_rows_with_steroid_token[1])))
-  save_table(audit, section = section,
-             title = paste0("Steroid audit - steroid tokens in any LOT regimen ",
-                            "(expected 0",
-                            if (isTRUE(hits > 0)) "; FAILED - investigate" else "",
-                            ")"))
-  if (isTRUE(hits > 0))
-    log_msg("WARNING: steroid audit FAILED - ", hits,
-            " regimen row(s) contain a steroid token.")
-  invisible(hits)
-}
-
-# ===========================================================================
-main_refresh <- function() {
-  stop_if_blank(cfg$pwd, "DATABRICKS_PWD environment variable is not set.")
-  cfg$build_dashboard <<- TRUE
-
-  con <- DBI::dbConnect(odbc::odbc(), dsn = cfg$dsn,
-                        pwd = cfg$pwd, timeout = 120)
-  on.exit(try(DBI::dbDisconnect(con), silent = TRUE), add = TRUE)
-
-  out_dir <- cfg$output_dir
-  if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
-  stamp <- format(Sys.time(), "%Y%m%d_%H%M%S")
-
-  # NDMM by default, matching jul20_studyteam_qs.R so the July-20 pair always
-  # runs on one population unless the cohort is overridden explicitly.
-  cohort_mode <- toupper(Sys.getenv("LOT_COHORT", unset = "NDMM"))
-  if (cohort_mode %in% c("OVERALL", "FULL")) {
-    cohort_mode <- "OVERALL"
-    lot_long <- wrk("LOT_LONG")
-    cohort_label <- "overall cohort"
-    out_name <- "regimen_dashboard_refresh_overall.html"
-    cohort_tag <- "overall"
-  } else {
-    cohort_mode <- "NDMM"
-    lot_long <- wrk("NDMM_LOT_LONG_FILT")
-    cohort_label <- "NDMM newly-diagnosed 1L study cohort"
-    out_name <- "regimen_dashboard_refresh_ndmm.html"
-    cohort_tag <- "ndmm"
-  }
-
-  log_msg(SEP)
-  log_msg("July-20 regimen dashboard refresh [", cohort_label,
-          "] - steroid-free + all-regimen downloads")
-  log_msg(SEP)
-
-  readable <- function(t) isTRUE(tryCatch(
-    nrow(db_q(con, glue("SELECT 1 FROM {t} LIMIT 1"))) >= 0,
-    error = function(e) FALSE))
-  if (!readable(lot_long)) {
-    if (cohort_mode == "NDMM")
-      stop("Cannot read ", lot_long, ". Run 06_ndmm_dashboard.R first to persist ",
-           "NDMM_LOT_LONG_FILT, or set LOT_COHORT=OVERALL for the overall cohort.")
-    stop("Cannot read ", lot_long,
-         ". Build the LOT pipeline (02_lot1.R / 03_lot2_5.R) first.")
-  }
-
-  # --- Setup: steroid augmentation BYPASSED --------------------------------
-  # n_codes = 0 makes augment_lot_long() build LOT_LONG_AUG as a plain
-  # passthrough temp view (LOT_BASE_MEDS_AUG = LOT_BASE_MEDS) and return
-  # before the materialization step, so the persisted REGIMEN_LOT_LONG_AUG
-  # table of the production dashboard is never touched. Every 05 builder that
-  # reads LOT_LONG_AUG therefore shows the engine's steroid-free regimens.
-  clear_steroid_counts()
-  augment_lot_long(con, lot_long,
-                   cdm_src(cfg$tbl_rx), cdm_src(cfg$tbl_medical), 0L)
-  REGIMEN_MODAL_MAP <<- build_modal_map(con, lot_long)
-
-  lookups <- load_categories()
-  n_rules <- length(lookups$lookup_1L) + length(lookups$lookup_2L)
-  log_msg("  ", n_rules, " category rules loaded; steroid augmentation bypassed.")
-
-  # --- Build: the existing dashboard, minus steroids, plus all regimens ----
-  dashboard_items <<- list()
-
-  build_cohort_kpis(con, lot_long, section = "OVERVIEW")
-
-  add_html_card(paste0(
-    '<div style="font-family:system-ui;padding:14px;max-width:900px">',
-    '<h3>Regimen transitions - ', esc_html(cohort_label),
-    ' (July-20 refresh: steroids removed)</h3>',
-    '<p style="color:#555;font-size:13px">The same regimen dashboard, rebuilt ',
-    'with two changes requested on July 20 and nothing else:</p>',
-    '<ul style="font-size:13px;color:#1a7a3a;margin-top:0">',
-    '<li><b>Steroids removed</b>: the steroid display augmentation is bypassed ',
-    'and the STEROIDS views are omitted. Regimen strings come straight from ',
-    'the engine&#39;s <code>LOT_BASE_MEDS</code>, which never contains a ',
-    'steroid (see the steroid audit under Validation). LOT boundaries and ',
-    'counts are unchanged - steroids never entered the LOT rules.</li>',
-    '<li><b>All regimens per LOT</b>: a new section lists every regimen for ',
-    'each line, with a CSV download per list.</li>',
-    '</ul>',
-    '<p style="color:#555;font-size:13px">Category transitions (',
-    n_rules, ' regimen rules loaded) and all other views are built by the ',
-    'existing dashboard code, in the existing display order. ',
-    'Non-progressors are dropped from the Sankeys (inner-join LOTn &rarr; ',
-    'LOTn+1), as before.</p></div>'),
-    section = "OVERVIEW", title = "What this refresh shows")
-
-  if (cohort_mode == "OVERALL") build_overall_attrition(con)
-
-  # (STEROIDS section intentionally omitted - the July-20 request.)
-
-  build_payer_lot_qc(con, section = "Payer")
-  for (n in 1:4) build_focused_pair(con, n, n + 1L)
-  for (n in 1:4) build_category_pair(con, n, n + 1L, lookups)
-  build_category_coverage(con, lookups)
-
-  build_all_regimens_section(con, lot_long, out_dir, stamp, cohort_tag)
-
-  build_patient_gallery(con, lot_long, section = "Patient examples")
-  build_validation_views(con, lot_long, section = "Validation")
-  build_steroid_audit_table(con, lot_long, section = "Validation")
-  add_html_card(paste0(
-    '<div style="font-family:system-ui;padding:12px;max-width:760px">',
-    '<h3>Run comparison omitted</h3><p style="color:#555;font-size:13px">',
-    'The run-comparison view appends rows to the permanent ',
-    '<code>lot_dashboard_run_summary</code> table. This refresh script writes ',
-    'no permanent tables, so that view is left to the production dashboard ',
-    'runs.</p></div>'),
-    section = "Validation", title = "Run comparison (omitted by design)")
-
-  build_dashboard(
-    out_name     = out_name,
-    header_title = paste0("MM LOT &mdash; Regimen transitions (",
-                          esc_html(cohort_label), ") &mdash; July-20 refresh"),
-    header_sub   = paste0("Steroid-free regimens &bull; LOT-pair Sankeys ",
-                          "&bull; By category &bull; All regimens per LOT ",
-                          "(CSV downloads)")
-  )
-  log_msg("Wrote ", file.path(cfg$output_dir, out_name))
-}
-
-if (!interactive() && !isTRUE(getOption("jul20_refresh_dashboard.no_autorun"))) {
-  main_refresh()
 }
