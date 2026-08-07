@@ -1,0 +1,205 @@
+-- =============================================================================
+-- Queries that close five open register rows WITHOUT any judgement call
+-- =============================================================================
+-- Q25  LABALB delivered scale        <- run this one FIRST
+-- Q52  index-date granularity
+-- Q34  progression-date chronology
+-- Q42  next-treatment date vs index
+-- Q38  index line starting before its milestone
+--
+-- Schema below is what the preflight screenshots show. Change it in one place
+-- if the run environment differs.
+--
+-- ONE ASSUMPTION, worth a DESCRIBE before running Q52 and Q38:
+--   t_enh_prostate_lot is assumed to carry STARTDATEGRANULARITY. The column is
+--   NOT in validation/00_input_contract.csv because the build does not read it;
+--   its existence is inferred from the earlier preflight output. If the DESCRIBE
+--   shows a different name, fix it in Q52 only - nothing else depends on it.
+--
+-- NEW_LOT_N is DERIVED, not stored: it restarts at 1 within each of mHSPC and
+-- mCRPC, ordered by StartDate. Every query below reproduces that with the same
+-- window the build uses, so the numbers describe the delivered cohorts rather
+-- than the raw table.
+-- =============================================================================
+
+USE CATALOG hive_metastore;
+USE SCHEMA  rwd_flatiron_dataproducts;
+
+-- Shared definitions -----------------------------------------------------------
+-- (Databricks does not persist WITH across statements, so each query repeats
+--  these. They are identical everywhere - do not let them drift.)
+
+
+-- =============================================================================
+-- Q25  LABALB / LABALBV - is the delivered value g/L or g/dL?
+-- =============================================================================
+-- WHY IT MATTERS: the spec labels LABALBV "g/L" and filters on
+-- testunitscleaned='g/L', but no albumin row carries that unit, so the filter
+-- was dropped (register Q25). If the underlying values are g/dL the delivered
+-- column is out by a factor of ten.
+--
+-- HOW TO READ IT: serum albumin is ~3.5-5.0 g/dL, or ~35-50 g/L. The median
+-- settles it on sight. No judgement required.
+SELECT
+    labcomponent,
+    COALESCE(testunitscleaned, '<NULL>')                    AS unit,
+    COUNT(*)                                                AS n_rows,
+    COUNT(DISTINCT patientid)                               AS n_pts,
+    ROUND(MIN(testresultcleaned), 2)                        AS min_val,
+    ROUND(PERCENTILE_APPROX(testresultcleaned, 0.25), 2)    AS p25,
+    ROUND(PERCENTILE_APPROX(testresultcleaned, 0.50), 2)    AS median,
+    ROUND(PERCENTILE_APPROX(testresultcleaned, 0.75), 2)    AS p75,
+    ROUND(MAX(testresultcleaned), 2)                        AS max_val
+FROM t_lab_2026m06
+WHERE LOWER(testbasename) = 'albumin'
+  AND testresultcleaned IS NOT NULL
+GROUP BY labcomponent, COALESCE(testunitscleaned, '<NULL>')
+ORDER BY n_rows DESC;
+
+
+-- =============================================================================
+-- Q52  How many DELIVERED index dates are not day-granular?
+-- =============================================================================
+-- WHY IT MATTERS: for cohorts 3-7 the index date IS the line start date. A
+-- year-granular start almost certainly lands on 1 January, and every
+-- time-to-event variable plus the [-30,+7] biomarker and ECOG windows is
+-- measured from it.
+--
+-- HOW TO READ IT: this counts PATIENTS PER DELIVERED COHORT, not raw LOT rows,
+-- so it sizes the actual exposure in the ADS.
+WITH lot AS (
+    SELECT patientid, linesetting, startdate, startdategranularity,
+           ROW_NUMBER() OVER (PARTITION BY patientid, linesetting
+                              ORDER BY startdate)           AS new_lot_n
+    FROM t_enh_prostate_lot_2026m06
+    WHERE linesetting IN ('mHSPC', 'mCRPC')       -- exact match: nmHSPC/nmCRPC are different settings
+),
+ms AS (
+    SELECT patientid,
+           GREATEST(metastaticdiagnosisdate, hspcdate) AS mhspcdd,
+           GREATEST(metastaticdiagnosisdate, crpcdate) AS mcrpcdd
+    FROM t_enh_prostate_2026m06
+)
+SELECT
+    CASE WHEN l.linesetting = 'mHSPC' AND l.new_lot_n = 1 THEN '3 L1+ mHSPC'
+         WHEN l.linesetting = 'mCRPC' AND l.new_lot_n = 1 THEN '4 L1+ mCRPC'
+         WHEN l.linesetting = 'mCRPC' AND l.new_lot_n = 2 THEN '5 L2+ mCRPC'
+         WHEN l.linesetting = 'mCRPC' AND l.new_lot_n = 3 THEN '6 L3+ mCRPC'
+         WHEN l.linesetting = 'mCRPC' AND l.new_lot_n = 4 THEN '7 L4+ mCRPC'
+    END                                                     AS cohort,
+    COALESCE(l.startdategranularity, '<NULL>')              AS granularity,
+    COUNT(DISTINCT l.patientid)                             AS n_pts
+FROM lot l
+JOIN ms  m ON m.patientid = l.patientid
+WHERE l.startdate BETWEEN DATE'2011-01-01' AND DATE'2026-04-30'
+  AND (   (l.linesetting = 'mHSPC' AND m.mhspcdd BETWEEN DATE'2011-01-01' AND DATE'2026-04-30')
+       OR (l.linesetting = 'mCRPC' AND m.mcrpcdd BETWEEN DATE'2011-01-01' AND DATE'2026-04-30'))
+  AND (   (l.linesetting = 'mHSPC' AND l.new_lot_n = 1)
+       OR (l.linesetting = 'mCRPC' AND l.new_lot_n BETWEEN 1 AND 4))
+GROUP BY 1, 2
+ORDER BY 1, 3 DESC;
+
+
+-- =============================================================================
+-- Q34  Does progression get recorded after death or after the last note?
+-- =============================================================================
+-- WHY IT MATTERS: the build takes PFSDT as recorded, with no clamping and no
+-- exclusion. If these counts are ZERO the row closes with no decision at all.
+--
+-- CAVEAT, and it is not small: DateOfDeath is month/year granular in the source,
+-- so "progression after death" here is approximate at the month boundary. Treat
+-- a small non-zero count as "check the individual rows", not as proof.
+-- The evidence filter matches the build: any flag EXCEPT pseudo-progression.
+WITH prog AS (
+    SELECT patientid, progressiondate, lastclinicnotedate
+    FROM t_enh_prostate_prog_scled_2026m06
+    WHERE progressiondate IS NOT NULL
+      AND (   LOWER(isradiographicevidence)    = 'true'
+           OR LOWER(ispathologicevidence)      = 'true'
+           OR LOWER(ismixedresponsementioned)  = 'true'
+           OR LOWER(isphysicalexamevidence)    = 'true'
+           OR LOWER(istumormarkerevidence)     = 'true'
+           OR LOWER(ispsaincreased)            = 'true')
+)
+SELECT
+    COUNT(*)                                                            AS n_qualifying_prog_rows,
+    COUNT(DISTINCT p.patientid)                                         AS n_pts,
+    SUM(CASE WHEN p.lastclinicnotedate IS NOT NULL
+              AND p.progressiondate > p.lastclinicnotedate
+             THEN 1 ELSE 0 END)                                         AS n_after_last_note,
+    SUM(CASE WHEN d.dateofdeath IS NOT NULL
+              AND p.progressiondate > LAST_DAY(d.dateofdeath)
+             THEN 1 ELSE 0 END)                                         AS n_after_death_month_end
+FROM prog p
+LEFT JOIN t_mortality_v2_2026m06 d ON d.patientid = p.patientid;
+
+
+-- =============================================================================
+-- Q42  Can the next-treatment date fall on or before the index date?
+-- =============================================================================
+-- WHY IT MATTERS: TTNT takes the next line's start date with no requirement
+-- that it be after index. Because NEW_LOT_N is ordered BY startdate, line n+1
+-- can only precede line n if the two share a start date - which is also the
+-- Q24 tie condition. A zero here closes Q42 AND supports Q24.
+WITH lot AS (
+    SELECT patientid, linesetting, startdate,
+           LEAD(startdate) OVER (PARTITION BY patientid, linesetting
+                                 ORDER BY startdate)        AS next_startdate
+    FROM t_enh_prostate_lot_2026m06
+    WHERE linesetting IN ('mHSPC', 'mCRPC')
+)
+SELECT
+    linesetting,
+    COUNT(*)                          AS n_consecutive_pairs_same_or_earlier,
+    COUNT(DISTINCT patientid)         AS n_pts
+FROM lot
+WHERE next_startdate IS NOT NULL
+  AND next_startdate <= startdate
+GROUP BY linesetting
+ORDER BY linesetting;
+
+
+-- =============================================================================
+-- Q38  How often does the index LINE start before the MILESTONE it is joined to?
+-- =============================================================================
+-- WHY IT MATTERS: the cohort join matches on patientid only and enforces no
+-- chronology, so a patient can be indexed on an mCRPC line that started before
+-- they were mCRPC. This sizes it before the SME is asked to rule.
+WITH lot AS (
+    SELECT patientid, linesetting, startdate,
+           ROW_NUMBER() OVER (PARTITION BY patientid, linesetting
+                              ORDER BY startdate)           AS new_lot_n
+    FROM t_enh_prostate_lot_2026m06
+    WHERE linesetting IN ('mHSPC', 'mCRPC')
+),
+ms AS (
+    SELECT patientid,
+           GREATEST(metastaticdiagnosisdate, hspcdate) AS mhspcdd,
+           GREATEST(metastaticdiagnosisdate, crpcdate) AS mcrpcdd
+    FROM t_enh_prostate_2026m06
+)
+SELECT
+    CASE WHEN l.linesetting = 'mHSPC' AND l.new_lot_n = 1 THEN '3 L1+ mHSPC'
+         WHEN l.linesetting = 'mCRPC' AND l.new_lot_n = 1 THEN '4 L1+ mCRPC'
+         WHEN l.linesetting = 'mCRPC' AND l.new_lot_n = 2 THEN '5 L2+ mCRPC'
+         WHEN l.linesetting = 'mCRPC' AND l.new_lot_n = 3 THEN '6 L3+ mCRPC'
+         WHEN l.linesetting = 'mCRPC' AND l.new_lot_n = 4 THEN '7 L4+ mCRPC'
+    END                                                     AS cohort,
+    COUNT(DISTINCT l.patientid)                             AS n_pts_in_cohort,
+    COUNT(DISTINCT CASE
+        WHEN (l.linesetting = 'mHSPC' AND l.startdate < m.mhspcdd)
+          OR (l.linesetting = 'mCRPC' AND l.startdate < m.mcrpcdd)
+        THEN l.patientid END)                               AS n_pts_line_before_milestone,
+    ROUND(100.0 * COUNT(DISTINCT CASE
+        WHEN (l.linesetting = 'mHSPC' AND l.startdate < m.mhspcdd)
+          OR (l.linesetting = 'mCRPC' AND l.startdate < m.mcrpcdd)
+        THEN l.patientid END) / NULLIF(COUNT(DISTINCT l.patientid), 0), 1) AS pct
+FROM lot l
+JOIN ms  m ON m.patientid = l.patientid
+WHERE l.startdate BETWEEN DATE'2011-01-01' AND DATE'2026-04-30'
+  AND (   (l.linesetting = 'mHSPC' AND m.mhspcdd BETWEEN DATE'2011-01-01' AND DATE'2026-04-30')
+       OR (l.linesetting = 'mCRPC' AND m.mcrpcdd BETWEEN DATE'2011-01-01' AND DATE'2026-04-30'))
+  AND (   (l.linesetting = 'mHSPC' AND l.new_lot_n = 1)
+       OR (l.linesetting = 'mCRPC' AND l.new_lot_n BETWEEN 1 AND 4))
+GROUP BY 1
+ORDER BY 1;
