@@ -2,7 +2,58 @@
 -- Queries that close five open register rows WITHOUT any judgement call
 -- =============================================================================
 -- Q25  LABALB delivered scale        <- run this one FIRST
--- Q52  index-date granularity
+-- Q52  Index-date granularity  (Overall cohorts 1-2)
+-- ---------------------------------------------------------------------------
+-- CORRECTED. An earlier version of this query read startdategranularity from
+-- t_enh_prostate_lot. That column DOES NOT EXIST - the LOT table carries only
+-- patientid, linename, linenumber, linesetting, startdate, enddate. Cohorts
+-- 3-7 therefore cannot be checked for index-date precision from the source at
+-- all, and nothing so far shows their start dates are either precise or not.
+--
+-- What CAN be checked is cohorts 1 and 2, whose index date is
+--   cohort 1: max(MetastaticDiagnosisDate, HSPCDate)
+--   cohort 2: max(MetastaticDiagnosisDate, CRPCDate)
+-- Both components carry a granularity column on t_enh_prostate. The question
+-- is not "how granular is each component" - the profiler already answers that
+-- (hspcdate DAY 701 / MONTH 197 / YEAR 155) - but "how granular is the
+-- component that actually WINS the max()", since only that one becomes INDEXDT.
+SELECT cohortn,
+       win_granularity,
+       COUNT(*)                                              AS n_pts,
+       ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (PARTITION BY cohortn), 2) AS pct
+FROM (
+    SELECT 1 AS cohortn,
+           CASE WHEN p.metastaticdiagnosisdate >= p.hspcdate
+                  OR p.hspcdate IS NULL
+                THEN COALESCE(p.metastaticdiagnosisdategranularity, '<NULL>')
+                ELSE COALESCE(p.hspcdategranularity,               '<NULL>')
+           END AS win_granularity
+    FROM ${SCHEMA}.t_enh_prostate_2026m06 p
+    WHERE GREATEST(p.metastaticdiagnosisdate, p.hspcdate)
+          BETWEEN DATE '2011-01-01' AND DATE '2026-04-30'
+
+    UNION ALL
+
+    SELECT 2 AS cohortn,
+           CASE WHEN p.metastaticdiagnosisdate >= p.crpcdate
+                  OR p.crpcdate IS NULL
+                THEN COALESCE(p.metastaticdiagnosisdategranularity, '<NULL>')
+                ELSE COALESCE(p.crpcdategranularity,                '<NULL>')
+           END AS win_granularity
+    FROM ${SCHEMA}.t_enh_prostate_2026m06 p
+    WHERE GREATEST(p.metastaticdiagnosisdate, p.crpcdate)
+          BETWEEN DATE '2011-01-01' AND DATE '2026-04-30'
+) x
+GROUP BY cohortn, win_granularity
+ORDER BY cohortn, n_pts DESC;
+-- Reading it: YEAR on the winning component means INDEXDT is almost certainly
+-- 1 January of that year, and OS, FUDUR and the [-30,+7] biomarker and ECOG
+-- windows are all measured from it. If YEAR is ~0%, close the row.
+-- CONFIRM FIRST: the exact granularity column names on t_enh_prostate. Our
+-- input contract does not carry them (the build does not read them), so they
+-- are taken from the profiler. Run DESCRIBE if the query errors.
+
+
 -- Q34  progression-date chronology
 -- Q42  next-treatment date vs index
 -- Q38  index line starting before its milestone
