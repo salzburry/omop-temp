@@ -1,256 +1,370 @@
 -- =============================================================================
--- Queries that close five open register rows WITHOUT any judgement call
+-- Sizing queries for the four open register rows that must be COUNTED
+-- before anyone can sensibly rule on them
 -- =============================================================================
--- Q25  LABALB delivered scale        <- run this one FIRST
--- Q52  Index-date granularity  (Overall cohorts 1-2)
--- ---------------------------------------------------------------------------
--- CORRECTED. An earlier version of this query read startdategranularity from
--- t_enh_prostate_lot. That column DOES NOT EXIST - the LOT table carries only
--- patientid, linename, linenumber, linesetting, startdate, enddate. Cohorts
--- 3-7 therefore cannot be checked for index-date precision from the source at
--- all, and nothing so far shows their start dates are either precise or not.
+--   S1  Q58   labs + BP: "Missing" vs "Unknown" when every record is post-index
+--   S2  Q63   labs: does "testdate is not missing" mean the RAW or DERIVED date?
+--   S3  Q59   PSA50: is the PSABL > 0 guard ever load-bearing?
+--   S4  Q56   ECOG: how much does the [INDEX-30, INDEX+7] window cost cohorts 3-7?
 --
--- What CAN be checked is cohorts 1 and 2, whose index date is
---   cohort 1: max(MetastaticDiagnosisDate, HSPCDate)
---   cohort 2: max(MetastaticDiagnosisDate, CRPCDate)
--- Both components carry a granularity column on t_enh_prostate. The question
--- is not "how granular is each component" - the profiler already answers that
--- (hspcdate DAY 701 / MONTH 197 / YEAR 155) - but "how granular is the
--- component that actually WINS the max()", since only that one becomes INDEXDT.
-SELECT cohortn,
-       win_granularity,
-       COUNT(*)                                              AS n_pts,
-       ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (PARTITION BY cohortn), 2) AS pct
-FROM (
-    SELECT 1 AS cohortn,
-           CASE WHEN p.metastaticdiagnosisdate >= p.hspcdate
-                  OR p.hspcdate IS NULL
-                THEN COALESCE(p.metastaticdiagnosisdategranularity, '<NULL>')
-                ELSE COALESCE(p.hspcdategranularity,               '<NULL>')
-           END AS win_granularity
-    FROM ${SCHEMA}.t_enh_prostate_2026m06 p
-    WHERE GREATEST(p.metastaticdiagnosisdate, p.hspcdate)
-          BETWEEN DATE '2011-01-01' AND DATE '2026-04-30'
-
-    UNION ALL
-
-    SELECT 2 AS cohortn,
-           CASE WHEN p.metastaticdiagnosisdate >= p.crpcdate
-                  OR p.crpcdate IS NULL
-                THEN COALESCE(p.metastaticdiagnosisdategranularity, '<NULL>')
-                ELSE COALESCE(p.crpcdategranularity,                '<NULL>')
-           END AS win_granularity
-    FROM ${SCHEMA}.t_enh_prostate_2026m06 p
-    WHERE GREATEST(p.metastaticdiagnosisdate, p.crpcdate)
-          BETWEEN DATE '2011-01-01' AND DATE '2026-04-30'
-) x
-GROUP BY cohortn, win_granularity
-ORDER BY cohortn, n_pts DESC;
--- Reading it: YEAR on the winning component means INDEXDT is almost certainly
--- 1 January of that year, and OS, FUDUR and the [-30,+7] biomarker and ECOG
--- windows are all measured from it. If YEAR is ~0%, close the row.
--- CONFIRM FIRST: the exact granularity column names on t_enh_prostate. Our
--- input contract does not carry them (the build does not read them), so they
--- are taken from the profiler. Run DESCRIBE if the query errors.
-
-
--- Q34  progression-date chronology
--- Q42  next-treatment date vs index
--- Q38  index line starting before its milestone
+-- These are DESCRIPTIVE. None of them presumes an answer; each one produces the
+-- number that makes the ruling either obvious or unnecessary. Three of the four
+-- can close with NO code change if the count comes back zero.
 --
--- Schema below is what the preflight screenshots show. Change it in one place
--- if the run environment differs.
+-- Snapshot suffix is _2026m06 throughout (code/modules/00_setup.R: refresh).
+-- Index window is [2011-01-01, 2026-04-30] (index_start / index_end).
 --
--- ONE ASSUMPTION, worth a DESCRIBE before running Q52 and Q38:
---   t_enh_prostate_lot is assumed to carry STARTDATEGRANULARITY. The column is
---   NOT in validation/00_input_contract.csv because the build does not read it;
---   its existence is inferred from the earlier preflight output. If the DESCRIBE
---   shows a different name, fix it in Q52 only - nothing else depends on it.
---
--- NEW_LOT_N is DERIVED, not stored: it restarts at 1 within each of mHSPC and
--- mCRPC, ordered by StartDate. Every query below reproduces that with the same
--- window the build uses, so the numbers describe the delivered cohorts rather
--- than the raw table.
+-- NOTE ON GREATEST: Spark's GREATEST ignores NULL arguments and returns NULL
+-- only when every argument is NULL. That is the same semantics as the build's
+-- pmax(testdate, resultdate, na.rm = TRUE), so the derived lab date below
+-- matches what the build computes.
 -- =============================================================================
 
 USE CATALOG hive_metastore;
 USE SCHEMA  rwd_flatiron_dataproducts;
 
--- Shared definitions -----------------------------------------------------------
--- (Databricks does not persist WITH across statements, so each query repeats
---  these. They are identical everywhere - do not let them drift.)
-
 
 -- =============================================================================
--- Q25  LABALB / LABALBV - is the delivered value g/L or g/dL?
+-- S1  Q58 - labs: how many delivered rows would flip from Missing to Unknown?
 -- =============================================================================
--- WHY IT MATTERS: the spec labels LABALBV "g/L" and filters on
--- testunitscleaned='g/L', but no albumin row carries that unit, so the filter
--- was dropped (register Q25). If the underlying values are g/dL the delivered
--- column is out by a factor of ten.
+-- WHY IT MATTERS: the spec's Missing clause ("no record with testbasename = X
+-- is present in t_lab") carries no time qualifier; the build tests for a record
+-- only after restricting to labdate <= index_date. A patient whose only
+-- neutrophil result is post-index is therefore scored Missing today, but under
+-- the spec's literal wording HAS a record and should read Unknown.
 --
--- HOW TO READ IT: serum albumin is ~3.5-5.0 g/dL, or ~35-50 g/L. The median
--- settles it on sight. No judgement required.
+-- HOW TO READ IT: n_flip is the number of delivered rows that change label if
+-- the Missing test is un-windowed. LAB*V and LAB*DT do not move either way -
+-- only the three-way Present/Unknown/Missing flag. If n_flip is ~0 the
+-- distinction is academic and Q58 closes with no change.
+WITH ms AS (
+    SELECT patientid,
+           GREATEST(metastaticdiagnosisdate, hspcdate) AS mhspcdd,
+           GREATEST(metastaticdiagnosisdate, crpcdate) AS mcrpcdd
+    FROM t_enh_prostate_2026m06
+),
+lot AS (
+    SELECT patientid, linesetting, linenumber, startdate,
+           ROW_NUMBER() OVER (PARTITION BY patientid, linesetting
+                              ORDER BY startdate)           AS new_lot_n
+    FROM t_enh_prostate_lot_2026m06
+    WHERE linesetting IN ('mHSPC', 'mCRPC')
+),
+idx AS (
+    SELECT patientid, '1 Overall mHSPC' AS cohort, mhspcdd AS index_date
+    FROM ms WHERE mhspcdd BETWEEN DATE'2011-01-01' AND DATE'2026-04-30'
+    UNION ALL
+    SELECT patientid, '2 Overall mCRPC', mcrpcdd
+    FROM ms WHERE mcrpcdd BETWEEN DATE'2011-01-01' AND DATE'2026-04-30'
+    UNION ALL
+    SELECT l.patientid,
+           CASE WHEN l.linesetting = 'mHSPC' THEN '3 L1+ mHSPC'
+                WHEN l.new_lot_n = 1         THEN '4 L1+ mCRPC'
+                WHEN l.new_lot_n = 2         THEN '5 L2+ mCRPC'
+                WHEN l.new_lot_n = 3         THEN '6 L3+ mCRPC'
+                ELSE                              '7 L4+ mCRPC' END,
+           l.startdate
+    FROM lot l
+    JOIN ms  m ON m.patientid = l.patientid
+    WHERE l.startdate BETWEEN DATE'2011-01-01' AND DATE'2026-04-30'
+      AND ((l.linesetting = 'mHSPC' AND l.new_lot_n = 1
+            AND m.mhspcdd BETWEEN DATE'2011-01-01' AND DATE'2026-04-30')
+        OR (l.linesetting = 'mCRPC' AND l.new_lot_n BETWEEN 1 AND 4
+            AND m.mcrpcdd BETWEEN DATE'2011-01-01' AND DATE'2026-04-30'))
+),
+-- The ten analytes exactly as lab_spec defines them, component filter included.
+lab AS (
+    SELECT patientid,
+           CASE WHEN LOWER(testbasename) = 'neutrophils'                 THEN 'LABNEU'
+                WHEN LOWER(testbasename) = 'platelets'                   THEN 'LABPLA'
+                WHEN LOWER(testbasename) = 'hemoglobin'                  THEN 'LABHEM'
+                WHEN LOWER(testbasename) = 'creatinine'
+                     AND labcomponent = 'Creatinine, serum'              THEN 'LABCRE'
+                WHEN LOWER(testbasename) = 'bilirubin'                   THEN 'LABBIL'
+                WHEN LOWER(testbasename) = 'aspartate aminotransferase'  THEN 'LABAST'
+                WHEN LOWER(testbasename) = 'alanine aminotransferase'    THEN 'LABALT'
+                WHEN LOWER(testbasename) = 'alkaline phosphatase'        THEN 'LABALP'
+                WHEN LOWER(testbasename) = 'albumin'
+                     AND labcomponent = 'Albumin, serum'                 THEN 'LABALB'
+                WHEN LOWER(testbasename) = 'lymphocytes'                 THEN 'LABLYM'
+           END                                          AS analyte,
+           GREATEST(testdate, resultdate)               AS labdate
+    FROM t_lab_2026m06
+),
+-- One row per patient per analyte. first_labdate is NULL only when EVERY
+-- record for that analyte is undated - which is also a flip, because such a
+-- record exists but can never satisfy labdate <= index_date.
+pa AS (
+    SELECT patientid, analyte,
+           MIN(labdate) AS first_labdate,
+           COUNT(*)     AS n_records
+    FROM lab
+    WHERE analyte IS NOT NULL
+    GROUP BY patientid, analyte
+),
+denom AS (SELECT COUNT(*) AS n_index_rows FROM idx)
 SELECT
-    labcomponent,
-    COALESCE(testunitscleaned, '<NULL>')                    AS unit,
-    COUNT(*)                                                AS n_rows,
-    COUNT(DISTINCT patientid)                               AS n_pts,
-    ROUND(MIN(testresultcleaned), 2)                        AS min_val,
-    ROUND(PERCENTILE_APPROX(testresultcleaned, 0.25), 2)    AS p25,
-    ROUND(PERCENTILE_APPROX(testresultcleaned, 0.50), 2)    AS median,
-    ROUND(PERCENTILE_APPROX(testresultcleaned, 0.75), 2)    AS p75,
-    ROUND(MAX(testresultcleaned), 2)                        AS max_val
+    pa.analyte,
+    (SELECT n_index_rows FROM denom)                    AS n_index_rows_all,
+    COUNT(*)                                            AS n_index_rows_with_any_record,
+    SUM(CASE WHEN pa.first_labdate IS NULL
+                  OR pa.first_labdate > i.index_date
+             THEN 1 ELSE 0 END)                         AS n_flip_missing_to_unknown,
+    SUM(CASE WHEN pa.first_labdate IS NULL
+             THEN 1 ELSE 0 END)                         AS n_flip_all_records_undated,
+    ROUND(100.0 * SUM(CASE WHEN pa.first_labdate IS NULL
+                                OR pa.first_labdate > i.index_date
+                           THEN 1 ELSE 0 END)
+          / NULLIF((SELECT n_index_rows FROM denom), 0), 3) AS pct_of_all_index_rows
+FROM idx i
+JOIN pa ON pa.patientid = i.patientid
+GROUP BY pa.analyte
+ORDER BY n_flip_missing_to_unknown DESC;
+
+
+-- =============================================================================
+-- S1b  Q58 - the same question for BP
+-- =============================================================================
+-- BP scores Missing when no systolic OR diastolic vitals record exists at all;
+-- the build applies testdate <= index_date first, exactly as with the labs.
+WITH ms AS (
+    SELECT patientid,
+           GREATEST(metastaticdiagnosisdate, hspcdate) AS mhspcdd,
+           GREATEST(metastaticdiagnosisdate, crpcdate) AS mcrpcdd
+    FROM t_enh_prostate_2026m06
+),
+lot AS (
+    SELECT patientid, linesetting, linenumber, startdate,
+           ROW_NUMBER() OVER (PARTITION BY patientid, linesetting
+                              ORDER BY startdate)           AS new_lot_n
+    FROM t_enh_prostate_lot_2026m06
+    WHERE linesetting IN ('mHSPC', 'mCRPC')
+),
+idx AS (
+    SELECT patientid, '1 Overall mHSPC' AS cohort, mhspcdd AS index_date
+    FROM ms WHERE mhspcdd BETWEEN DATE'2011-01-01' AND DATE'2026-04-30'
+    UNION ALL
+    SELECT patientid, '2 Overall mCRPC', mcrpcdd
+    FROM ms WHERE mcrpcdd BETWEEN DATE'2011-01-01' AND DATE'2026-04-30'
+    UNION ALL
+    SELECT l.patientid,
+           CASE WHEN l.linesetting = 'mHSPC' THEN '3 L1+ mHSPC'
+                WHEN l.new_lot_n = 1         THEN '4 L1+ mCRPC'
+                WHEN l.new_lot_n = 2         THEN '5 L2+ mCRPC'
+                WHEN l.new_lot_n = 3         THEN '6 L3+ mCRPC'
+                ELSE                              '7 L4+ mCRPC' END,
+           l.startdate
+    FROM lot l
+    JOIN ms  m ON m.patientid = l.patientid
+    WHERE l.startdate BETWEEN DATE'2011-01-01' AND DATE'2026-04-30'
+      AND ((l.linesetting = 'mHSPC' AND l.new_lot_n = 1
+            AND m.mhspcdd BETWEEN DATE'2011-01-01' AND DATE'2026-04-30')
+        OR (l.linesetting = 'mCRPC' AND l.new_lot_n BETWEEN 1 AND 4
+            AND m.mcrpcdd BETWEEN DATE'2011-01-01' AND DATE'2026-04-30'))
+),
+bp AS (
+    SELECT patientid, MIN(testdate) AS first_bpdate, COUNT(*) AS n_records
+    FROM t_vitals_2026m06
+    WHERE LOWER(test) IN ('systolic blood pressure', 'diastolic blood pressure')
+    GROUP BY patientid
+)
+SELECT
+    'BP'                                                AS variable,
+    (SELECT COUNT(*) FROM idx)                          AS n_index_rows_all,
+    COUNT(*)                                            AS n_index_rows_with_any_record,
+    SUM(CASE WHEN bp.first_bpdate IS NULL
+                  OR bp.first_bpdate > i.index_date
+             THEN 1 ELSE 0 END)                         AS n_flip_missing_to_unknown
+FROM idx i
+JOIN bp ON bp.patientid = i.patientid;
+
+
+-- =============================================================================
+-- S2  Q63 - labs: raw testdate or derived max(testdate, resultdate)?
+-- =============================================================================
+-- STEP 1, and it may be the only step. The reading matters ONLY for rows where
+-- testdate is null but resultdate is populated. If this returns nothing, Q63
+-- closes with no code change and no argument about interpretation.
+SELECT
+    CASE WHEN LOWER(testbasename) = 'neutrophils'                 THEN 'LABNEU'
+         WHEN LOWER(testbasename) = 'platelets'                   THEN 'LABPLA'
+         WHEN LOWER(testbasename) = 'hemoglobin'                  THEN 'LABHEM'
+         WHEN LOWER(testbasename) = 'creatinine'
+              AND labcomponent = 'Creatinine, serum'              THEN 'LABCRE'
+         WHEN LOWER(testbasename) = 'bilirubin'                   THEN 'LABBIL'
+         WHEN LOWER(testbasename) = 'aspartate aminotransferase'  THEN 'LABAST'
+         WHEN LOWER(testbasename) = 'alanine aminotransferase'    THEN 'LABALT'
+         WHEN LOWER(testbasename) = 'alkaline phosphatase'        THEN 'LABALP'
+         WHEN LOWER(testbasename) = 'albumin'
+              AND labcomponent = 'Albumin, serum'                 THEN 'LABALB'
+         WHEN LOWER(testbasename) = 'lymphocytes'                 THEN 'LABLYM'
+    END                                                 AS analyte,
+    COUNT(*)                                            AS n_rows_testdate_null_resultdate_present,
+    COUNT(DISTINCT patientid)                           AS n_patients,
+    SUM(CASE WHEN testresultcleaned > 0 THEN 1 ELSE 0 END) AS n_rows_also_value_positive
 FROM t_lab_2026m06
-WHERE LOWER(testbasename) = 'albumin'
-  AND testresultcleaned IS NOT NULL
-GROUP BY labcomponent, COALESCE(testunitscleaned, '<NULL>')
-ORDER BY n_rows DESC;
-
-
--- =============================================================================
--- Q52  How many DELIVERED index dates are not day-granular?
--- =============================================================================
--- WHY IT MATTERS: for cohorts 3-7 the index date IS the line start date. A
--- year-granular start almost certainly lands on 1 January, and every
--- time-to-event variable plus the [-30,+7] biomarker and ECOG windows is
--- measured from it.
---
--- HOW TO READ IT: this counts PATIENTS PER DELIVERED COHORT, not raw LOT rows,
--- so it sizes the actual exposure in the ADS.
-WITH lot AS (
-    SELECT patientid, linesetting, startdate, startdategranularity,
-           ROW_NUMBER() OVER (PARTITION BY patientid, linesetting
-                              ORDER BY startdate)           AS new_lot_n
-    FROM t_enh_prostate_lot_2026m06
-    WHERE linesetting IN ('mHSPC', 'mCRPC')       -- exact match: nmHSPC/nmCRPC are different settings
-),
-ms AS (
-    SELECT patientid,
-           GREATEST(metastaticdiagnosisdate, hspcdate) AS mhspcdd,
-           GREATEST(metastaticdiagnosisdate, crpcdate) AS mcrpcdd
-    FROM t_enh_prostate_2026m06
-)
-SELECT
-    CASE WHEN l.linesetting = 'mHSPC' AND l.new_lot_n = 1 THEN '3 L1+ mHSPC'
-         WHEN l.linesetting = 'mCRPC' AND l.new_lot_n = 1 THEN '4 L1+ mCRPC'
-         WHEN l.linesetting = 'mCRPC' AND l.new_lot_n = 2 THEN '5 L2+ mCRPC'
-         WHEN l.linesetting = 'mCRPC' AND l.new_lot_n = 3 THEN '6 L3+ mCRPC'
-         WHEN l.linesetting = 'mCRPC' AND l.new_lot_n = 4 THEN '7 L4+ mCRPC'
-    END                                                     AS cohort,
-    COALESCE(l.startdategranularity, '<NULL>')              AS granularity,
-    COUNT(DISTINCT l.patientid)                             AS n_pts
-FROM lot l
-JOIN ms  m ON m.patientid = l.patientid
-WHERE l.startdate BETWEEN DATE'2011-01-01' AND DATE'2026-04-30'
-  AND (   (l.linesetting = 'mHSPC' AND m.mhspcdd BETWEEN DATE'2011-01-01' AND DATE'2026-04-30')
-       OR (l.linesetting = 'mCRPC' AND m.mcrpcdd BETWEEN DATE'2011-01-01' AND DATE'2026-04-30'))
-  AND (   (l.linesetting = 'mHSPC' AND l.new_lot_n = 1)
-       OR (l.linesetting = 'mCRPC' AND l.new_lot_n BETWEEN 1 AND 4))
-GROUP BY 1, 2
-ORDER BY 1, 3 DESC;
-
-
--- =============================================================================
--- Q34  Does progression get recorded after death or after the last note?
--- =============================================================================
--- WHY IT MATTERS: the build takes PFSDT as recorded, with no clamping and no
--- exclusion. If these counts are ZERO the row closes with no decision at all.
---
--- CAVEAT, and it is not small: DateOfDeath is month/year granular in the source,
--- so "progression after death" here is approximate at the month boundary. Treat
--- a small non-zero count as "check the individual rows", not as proof.
--- The evidence filter matches the build: any flag EXCEPT pseudo-progression.
-WITH prog AS (
-    SELECT patientid, progressiondate, lastclinicnotedate
-    FROM t_enh_prostate_prog_scled_2026m06
-    WHERE progressiondate IS NOT NULL
-      AND (   LOWER(isradiographicevidence)    = 'true'
-           OR LOWER(ispathologicevidence)      = 'true'
-           OR LOWER(ismixedresponsementioned)  = 'true'
-           OR LOWER(isphysicalexamevidence)    = 'true'
-           OR LOWER(istumormarkerevidence)     = 'true'
-           OR LOWER(ispsaincreased)            = 'true')
-)
-SELECT
-    COUNT(*)                                                            AS n_qualifying_prog_rows,
-    COUNT(DISTINCT p.patientid)                                         AS n_pts,
-    SUM(CASE WHEN p.lastclinicnotedate IS NOT NULL
-              AND p.progressiondate > p.lastclinicnotedate
-             THEN 1 ELSE 0 END)                                         AS n_after_last_note,
-    SUM(CASE WHEN d.dateofdeath IS NOT NULL
-              AND p.progressiondate > LAST_DAY(d.dateofdeath)
-             THEN 1 ELSE 0 END)                                         AS n_after_death_month_end
-FROM prog p
-LEFT JOIN t_mortality_v2_2026m06 d ON d.patientid = p.patientid;
-
-
--- =============================================================================
--- Q42  Can the next-treatment date fall on or before the index date?
--- =============================================================================
--- WHY IT MATTERS: TTNT takes the next line's start date with no requirement
--- that it be after index. Because NEW_LOT_N is ordered BY startdate, line n+1
--- can only precede line n if the two share a start date - which is also the
--- Q24 tie condition. A zero here closes Q42 AND supports Q24.
-WITH lot AS (
-    SELECT patientid, linesetting, startdate,
-           LEAD(startdate) OVER (PARTITION BY patientid, linesetting
-                                 ORDER BY startdate)        AS next_startdate
-    FROM t_enh_prostate_lot_2026m06
-    WHERE linesetting IN ('mHSPC', 'mCRPC')
-)
-SELECT
-    linesetting,
-    COUNT(*)                          AS n_consecutive_pairs_same_or_earlier,
-    COUNT(DISTINCT patientid)         AS n_pts
-FROM lot
-WHERE next_startdate IS NOT NULL
-  AND next_startdate <= startdate
-GROUP BY linesetting
-ORDER BY linesetting;
-
-
--- =============================================================================
--- Q38  How often does the index LINE start before the MILESTONE it is joined to?
--- =============================================================================
--- WHY IT MATTERS: the cohort join matches on patientid only and enforces no
--- chronology, so a patient can be indexed on an mCRPC line that started before
--- they were mCRPC. This sizes it before the SME is asked to rule.
-WITH lot AS (
-    SELECT patientid, linesetting, startdate,
-           ROW_NUMBER() OVER (PARTITION BY patientid, linesetting
-                              ORDER BY startdate)           AS new_lot_n
-    FROM t_enh_prostate_lot_2026m06
-    WHERE linesetting IN ('mHSPC', 'mCRPC')
-),
-ms AS (
-    SELECT patientid,
-           GREATEST(metastaticdiagnosisdate, hspcdate) AS mhspcdd,
-           GREATEST(metastaticdiagnosisdate, crpcdate) AS mcrpcdd
-    FROM t_enh_prostate_2026m06
-)
-SELECT
-    CASE WHEN l.linesetting = 'mHSPC' AND l.new_lot_n = 1 THEN '3 L1+ mHSPC'
-         WHEN l.linesetting = 'mCRPC' AND l.new_lot_n = 1 THEN '4 L1+ mCRPC'
-         WHEN l.linesetting = 'mCRPC' AND l.new_lot_n = 2 THEN '5 L2+ mCRPC'
-         WHEN l.linesetting = 'mCRPC' AND l.new_lot_n = 3 THEN '6 L3+ mCRPC'
-         WHEN l.linesetting = 'mCRPC' AND l.new_lot_n = 4 THEN '7 L4+ mCRPC'
-    END                                                     AS cohort,
-    COUNT(DISTINCT l.patientid)                             AS n_pts_in_cohort,
-    COUNT(DISTINCT CASE
-        WHEN (l.linesetting = 'mHSPC' AND l.startdate < m.mhspcdd)
-          OR (l.linesetting = 'mCRPC' AND l.startdate < m.mcrpcdd)
-        THEN l.patientid END)                               AS n_pts_line_before_milestone,
-    ROUND(100.0 * COUNT(DISTINCT CASE
-        WHEN (l.linesetting = 'mHSPC' AND l.startdate < m.mhspcdd)
-          OR (l.linesetting = 'mCRPC' AND l.startdate < m.mcrpcdd)
-        THEN l.patientid END) / NULLIF(COUNT(DISTINCT l.patientid), 0), 1) AS pct
-FROM lot l
-JOIN ms  m ON m.patientid = l.patientid
-WHERE l.startdate BETWEEN DATE'2011-01-01' AND DATE'2026-04-30'
-  AND (   (l.linesetting = 'mHSPC' AND m.mhspcdd BETWEEN DATE'2011-01-01' AND DATE'2026-04-30')
-       OR (l.linesetting = 'mCRPC' AND m.mcrpcdd BETWEEN DATE'2011-01-01' AND DATE'2026-04-30'))
-  AND (   (l.linesetting = 'mHSPC' AND l.new_lot_n = 1)
-       OR (l.linesetting = 'mCRPC' AND l.new_lot_n BETWEEN 1 AND 4))
+WHERE testdate IS NULL
+  AND resultdate IS NOT NULL
 GROUP BY 1
-ORDER BY 1;
+HAVING analyte IS NOT NULL
+ORDER BY n_rows_testdate_null_resultdate_present DESC;
+
+
+-- =============================================================================
+-- S3  Q59 - is the PSABL > 0 guard ever load-bearing?
+-- =============================================================================
+-- STEP 1, and again it may be the only step. PSABL is PSA_INDEX, taken from
+-- ScoreSerial. If no PSA record in the whole table is <= 0, the guard can never
+-- fire and Q59 closes as a free defensive condition.
+SELECT
+    COUNT(*)                                                     AS n_psa_rows,
+    SUM(CASE WHEN scoreserial IS NULL  THEN 1 ELSE 0 END)        AS n_null,
+    SUM(CASE WHEN scoreserial =  0     THEN 1 ELSE 0 END)        AS n_zero,
+    SUM(CASE WHEN scoreserial <  0     THEN 1 ELSE 0 END)        AS n_negative,
+    COUNT(DISTINCT CASE WHEN scoreserial <= 0 THEN patientid END) AS n_patients_le_zero,
+    MIN(scoreserial)                                             AS min_scoreserial
+FROM t_enh_prostate_psa_2026m06;
+
+-- STEP 2 - run this ONLY if STEP 1 shows scoreserial <= 0 somewhere.
+-- Reproduces PSA_INDEX exactly (earliest ScoreSerial in [INDEX-14, INDEX], max
+-- value on that earliest date) and counts the delivered rows whose PSABL is
+-- <= 0, i.e. the rows where the guard actually changes PSA50_6MO / PSA50_12MO
+-- from a computed answer to a forced 'N'.
+WITH ms AS (
+    SELECT patientid,
+           GREATEST(metastaticdiagnosisdate, hspcdate) AS mhspcdd,
+           GREATEST(metastaticdiagnosisdate, crpcdate) AS mcrpcdd
+    FROM t_enh_prostate_2026m06
+),
+lot AS (
+    SELECT patientid, linesetting, linenumber, startdate,
+           ROW_NUMBER() OVER (PARTITION BY patientid, linesetting
+                              ORDER BY startdate)           AS new_lot_n
+    FROM t_enh_prostate_lot_2026m06
+    WHERE linesetting IN ('mHSPC', 'mCRPC')
+),
+idx AS (
+    SELECT patientid, '1 Overall mHSPC' AS cohort, mhspcdd AS index_date
+    FROM ms WHERE mhspcdd BETWEEN DATE'2011-01-01' AND DATE'2026-04-30'
+    UNION ALL
+    SELECT patientid, '2 Overall mCRPC', mcrpcdd
+    FROM ms WHERE mcrpcdd BETWEEN DATE'2011-01-01' AND DATE'2026-04-30'
+    UNION ALL
+    SELECT l.patientid,
+           CASE WHEN l.linesetting = 'mHSPC' THEN '3 L1+ mHSPC'
+                WHEN l.new_lot_n = 1         THEN '4 L1+ mCRPC'
+                WHEN l.new_lot_n = 2         THEN '5 L2+ mCRPC'
+                WHEN l.new_lot_n = 3         THEN '6 L3+ mCRPC'
+                ELSE                              '7 L4+ mCRPC' END,
+           l.startdate
+    FROM lot l
+    JOIN ms  m ON m.patientid = l.patientid
+    WHERE l.startdate BETWEEN DATE'2011-01-01' AND DATE'2026-04-30'
+      AND ((l.linesetting = 'mHSPC' AND l.new_lot_n = 1
+            AND m.mhspcdd BETWEEN DATE'2011-01-01' AND DATE'2026-04-30')
+        OR (l.linesetting = 'mCRPC' AND l.new_lot_n BETWEEN 1 AND 4
+            AND m.mcrpcdd BETWEEN DATE'2011-01-01' AND DATE'2026-04-30'))
+),
+win AS (
+    SELECT i.cohort, i.patientid, i.index_date, p.resultdate, p.scoreserial
+    FROM idx i
+    JOIN t_enh_prostate_psa_2026m06 p ON p.patientid = i.patientid
+    WHERE p.resultdate BETWEEN DATE_SUB(i.index_date, 14) AND i.index_date
+),
+first_dt AS (
+    SELECT cohort, patientid, index_date, MIN(resultdate) AS psa_dt
+    FROM win GROUP BY cohort, patientid, index_date
+),
+psabl AS (
+    SELECT w.cohort, w.patientid, w.index_date, MAX(w.scoreserial) AS psabl
+    FROM win w
+    JOIN first_dt f
+      ON f.cohort = w.cohort AND f.patientid = w.patientid
+     AND f.index_date = w.index_date AND f.psa_dt = w.resultdate
+    GROUP BY w.cohort, w.patientid, w.index_date
+)
+SELECT
+    cohort,
+    COUNT(*)                                                AS n_rows_with_psabl,
+    SUM(CASE WHEN psabl <= 0 THEN 1 ELSE 0 END)             AS n_psabl_le_zero,
+    SUM(CASE WHEN psabl =  0 THEN 1 ELSE 0 END)             AS n_psabl_zero,
+    SUM(CASE WHEN psabl <  0 THEN 1 ELSE 0 END)             AS n_psabl_negative
+FROM psabl
+GROUP BY cohort
+ORDER BY cohort;
+
+
+-- =============================================================================
+-- S4  Q56 - what does the [INDEX-30, INDEX+7] ECOG window cost cohorts 3-7?
+-- =============================================================================
+-- WHY IT MATTERS: the window is now applied to all seven cohorts because
+-- 3.Data Prep defines LOT_ECOG that way for the single ECOG row. Cohorts 3-7
+-- previously matched Flatiron's baseline ECOG on line number and line start
+-- date with NO date bound, so a baseline assessment recorded months before the
+-- line still counted. Every such row now reads Unknown/Missing (ECOGN = 6).
+--
+-- HOW TO READ IT: n_lost is the number of delivered rows that had a baseline
+-- ECOG under the old rule and have none under the new one. pct_lost is the
+-- honest headline for the ECOG completeness change in cohorts 3-7.
+WITH ms AS (
+    SELECT patientid,
+           GREATEST(metastaticdiagnosisdate, hspcdate) AS mhspcdd,
+           GREATEST(metastaticdiagnosisdate, crpcdate) AS mcrpcdd
+    FROM t_enh_prostate_2026m06
+),
+lot AS (
+    SELECT patientid, linesetting, linenumber, startdate,
+           ROW_NUMBER() OVER (PARTITION BY patientid, linesetting
+                              ORDER BY startdate)           AS new_lot_n
+    FROM t_enh_prostate_lot_2026m06
+    WHERE linesetting IN ('mHSPC', 'mCRPC')
+),
+-- cohorts 3-7 only, carrying the line identity the ECOG match needs
+idx_lot AS (
+    SELECT CASE WHEN l.linesetting = 'mHSPC' THEN '3 L1+ mHSPC'
+                WHEN l.new_lot_n = 1         THEN '4 L1+ mCRPC'
+                WHEN l.new_lot_n = 2         THEN '5 L2+ mCRPC'
+                WHEN l.new_lot_n = 3         THEN '6 L3+ mCRPC'
+                ELSE                              '7 L4+ mCRPC' END AS cohort,
+           l.patientid, l.linenumber,
+           l.startdate AS index_date
+    FROM lot l
+    JOIN ms  m ON m.patientid = l.patientid
+    WHERE l.startdate BETWEEN DATE'2011-01-01' AND DATE'2026-04-30'
+      AND ((l.linesetting = 'mHSPC' AND l.new_lot_n = 1
+            AND m.mhspcdd BETWEEN DATE'2011-01-01' AND DATE'2026-04-30')
+        OR (l.linesetting = 'mCRPC' AND l.new_lot_n BETWEEN 1 AND 4
+            AND m.mcrpcdd BETWEEN DATE'2011-01-01' AND DATE'2026-04-30'))
+),
+matched AS (
+    SELECT i.cohort, i.patientid, i.index_date, e.ecogdate,
+           DATEDIFF(e.ecogdate, i.index_date) AS gap_days
+    FROM idx_lot i
+    JOIN t_enh_prostate_bsln_ecog_2026m06 e
+      ON e.patientid     = i.patientid
+     AND e.linenumber    = i.linenumber
+     AND e.linestartdate = i.index_date
+),
+per_row AS (
+    SELECT cohort, patientid, index_date,
+           MAX(CASE WHEN gap_days BETWEEN -30 AND 7 THEN 1 ELSE 0 END) AS in_window,
+           MIN(gap_days) AS earliest_gap,
+           MAX(gap_days) AS latest_gap
+    FROM matched
+    GROUP BY cohort, patientid, index_date
+)
+SELECT
+    cohort,
+    COUNT(*)                                            AS n_rows_with_baseline_ecog_old_rule,
+    SUM(in_window)                                      AS n_rows_kept_new_rule,
+    SUM(1 - in_window)                                  AS n_lost,
+    ROUND(100.0 * SUM(1 - in_window) / NULLIF(COUNT(*), 0), 1) AS pct_lost,
+    -- where the lost assessments sit relative to index, to show whether the
+    -- window is discarding stale readings or plausible baselines
+    SUM(CASE WHEN in_window = 0 AND latest_gap  <  -30 THEN 1 ELSE 0 END) AS n_lost_all_before_minus30,
+    SUM(CASE WHEN in_window = 0 AND earliest_gap >    7 THEN 1 ELSE 0 END) AS n_lost_all_after_plus7,
+    MIN(earliest_gap)                                   AS min_gap_days,
+    MAX(latest_gap)                                     AS max_gap_days
+FROM per_row
+GROUP BY cohort
+ORDER BY cohort;
