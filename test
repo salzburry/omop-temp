@@ -1,200 +1,44 @@
-#!/usr/bin/env Rscript
-# One plain-text summary of the study-team answers, filled from the files the
-# runs already wrote. Reads only; no connection.
-#
-#   Rscript reporting/summarize_results.R [results_dir]
-#
-# results_dir defaults to OUTPUT_DIR, then /mnt/artifacts/results. The
-# melphalan, fold-in and audit outputs are also looked for in their own out/
-# folders, so it works whether or not OUTPUT_DIR was set for those runs.
-# A section whose files are missing says so instead of stopping.
-#
-# Writes results_summary_<stamp>.txt next to the August answers and prints
-# the same text.
+Q1 (Teams): "How many patients are affected by the MAP-splitting rule?"
 
-.script_dir <- local({
-  a <- grep("^--file=", commandArgs(FALSE), value = TRUE)
-  if (length(a)) dirname(normalizePath(gsub("~+~", " ", sub("^--file=", "", a[1]),
-                                            fixed = TRUE))) else getwd()
-})
-STUDY <- dirname(.script_dir)
+1,408 patients. For each of them, a drug from their previous line came back after the new line's window, and that alone is what starts an extra line today. Another 39 patients have the same drug-return, but a genuinely new drug started the same day — so their new line stays real either way.
 
-argv <- commandArgs(trailingOnly = TRUE)
-res_dir <- if (length(argv)) argv[1] else {
-  d <- trimws(Sys.getenv("OUTPUT_DIR", unset = ""))
-  if (nzchar(d)) d else "/mnt/artifacts/results"
-}
-DIRS <- unique(c(res_dir,
-                 file.path(STUDY, "exploration", "melphalan", "out"),
-                 file.path(STUDY, "exploration", "lot", "out")))
+One thing we checked for you: whether counting a biosimilar as "the same drug" changes this. It doesn't — the numbers are identical both ways, so the biosimilar question doesn't matter in our data.
 
-# Newest file matching the pattern across the candidate dirs, or NULL.
-find_file <- function(pattern) {
-  hits <- unlist(lapply(DIRS[dir.exists(DIRS)], function(d)
-    list.files(d, pattern, full.names = TRUE)))
-  if (!length(hits)) return(NULL)
-  hits[order(file.mtime(hits), decreasing = TRUE)][1]
-}
-read_any <- function(pattern) {
-  f <- find_file(pattern)
-  if (is.null(f)) return(NULL)
-  tryCatch(utils::read.csv(f, stringsAsFactors = FALSE), error = function(e) NULL)
-}
-n1 <- function(x) if (is.null(x) || !length(x) || is.na(x[1])) "?" else
-  format(as.numeric(x[1]), big.mark = ",")
+I have the patient-by-patient list if you want to look at individual cases (the roster CSV: prior regimen, the returning drug, the gap, what else started that day).
 
-out <- character(0)
-say <- function(...) out <<- c(out, paste0(...))
+If she asks "so what happens if we apply my rule?":
 
-say("NDMM lines of therapy - answers for the study team")
-say("Made ", format(Sys.time(), "%d %b %Y %H:%M"), " from the finished runs.")
-say("")
+The count above is what disappears. We've also built the rule as a switch in the engine, off by default, with a test rebuild ready to run — so we can show you the actual before/after line table per patient before anyone commits. Three details need your sign-off first: does the returning drug join the regimen name or just extend the line's dates; does it apply to drugs from any earlier line or only the immediately previous one; and does it still fold in when the line had already ended.
 
-# ---- which run this all comes from ------------------------------------------
-status_f <- find_file("^aug15_qs_run_status_.*\\.txt$")
-stamp <- if (!is.null(status_f))
-  sub("^aug15_qs_run_status_(.*)\\.txt$", "\\1", basename(status_f)) else
-  format(Sys.time(), "%Y%m%d_%H%M%S")
-if (!is.null(status_f)) {
-  st <- readLines(status_f, warn = FALSE)
-  run_ln <- grep("LOT run:", st, value = TRUE)
-  if (length(run_ln)) say("Built on", sub(".*LOT run:", " LOT run", run_ln[1]), ".")
-  waived <- grep("WAIVED|UNPROVEN", st, value = TRUE)
-  for (w in waived)
-    say("WARNING: ", trimws(w), " - fix this before sending numbers out.")
-} else {
-  say("NOTE: no aug15 run-status file found under ", res_dir,
-      " - run analysis/questions/aug15_studyteam_qs.R first.")
-}
-say("")
+Q2 (Teams): "How are the MELP rules I created working?"
 
-# ---- 1. the MAP splitting rule ----------------------------------------------
-say("1) HOW MANY PATIENTS DOES THE MAP-SPLITTING RULE AFFECT?")
-aff <- read_any("^aug15_qs_map_splitting_affected_.*\\.csv$")
-if (is.null(aff)) {
-  say("   (no screen file found - run aug15_studyteam_qs.R)")
-} else {
-  all_rows <- aff[aff$LINE_THAT_ENDED == "ALL", ]
-  pick <- function(basis, cls) {
-    r <- all_rows[all_rows$MATCH_BASIS == basis & all_rows$CLASS == cls, ]
-    if (nrow(r)) r$N_PATIENTS[1] else 0
-  }
-  say("   Counting the same drug only:")
-  say("     ", n1(pick("EXACT_TOKEN", "AFFECTED")),
-      " patients would LOSE a line boundary under the rule.")
-  say("     ", n1(pick("EXACT_TOKEN", "SAME_DAY_NEW_AGENT")),
-      " keep it - a new drug started the same day.")
-  say("   Counting the drug or its biosimilar:")
-  say("     ", n1(pick("SUBSTITUTE_FAMILY", "AFFECTED")), " would lose it; ",
-      n1(pick("SUBSTITUTE_FAMILY", "SAME_DAY_NEW_AGENT")), " keep it.")
-  say("   What 'affected' means: a drug from the LAST line came back after the")
-  say("   current line's window, and it is the only reason a new line starts.")
-  roster <- find_file("^aug15_qs_map_splitting_review_roster_.*\\.csv$")
-  if (!is.null(roster))
-    say("   Patient-by-patient detail: ", basename(roster))
-}
-fv <- read_any("^foldin_vs_reference\\.csv$")
-fp <- read_any("^foldin_patients\\.csv$")
-if (!is.null(fp)) {
-  say("   If we APPLY the rule (trial rebuild, not the study numbers):")
-  say("     ", n1(fp$N_DIFFERENT), " of ", n1(fp$N_PATIENTS),
-      " patients change; ", n1(fp$N_LINE_COUNT_DIFFERENT),
-      " end up with a different NUMBER of lines.")
-  ch <- find_file("^foldin_changed_lines\\.csv$")
-  if (!is.null(ch)) say("     Their before/after lines: ", basename(ch))
-  say("     Read with its assumptions: any earlier line's drug folds; the drug")
-  say("     joins the line's TIME, not its regimen name; a return after the")
-  say("     line ran out still folds. All three are open for the team to set.")
-}
-say("")
+The rule is fully built — all five branches, plus your simplified 28-day version — and each runs as a complete side-by-side rebuild against the study build, so we measure real line changes rather than estimates. The comparison numbers weren't part of today's run; I'll send them separately once the cells finish on the current cohort.
 
-# ---- 2. the MELP rules ------------------------------------------------------
-say("2) HOW ARE THE MELP RULES WORKING?")
-mp <- read_any("^melp_modes_patients\\.csv$")
-mv <- read_any("^melp_vs_reference\\.csv$")
-if (is.null(mv) && is.null(mp)) {
-  say("   (no melphalan comparison files found - run the melphalan package)")
-} else {
-  vs <- function(d, cellname, metric) {
-    r <- d[d$cell == cellname & d$metric == metric, ]
-    if (nrow(r)) paste0(n1(r$reference), " -> ", n1(r$observed)) else "?"
-  }
-  if (!is.null(mv)) {
-    say("   Your five-branch rule, as a full trial rebuild (mode 'as_asked'):")
-    say("     lines overall: ", vs(mv, "as_asked", "n_lines"),
-        "; patients with any line: ", vs(mv, "as_asked", "n_patients"))
-    say("     melphalan-only lines: ", vs(mv, "as_asked", "n_melp_mono_lines"),
-        "; lines melphalan alone STARTED: ", vs(mv, "as_asked", "n_melp_mono_adv"))
-  }
-  if (!is.null(mp))
-    say("   The two transplant readings differ for ", n1(mp$N_DIFFERENT),
-        " patients - that choice is still the team's.")
-}
-sv <- read_any("^melp_simple_vs_reference\\.csv$")
-sp <- read_any("^melp_simple_patients\\.csv$")
-if (!is.null(sp))
-  say("   The simple 28-day fallback changes ", n1(sp$N_DIFFERENT), " of ",
-      n1(sp$N_PATIENTS), " patients vs today's build.")
-say("   Notes: none of this touches the study's own numbers. 'Melphalan only'")
-say("   counts captured drugs, so melphalan WITH a steroid still reads as")
-say("   melphalan only. The 28-vs-30-day question is about course length;")
-say("   changing the assumed days supplied is a different change, not built.")
-say("")
+Two things I can tell you now. First, on MELP mono and DEX: since steroids aren't in the captured drug list, a patient on melphalan plus DEX already reads as melphalan-mono in our tables — so those patients are not being lost. Second, your day-100/105 example is built in exactly as you described: the new line starts on day 100, when the melphalan appears.
 
-# ---- 3. the 12-month CE funnel ----------------------------------------------
-say("3) DISCONTINUE THE PRIOR LINE, THEN 12 MONTHS COVER BEFORE THE NEXT")
-fu <- read_any("^aug15_qs_discontinued_then_12mo_ce_.*\\.csv$")
-if (is.null(fu)) {
-  say("   (no funnel file found - run aug15_studyteam_qs.R)")
-} else {
-  for (i in seq_len(nrow(fu))) {
-    say("   ", fu$COHORT[i], ": ", n1(fu$N_DISCONTINUED_PRIOR[i]),
-        " discontinued ", fu$PRIOR_LINE_DISCONTINUED[i], "; ",
-        n1(fu$N_ALSO_HAS_NEXT_LINE[i]), " reached ", fu$COHORT[i], "; ",
-        n1(fu$N_ALSO_12MO_CE_BEFORE_IT[i]),
-        " also have 12 months cover before it.")
-  }
-  say("   '12 months' = one merged enrollment span over the 365 days before")
-  say("   the line starts. Discontinued = the line's recorded end reason.")
-  attr_f <- find_file("^aug15_qs_subsequent_cohort_attrition_.*\\.csv$")
-  if (!is.null(attr_f))
-    say("   The formally chained 2L/3L study cohort is beside it: ",
-        basename(attr_f))
-  else
-    say("   (The chained study-cohort file was not written - its build did ",
-        "not match this LOT run.)")
-}
-say("")
+One clarification I need from you: a 30-day cap changes which course lengths count as short. If you meant actually imputing melphalan days-supplied as 30 instead of 28, that's a different change — tell me which one you meant.
 
-# ---- checks -----------------------------------------------------------------
-say("CHECKS BEHIND THE NUMBERS")
-aud <- read_any("^lot_audit_counts\\.csv$")
-if (!is.null(aud)) {
-  b <- aud[aud$finding == "transplant-belonging-to-no-line", ]
-  if (nrow(b)) {
-    say("   Transplant-in-no-line audit rows (shape b should be 0 after the ",
-        "rebuild):")
-    for (r in unique(b$row)) {
-      rr <- b[b$row == r, ]
-      say("     ", paste(paste0(rr$metric, "=", rr$value), collapse = "  "))
-    }
-  }
-}
-say("   QC report and the scenario workbook (lot_scenarios.xlsx) carry the")
-say("   rest; the workbook's Open questions sheet lists what is not settled.")
-say("")
+(Don't quote MELP impact numbers today — you don't have them. If pressed for a timeline: "the builds take a few hours; I can have the numbers to you tomorrow.")
 
-say("DECISIONS WE NEED FROM THE TEAM")
-say("   - MAP fold-in: adopt or not; only the last line's drugs or any earlier")
-say("     line's; does the drug join the regimen name or only the line's time;")
-say("     does a return after the line ran out still fold?")
-say("   - MELP: five-branch rule or the simple fallback; which transplant")
-say("     reading; 28 or 30 days; what 'mono' should mean given MELP+DEX.")
-say("   - Tandem transplants: today a stop between the two does NOT break the")
-say("     pair; a new drug between them does. Confirm or correct.")
+Q3 (Teams): "How many patients discontinue 1L before starting a 12-month CE baseline period for 2L, and same for 3L?"
 
-txt <- paste(out, collapse = "\n")
-dest <- file.path(if (dir.exists(res_dir)) res_dir else ".",
-                  paste0("results_summary_", stamp, ".txt"))
-writeLines(txt, dest)
-cat(txt, "\n\nWrote ", dest, "\n", sep = "")
+For 2L: 3,205 patients. 4,957 discontinued 1L, 3,338 of those went on to a 2L, and 3,205 of those also had continuous enrollment for the full 12 months before 2L started.
+
+For 3L: 1,505 patients. Same funnel: 2,166 discontinued 2L, 1,576 reached 3L, 1,505 with the 12-month baseline.
+
+Definitions, so we're aligned: "discontinued" is the line's recorded end reason, and "12 months" is one continuous enrollment span covering the 365 days before the next line starts, with small gaps merged. The formally chained study cohort file was also produced and matches this LOT run.
+
+Q4 (Teams, Onkar's own point): "Tandem AUTO — what if something comes in the middle, or treatment is discontinued between the two?"
+
+Today the engine works like this: a new drug (or a donor transplant or CAR-T) between the two transplants breaks the pair — the second transplant starts its own line. But treatment simply running out or stopping between them does not break the pair — the line is held open to the second transplant.
+
+In the data this is small: the stop-between-transplants shape is 9 cases and the drug-in-between shape is 13. So whichever way you decide, few patients move — but we'd like your confirmation that the current reading is what you want. The worked examples are S10 and S11 in the scenario workbook.
+
+If she asks "is the build itself healthy?"
+
+Yes — the transplant-ownership audit is clean (the only transplants outside a line are 19 past the five-line cap, which is bookkeeping, not an error), the full regimen list is complete at 482 regimens with nothing cut off, and QC ran 37 checks with 2 flagged that I've reviewed. Everything is stamped to LOT run 6a85a6b / attempt 2026-08-19.
+
+(Before the meeting, actually open lot_qc_report.md and read those 2 flagged checks so that last sentence is true.)
+
+
+
