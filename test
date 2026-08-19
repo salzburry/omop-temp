@@ -1,44 +1,57 @@
-Q1 (Teams): "How many patients are affected by the MAP-splitting rule?"
+Here is a short text you can paste anywhere — the email, a slide, or the top of the workbook. Simple words, no jargon:
 
-1,408 patients. For each of them, a drug from their previous line came back after the new line's window, and that alone is what starts an extra line today. Another 39 patients have the same drug-return, but a genuinely new drug started the same day — so their new line stays real either way.
+---
 
-One thing we checked for you: whether counting a biosimilar as "the same drug" changes this. It doesn't — the numbers are identical both ways, so the biosimilar question doesn't matter in our data.
+**What the MAP-splitting rule is**
 
-I have the patient-by-patient list if you want to look at individual cases (the roster CSV: prior regimen, the returning drug, the gap, what else started that day).
+For every patient we build "cover periods" from their pharmacy and medical claims. Each drug gets its own periods: the days we believe the patient had that drug, based on fills and days of supply. We call these MAP periods.
 
-If she asks "so what happens if we apply my rule?":
+A line of therapy is the group of drugs a patient is on together. The line keeps going as long as the same drugs continue. When a **new** drug is added, the current line ends and a new line starts.
 
-The count above is what disappears. We've also built the rule as a switch in the engine, off by default, with a test rebuild ready to run — so we can show you the actual before/after line table per patient before anyone commits. Three details need your sign-off first: does the returning drug join the regimen name or just extend the line's dates; does it apply to drugs from any earlier line or only the immediately previous one; and does it still fold in when the line had already ended.
+The splitting rule is about one specific case: **a drug from an earlier line comes back later.**
 
-Q2 (Teams): "How are the MELP rules I created working?"
+Example:
 
-The rule is fully built — all five branches, plus your simplified 28-day version — and each runs as a complete side-by-side rebuild against the study build, so we measure real line changes rather than estimates. The comparison numbers weren't part of today's run; I'll send them separately once the cells finish on the current cohort.
+- Line 1: drug A + drug B. The patient stops both.
+- Drug C starts. That is a new drug, so Line 2 starts. Fine so far.
+- Months later, while still on drug C, **drug B comes back**.
 
-Two things I can tell you now. First, on MELP mono and DEX: since steroids aren't in the captured drug list, a patient on melphalan plus DEX already reads as melphalan-mono in our tables — so those patients are not being lost. Second, your day-100/105 example is built in exactly as you described: the new line starts on day 100, when the melphalan appears.
+Today the engine treats the returning drug B like any other added drug. B was not part of Line 2, so B is "new" to this line — and the line splits: Line 2 ends, Line 3 starts (C + B).
 
-One clarification I need from you: a 30-day cap changes which course lengths count as short. If you meant actually imputing melphalan days-supplied as 30 instead of 28, that's a different change — tell me which one you meant.
+The question is whether that split is right. Drug B is not really a new treatment for this patient — they had it before. The proposed change: when a drug from a previous line comes back, do **not** start a new line. Let it join the current line instead.
 
-(Don't quote MELP impact numbers today — you don't have them. If pressed for a timeline: "the builds take a few hours; I can have the numbers to you tomorrow.")
+One exception stays either way: if a **genuinely new** drug starts on the same day the old drug returns, the line still splits — the new drug earns the split on its own.
 
-Q3 (Teams): "How many patients discontinue 1L before starting a 12-month CE baseline period for 2L, and same for 3L?"
+In our data, 1,408 patients have a line break caused only by a returning previous-line drug. Under the proposed rule those breaks would go away. Another 39 patients have a returning drug plus a genuinely new drug on the same day — those breaks stay. Most returns happen soon: 1,114 of the 1,408 are within 6 months of the drug's last cover; only 92 are more than a year later.
 
-For 2L: 3,205 patients. 4,957 discontinued 1L, 3,338 of those went on to a 2L, and 3,205 of those also had continuous enrollment for the full 12 months before 2L started.
+---
 
-For 3L: 1,505 patients. Same funnel: 2,166 discontinued 2L, 1,576 reached 3L, 1,505 with the 12-month baseline.
-
-Definitions, so we're aligned: "discontinued" is the line's recorded end reason, and "12 months" is one continuous enrollment span covering the 365 days before the next line starts, with small gaps merged. The formally chained study cohort file was also produced and matches this LOT run.
-
-Q4 (Teams, Onkar's own point): "Tandem AUTO — what if something comes in the middle, or treatment is discontinued between the two?"
-
-Today the engine works like this: a new drug (or a donor transplant or CAR-T) between the two transplants breaks the pair — the second transplant starts its own line. But treatment simply running out or stopping between them does not break the pair — the line is held open to the second transplant.
-
-In the data this is small: the stop-between-transplants shape is 9 cases and the drug-in-between shape is 13. So whichever way you decide, few patients move — but we'd like your confirmation that the current reading is what you want. The worked examples are S10 and S11 in the scenario workbook.
-
-If she asks "is the build itself healthy?"
-
-Yes — the transplant-ownership audit is clean (the only transplants outside a line are 19 past the five-line cap, which is bookkeeping, not an error), the full regimen list is complete at 482 regimens with nothing cut off, and QC ran 37 checks with 2 flagged that I've reviewed. Everything is stamped to LOT run 6a85a6b / attempt 2026-08-19.
-
-(Before the meeting, actually open lot_qc_report.md and read those 2 flagged checks so that last sentence is true.)
+If you want a shorter version for a slide, the two-sentence form is: *"Today, when a drug from an earlier line comes back, the engine treats it as new and starts a new line. The proposed rule says a returning drug should join the current line instead — this affects 1,408 patients; 39 more keep their break because a truly new drug started the same day."*
 
 
+Let me explain it more simply, step by step.
 
+**The question Julia asked:** how many patients stopped their previous treatment, and then had a full year of insurance coverage before their next treatment started?
+
+Why does she want this? To study a patient's next line properly, you need to see their claims for the year before it. If the patient wasn't enrolled in the insurance plan during that year, their claims are missing — you can't use them.
+
+**How we count it, for 2L (second line):**
+
+Think of it as three filters, one after the other:
+
+1. **4,957 patients stopped their first line.** "Stopped" means the line's end reason says discontinuation — a long gap with no drug, not a switch to new drugs and not death.
+
+2. **Of those, 3,338 later started a second line.** The rest never got another treatment in our data.
+
+3. **Of those, 3,205 were enrolled in their insurance plan for the whole 365 days before the second line started.** These are the usable patients. The other 133 had a hole in their coverage during that year, so their claims for that year are incomplete.
+
+**Answer for Julia: 3,205 patients for 2L.**
+
+Same three filters for 3L (third line): 2,166 stopped their second line → 1,576 of them started a third line → **1,505** had the full year of coverage before it. **Answer: 1,505 patients for 3L.**
+
+Two small definitions, in plain words:
+
+- **"Discontinued"** — we don't guess. The engine records why each line ended. We only count lines whose recorded reason is "discontinued".
+- **"12 months of coverage"** — the patient was enrolled for all 365 days before the next line started. If their enrollment had a tiny administrative gap (like a few days between two plan periods), we bridge it and still count them as covered.
+
+If you want one sentence for the email: *"3,205 patients stopped 1L, went on to 2L, and were fully enrolled for the 12 months before 2L started; for 3L the number is 1,505."*
