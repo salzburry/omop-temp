@@ -1,0 +1,124 @@
+Subject: NSCLC prognostic score — covariate review back, Optum feasibility not yet
+
+Hi Phoebe,
+
+Short version: your N = 703 is correct, the 18-covariate set is sound with three
+changes, and I can't give you an Optum sample size yet. Detail below.
+
+────────────────────────────────────────────────────────────────────────
+1. YOUR 703 IS RIGHT
+────────────────────────────────────────────────────────────────────────
+The raw Flatiron tables give 1,700 and the RWDAP gives 703, and that gap is
+fully explained — it isn't a discrepancy:
+
+  1,700   2L docetaxel-only segment, raw FHRD
+  1,632   of those, holding a row in t_enh_advancednsclc
+    703   of those, advanced diagnosis on or after 2017-01-01   ← the whole gap
+
+2017 is the RWDAP's own cohort-entry floor (protocol §3.2.1), which the raw
+tables don't apply. Nothing else contributes: cohortn removes nobody, and the
+regimen-string difference contributes zero.
+
+Two honest caveats:
+  • This reconciles COUNTS, not patient identity. The check that would show
+    they're the same 703 people is written and hasn't run.
+  • "1,700 2L docetaxel monotherapy" is loose — Flatiron admits a patient if
+    ANY line-2 segment is exactly Docetaxel, which isn't the same as an
+    exclusively-docetaxel second line.
+
+Your censor filter reproduces the protocol's outcome gate exactly:
+n = 703, of whom 691 have ≥3 months' follow-up and 12 have no OS.
+
+────────────────────────────────────────────────────────────────────────
+2. THE 18 COVARIATES — SOUND, THREE CHANGES
+────────────────────────────────────────────────────────────────────────
+Eight carry real evidence, counting publications where the factor was
+prognostic AND multivariable-significant for OS AND in an advanced cohort:
+
+  Sex (6) · ECOG (5) · Histology (4) · Age (3) · Albumin (3)
+  Overall stage (2) · Race (2) · ALP (2)
+
+The other ten sit at ≤1. Keep them, but as prediction inputs rather than
+evidence-tier prognostic factors — the slide currently reads as evidence-ranked
+and shouldn't.
+
+ADD TWO:
+  • Number of metastatic sites — evidence equal to stage and race, and NOT
+    captured by initial overall stage. It's in REVEL's own baseline table.
+  • Neutrophil count — stronger evidence than NLR, which currently absorbs it.
+    The ratio hides the better signal.
+
+EVALUATE, DON'T ADOPT YET:
+  • Time since prior line (<9 vs ≥9 mo). A REVEL baseline field, but already
+    substantially represented by time_1l_to_index, and both its anchor (start
+    vs end of prior line) and the 9-month cut are unspecified. Adding it as
+    written risks entering the same information twice at a different cut.
+
+RECLASSIFY ONE, AND PLEASE DON'T DROP IT:
+  • Smoking status — 24 publications, every advanced-setting multivariable
+    estimate null. That's weak evidence for a prognostic claim, but it is not
+    grounds to remove it. Prespecified adjustment covariates should be chosen
+    from anticipated relevance and design considerations, not by counting
+    significant results — selecting on observed significance is what the
+    covariate-adjustment guidance warns against. The evidence tier is a label
+    on the slide, not a decision rule.
+
+FOUR PARAMETERISATIONS TO FIX:
+  • Stage means the wrong thing. Flatiron holds stage at INITIAL diagnosis, not
+    restaged at the 2L index, so it reads as de-novo vs recurrent. A coefficient
+    fitted on that won't transfer to a trial's entry stage. Label it or drop it.
+  • ECOG — don't collapse 2/3/4, and keep Unknown separate from Missing until
+    we've seen the distribution. The numeric codebook is asserted from a spec we
+    don't hold; a one-position offset would silently reclassify every ECOG 1.
+  • Race — both supporting results are the Asian/Other-vs-White contrast, not
+    White-vs-rest.
+  • PD-L1 — currently blends two time-attribution methods, which makes the
+    variable patient-dependent. Pick one as primary.
+
+────────────────────────────────────────────────────────────────────────
+3. OPTUM — NOT ANSWERABLE YET
+────────────────────────────────────────────────────────────────────────
+I don't have an Optum sample size or covariate fill rates for you, and I'd
+rather say that than give you a number I can't stand behind.
+
+What HAS run against Optum is a deployment profile — corpus size, site
+vocabulary, notes gate. What has NOT run is a 2L docetaxel cohort, so there is
+no attrition funnel, no N, and no per-covariate completeness on that source.
+
+The cohort builder is written and tested, but only against synthetic fixtures.
+It has never been given a database connection. Two things gate it:
+
+  • Optum's native line-of-therapy table can't be used. It's built from IV and
+    procedure-coded records only, so a patient whose 1L was an oral (osimertinib,
+    alectinib, lorlatinib) reads as 1L docetaxel instead of 2L. That's exactly
+    the EGFR/ALK-positive group, whose prognosis differs — misassignment
+    correlated with the outcome, inside a prognostic score. So we re-implement
+    Flatiron's line rules on Optum source data instead.
+  • That re-implementation is a rules-inspired reconstruction with documented
+    substitutions, not a faithful reproduction. It hasn't been validated against
+    Flatiron's own answer key yet. Until it has, I can't tell you an Optum N
+    means the same thing as your Flatiron 703.
+
+────────────────────────────────────────────────────────────────────────
+4. TWO THINGS I NEED
+────────────────────────────────────────────────────────────────────────
+  • A terminology check, because it changes what we're building. "PS" is used
+    for both prognostic score and propensity score in the source material.
+    Protocol 308769 asks for a prognostic score — a regression on each patient's
+    contribution to the covariate-adjusted log-rank statistic — which is a
+    different object from a propensity score and isn't evaluated by a C-index.
+    Worth confirming we mean the same thing before we freeze the covariate set.
+
+  • SME sign-off. Everything above is analyst-level. The clinical adjudication
+    column is empty on all 154 inventory rows, so none of these recommendations
+    is clinically signed off yet.
+
+One thing worth flagging for the analysis plan: eight of the ten strongest
+covariates are collected in REVEL- and LUME-style trials under eligibility
+restrictions that truncate their range. LUME-Lung 1 enrolled one PS-2 patient
+of 1,314, so in-trial ECOG is effectively binary; stage is 100% IV in REVEL;
+the organ-function labs are range-truncated by screening. How much prognostic
+signal survives that is an empirical question — the direction isn't knowable in
+advance and should be estimated, not assumed.
+
+Happy to walk through any of this.
