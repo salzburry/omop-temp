@@ -1,0 +1,353 @@
+-- ############################################################################
+-- PART C — WHY 1,700 (raw Flatiron) AND 703 (GSK RWDAP) ARE BOTH RIGHT
+--
+-- Part B returned 1,700 patients for "2L docetaxel monotherapy". Phoebe's
+-- 001_preprocess.R returns 703 for the same described population. Neither is
+-- wrong: they are two different tables.
+--
+--   Phoebe   ->  hive_metastore.rwd_flatiron_dataproducts.rwdap_nsclc_2026m01_v1
+--                the GSK analysis-ready data product   (filter lot2 == 'Docetaxel',
+--                cohortn == 4; one row per patient, lot2 is a single-valued column)
+--   Part B   ->  hive_metastore.clnprw_flatiron_nsclc_use.t_*_2026m01
+--                the raw FHRD tables    (LineNumber = 2 AND LineName = 'Docetaxel';
+--                many rows per patient per line)
+--
+-- THE LEADING EXPLANATION, from the protocol itself:
+--   source FHRD  : advanced dx on or after 1 January 2011   (nsclc_protocol.md:61)
+--   RWDAP        : advanced dx on or after 1 January 2017   (nsclc_protocol.md:143)
+-- Six years of patients sit in the raw denominator and not in hers. Her own
+-- script records the whole RWDAP at 71,445 patients (code.txt:372) where raw
+-- t_enh_advancednsclc_2026m01 holds 121,889 -- 58.6% retention, the shape of a
+-- 2011 -> 2017 cut. It reproduces across every line she counted:
+--   2L 703/1700 = 41.4% | 3L 479/1039 = 46.1%
+--   4L 167/371  = 45.0% | 5L  50/126  = 39.7%
+-- A uniform ~41-46% across four independent lines is a PATIENT-level filter.
+-- A line-definition disagreement would vary by line, and it does not.
+--
+-- WHAT IS NOT YET SETTLED, and what C0-C4 are for: the docetaxel lines retain
+-- ~43% where the cohort as a whole retains 59%. The hypothesis is that 2L
+-- docetaxel monotherapy is over-represented before 2017, because checkpoint
+-- inhibitors displaced it from 2L in 2015-16, so the cutoff bites this cohort
+-- harder than the average patient. C2 tests that directly. C4 tests the
+-- secondary contributor: RWDAP lot2 is ONE value per patient, while Part B
+-- matches ANY LineNumber = 2 row named 'Docetaxel', and 1,609 patients carry
+-- 'Docetaxel,Ramucirumab' at 2L.
+--
+-- RUN ORDER: C0 and C1 read the RWDAP. C2-C6 read raw Flatiron. C0 alone can
+-- confirm or kill the date hypothesis against Phoebe's own table.
+-- ############################################################################
+
+-- ---------------------------------------------------------------------------
+-- C0. THE DECISIVE ONE.  Phoebe's exact cohort, broken out by the year of
+--     ADVANCED DIAGNOSIS and by index year.
+--
+--     If the 2017 rule is live in the data product, adv_dx_year has NOTHING
+--     before 2017 and the hypothesis is confirmed in one shot. If pre-2017
+--     rows appear, the rule is not what removes the patients and C2-C4 carry
+--     the explanation instead.
+--
+--     n_total here must come out at 703. If it does not, the disagreement is
+--     in the filter, not in the population, and nothing downstream is valid.
+-- ---------------------------------------------------------------------------
+SELECT year(addd)                        AS adv_dx_year,
+       COUNT(*)                          AS n_patients,
+       MIN(indexdt)                      AS earliest_index,
+       MAX(indexdt)                      AS latest_index,
+       SUM(CASE WHEN dthfl = 1 THEN 1 ELSE 0 END) AS n_deaths
+FROM   hive_metastore.rwd_flatiron_dataproducts.rwdap_nsclc_2026m01_v1
+WHERE  lot2 = 'Docetaxel'
+  AND  cohortn = 4
+GROUP  BY year(addd)
+ORDER  BY adv_dx_year;
+
+-- Same cohort, one row, so the totals can be checked against her script
+-- (n_total = 703; n_deaths = 585, 83.2%; index range 2017-06-08 to 2025-12-24).
+-- id3mosfu is the protocol's outcome-eligibility flag (index on or before
+-- 3 months prior to data cutoff, nsclc_protocol.md:147). Her stated latest
+-- index is 2025-12-24, which suggests that rule was NOT applied -- if
+-- n_id3mosfu comes back below 703, patients with under three months of
+-- follow-up are sitting in the denominator of an OS analysis.
+SELECT COUNT(*)                                          AS n_total,
+       SUM(CASE WHEN dthfl    = 1 THEN 1 ELSE 0 END)     AS n_deaths,
+       SUM(CASE WHEN id3mosfu = 1 THEN 1 ELSE 0 END)     AS n_id3mosfu,
+       SUM(CASE WHEN os IS NULL THEN 1 ELSE 0 END)       AS n_missing_os,
+       MIN(addd)    AS earliest_adv_dx,  MAX(addd)    AS latest_adv_dx,
+       MIN(indexdt) AS earliest_index,   MAX(indexdt) AS latest_index
+FROM   hive_metastore.rwd_flatiron_dataproducts.rwdap_nsclc_2026m01_v1
+WHERE  lot2 = 'Docetaxel'
+  AND  cohortn = 4;
+
+-- ---------------------------------------------------------------------------
+-- C1. What cohortn actually codes, and how many docetaxel-2L patients sit
+--     outside cohortn = 4.  Phoebe's comment (code.txt:220-224) reads
+--     1 = Overall advNSCLC, 2 = L1+, 3 = L1m+, 4 = L2+, 5 = L3+. If patients
+--     with lot2 = 'Docetaxel' appear under other cohortn values, then
+--     cohortn = 4 is itself removing people and belongs in the funnel.
+-- ---------------------------------------------------------------------------
+SELECT cohortn,
+       MIN(cohort)               AS cohort_label,
+       COUNT(*)                  AS n_patients_in_cohort,
+       SUM(CASE WHEN lot2 = 'Docetaxel' THEN 1 ELSE 0 END) AS n_lot2_docetaxel
+FROM   hive_metastore.rwd_flatiron_dataproducts.rwdap_nsclc_2026m01_v1
+GROUP  BY cohortn
+ORDER  BY cohortn;
+
+USE hive_metastore.clnprw_flatiron_nsclc_use;
+
+-- ---------------------------------------------------------------------------
+-- C2. THE RAW SIDE OF THE SAME QUESTION.  Part B's 1,700, split by year of
+--     advanced diagnosis and by year of 2L start.
+--
+--     Read it against C0. If roughly 59% of the 1,700 have an advanced
+--     diagnosis before 2017, the date rule accounts for the whole gap on its
+--     own. The pre_2017 column is the number the RWDAP never sees.
+--
+--     The second half is the interesting one: 2L-start year shows whether
+--     docetaxel monotherapy really did collapse at 2L once checkpoint
+--     inhibitors arrived in 2015-16. If it did, that is why this cohort loses
+--     ~57% to a cutoff that costs the average patient only ~41%.
+-- ---------------------------------------------------------------------------
+WITH lot2_doce AS (
+  SELECT PatientID, MIN(StartDate) AS index_date
+  FROM   t_lineoftherapy_2026m01
+  WHERE  EnhancedCohort = 'AdvancedNSCLC'
+    AND  LineNumber = 2
+    AND  UPPER(TRIM(LineName)) = 'DOCETAXEL'
+  GROUP  BY PatientID
+)
+SELECT year(a.AdvancedDiagnosisDate) AS adv_dx_year,
+       year(c.index_date)            AS index_year,
+       COUNT(*)                      AS n_patients
+FROM   lot2_doce c
+JOIN   t_enh_advancednsclc_2026m01 a ON a.PatientID = c.PatientID
+GROUP  BY 1, 2
+ORDER  BY 1, 2;
+
+-- ---------------------------------------------------------------------------
+-- C3. THE RECONCILIATION FUNNEL.  Each step a strict subset of the last, in
+--     the order the evidence supports. The last step should land near 703.
+--
+--     s1 -> s2  : the protocol's cohort-entry rule (adv dx >= 2017-01-01).
+--                 Expect this to be the dominant single step.
+--     s2 -> s3  : patients whose 2L is docetaxel and NOTHING ELSE. RWDAP lot2
+--                 holds one regimen per patient; a 2L with a second segment
+--                 (e.g. Docetaxel,Ramucirumab) would not read as 'Docetaxel'
+--                 there but is matched by Part B.
+--     s3 -> s4  : index must fall on or after the advanced diagnosis (already
+--                 true for all 1,700 at B3, kept so the funnel is complete).
+--     s4 -> s5  : the outcome-eligibility rule, index on or before 3 months
+--                 before cutoff. SET THE CUTOFF LITERAL BELOW -- the value
+--                 here is derived from the data, not assumed. If s5 lands
+--                 materially below 703, the rule was not applied in her 703.
+--
+--     A residual after s5 is NOT failure; it is the size of what is still
+--     unexplained, and worth reporting as such rather than tuning away.
+-- ---------------------------------------------------------------------------
+WITH cutoff AS (          -- derive rather than assume the data cut
+  SELECT GREATEST(
+           (SELECT MAX(StartDate)     FROM t_lineoftherapy_2026m01),
+           (SELECT MAX(DiagnosisDate) FROM t_diagnosis_2026m01)
+         ) AS data_cutoff
+),
+lot2_rows AS (
+  SELECT PatientID, LineName, StartDate
+  FROM   t_lineoftherapy_2026m01
+  WHERE  EnhancedCohort = 'AdvancedNSCLC'
+    AND  LineNumber = 2
+),
+lot2_doce AS (
+  SELECT PatientID, MIN(StartDate) AS index_date
+  FROM   lot2_rows
+  WHERE  UPPER(TRIM(LineName)) = 'DOCETAXEL'
+  GROUP  BY PatientID
+),
+lot2_doce_only AS (       -- the patient's ENTIRE 2L is docetaxel, no other regimen
+  SELECT PatientID
+  FROM   lot2_rows
+  GROUP  BY PatientID
+  HAVING COUNT(DISTINCT UPPER(TRIM(LineName))) = 1
+     AND MAX(UPPER(TRIM(LineName))) = 'DOCETAXEL'
+),
+base AS (
+  SELECT c.PatientID,
+         c.index_date,
+         a.AdvancedDiagnosisDate,
+         (o.PatientID IS NOT NULL) AS doce_only_2l
+  FROM   lot2_doce c
+  JOIN   t_enh_advancednsclc_2026m01 a ON a.PatientID = c.PatientID
+  LEFT   JOIN lot2_doce_only o         ON o.PatientID = c.PatientID
+)
+SELECT (SELECT data_cutoff FROM cutoff)                                AS derived_data_cutoff,
+       COUNT(*)                                                        AS s1_partB_1700,
+       SUM(CASE WHEN AdvancedDiagnosisDate >= DATE'2017-01-01'
+                THEN 1 ELSE 0 END)                                     AS s2_adv_dx_2017plus,
+       SUM(CASE WHEN AdvancedDiagnosisDate >= DATE'2017-01-01'
+                 AND doce_only_2l
+                THEN 1 ELSE 0 END)                                     AS s3_2L_is_docetaxel_only,
+       SUM(CASE WHEN AdvancedDiagnosisDate >= DATE'2017-01-01'
+                 AND doce_only_2l
+                 AND index_date >= AdvancedDiagnosisDate
+                THEN 1 ELSE 0 END)                                     AS s4_index_after_adv_dx,
+       SUM(CASE WHEN AdvancedDiagnosisDate >= DATE'2017-01-01'
+                 AND doce_only_2l
+                 AND index_date >= AdvancedDiagnosisDate
+                 AND index_date <= add_months((SELECT data_cutoff FROM cutoff), -3)
+                THEN 1 ELSE 0 END)                                     AS s5_three_month_followup
+FROM   base;
+
+-- ---------------------------------------------------------------------------
+-- C4. How much of the gap the regimen-string difference alone can carry.
+--     Part B's 1,700 counts a patient whose 2L holds a 'Docetaxel' segment
+--     even when it also holds another. This shows the overlap explicitly:
+--     if n_doce_plus_other is large, Part B's monotherapy filter is looser
+--     than the RWDAP's and the number needs qualifying wherever it is quoted.
+-- ---------------------------------------------------------------------------
+WITH lot2_rows AS (
+  SELECT PatientID, UPPER(TRIM(LineName)) AS ln
+  FROM   t_lineoftherapy_2026m01
+  WHERE  EnhancedCohort = 'AdvancedNSCLC'
+    AND  LineNumber = 2
+)
+SELECT COUNT(DISTINCT PatientID)                                       AS n_any_docetaxel_2L_row,
+       COUNT(DISTINCT CASE WHEN n_regimens = 1 THEN PatientID END)     AS n_docetaxel_only_2L,
+       COUNT(DISTINCT CASE WHEN n_regimens > 1 THEN PatientID END)     AS n_doce_plus_other,
+       MAX(n_regimens)                                                 AS max_regimens_at_2L
+FROM  (SELECT PatientID,
+              COUNT(DISTINCT ln)                                       AS n_regimens,
+              MAX(CASE WHEN ln = 'DOCETAXEL' THEN 1 ELSE 0 END)        AS has_doce
+       FROM   lot2_rows
+       GROUP  BY PatientID) t
+WHERE has_doce = 1;
+
+-- ---------------------------------------------------------------------------
+-- C5. B4 RE-RUN WITHOUT NODAL, AND AS THREE STATES.
+--
+--     Two corrections to B4, both required before the site count is used.
+--
+--     (a) NODAL DROPPED. B5 put lymph_node second at 275 patients. Optum's
+--         curated table excludes nodal involvement by vendor definition, so
+--         C77 / 196 must come out before the two sources are compared at all.
+--
+--     (b) THREE STATES, NOT A COUNT. B4 found only 55.6% with any pre-index
+--         site code. In a 2L advanced cohort essentially everyone has
+--         metastatic disease, so a coded zero is overwhelmingly NOT CODED
+--         rather than no disease -- and ICD cannot express absence, which is
+--         exactly what Optum's mets_qualifier = 'absent' adds. So the honest
+--         states off ICD are: sited (a specific compartment is coded),
+--         unspecified (a secondary-neoplasm code exists but names no site --
+--         C79.9 / 199.0), and not_coded (no secondary-neoplasm code at all).
+--         Model the three states; do not model the count.
+-- ---------------------------------------------------------------------------
+WITH lot2_doce AS (
+  SELECT PatientID, MIN(StartDate) AS index_date
+  FROM   t_lineoftherapy_2026m01
+  WHERE  EnhancedCohort = 'AdvancedNSCLC'
+    AND  LineNumber = 2
+    AND  UPPER(TRIM(LineName)) = 'DOCETAXEL'
+  GROUP  BY PatientID
+),
+dx AS (
+  SELECT d.PatientID,
+         CASE
+           WHEN d.DiagnosisCode LIKE 'C79.5%' OR d.DiagnosisCode LIKE '198.5%' THEN 'bone'
+           WHEN d.DiagnosisCode LIKE 'C78.7%' OR d.DiagnosisCode LIKE '197.7%' THEN 'liver'
+           WHEN d.DiagnosisCode LIKE 'C79.3%' OR d.DiagnosisCode LIKE '198.3%'
+             OR d.DiagnosisCode LIKE 'C79.4%' OR d.DiagnosisCode LIKE '198.4%' THEN 'brain_cns'
+           WHEN d.DiagnosisCode LIKE 'C78.0%' OR d.DiagnosisCode LIKE '197.0%' THEN 'lung'
+           WHEN d.DiagnosisCode LIKE 'C78.2%' OR d.DiagnosisCode LIKE '197.2%' THEN 'pleura'
+           WHEN d.DiagnosisCode LIKE 'C79.7%' OR d.DiagnosisCode LIKE '198.7%' THEN 'adrenal'
+           WHEN d.DiagnosisCode LIKE 'C78.6%' OR d.DiagnosisCode LIKE '197.6%' THEN 'peritoneum'
+           WHEN d.DiagnosisCode LIKE 'C79.9%' OR d.DiagnosisCode LIKE '199.0%' THEN NULL
+           WHEN d.DiagnosisCode LIKE 'C78%'   OR d.DiagnosisCode LIKE 'C79%'
+             OR d.DiagnosisCode LIKE '197%'   OR d.DiagnosisCode LIKE '198%'   THEN 'other_organ'
+           ELSE NULL
+         END AS site_group,
+         -- any secondary-neoplasm code at all, nodal deliberately EXCLUDED
+         CASE WHEN d.DiagnosisCode LIKE 'C78%' OR d.DiagnosisCode LIKE 'C79%'
+                OR d.DiagnosisCode LIKE '197%' OR d.DiagnosisCode LIKE '198%'
+                OR d.DiagnosisCode LIKE '199.0%'
+              THEN 1 ELSE 0 END AS any_secondary_code
+  FROM   t_diagnosis_2026m01 d
+  JOIN   lot2_doce c ON c.PatientID = d.PatientID
+  WHERE  d.DiagnosisDate < c.index_date            -- strictly pre-index: no leakage
+),
+per_pt AS (
+  SELECT c.PatientID,
+         COUNT(DISTINCT dx.site_group)                AS n_met_sites,
+         COALESCE(MAX(dx.any_secondary_code), 0)      AS has_any_secondary
+  FROM   lot2_doce c
+  LEFT   JOIN dx ON dx.PatientID = c.PatientID
+  GROUP  BY c.PatientID
+)
+SELECT CASE WHEN n_met_sites > 0        THEN 'sited'
+            WHEN has_any_secondary = 1  THEN 'unspecified'
+            ELSE                             'not_coded' END           AS site_state,
+       COUNT(*)                                                        AS n_patients,
+       ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 1)              AS pct,
+       ROUND(AVG(n_met_sites), 2)                                      AS mean_sites_in_state,
+       SUM(CASE WHEN n_met_sites >= 3 THEN 1 ELSE 0 END)               AS n_with_3plus
+FROM   per_pt
+GROUP  BY 1
+ORDER  BY n_patients DESC;
+
+-- ---------------------------------------------------------------------------
+-- C6. B5 without nodal, so the compartment mix is Optum-comparable.
+--     Compare the shape against Optum's Part A vocabulary, NOT the rates:
+--     Optum's 24.4% is over all notes-eligible lung patients at any stage,
+--     Part B's 55.6% is over 1,700 patients already at 2L of advanced
+--     disease. Different denominators. The comparison that does hold is
+--     sites per captured patient -- Optum 2.6, Flatiron ICD 1.8 -- which says
+--     the ICD proxy under-counts sites even inside the patients it captures.
+-- ---------------------------------------------------------------------------
+WITH lot2_doce AS (
+  SELECT PatientID, MIN(StartDate) AS index_date
+  FROM   t_lineoftherapy_2026m01
+  WHERE  EnhancedCohort = 'AdvancedNSCLC'
+    AND  LineNumber = 2
+    AND  UPPER(TRIM(LineName)) = 'DOCETAXEL'
+  GROUP  BY PatientID
+)
+SELECT CASE
+         WHEN d.DiagnosisCode LIKE 'C79.5%' OR d.DiagnosisCode LIKE '198.5%' THEN 'bone'
+         WHEN d.DiagnosisCode LIKE 'C78.7%' OR d.DiagnosisCode LIKE '197.7%' THEN 'liver'
+         WHEN d.DiagnosisCode LIKE 'C79.3%' OR d.DiagnosisCode LIKE '198.3%'
+           OR d.DiagnosisCode LIKE 'C79.4%' OR d.DiagnosisCode LIKE '198.4%' THEN 'brain_cns'
+         WHEN d.DiagnosisCode LIKE 'C78.0%' OR d.DiagnosisCode LIKE '197.0%' THEN 'lung'
+         WHEN d.DiagnosisCode LIKE 'C78.2%' OR d.DiagnosisCode LIKE '197.2%' THEN 'pleura'
+         WHEN d.DiagnosisCode LIKE 'C79.7%' OR d.DiagnosisCode LIKE '198.7%' THEN 'adrenal'
+         WHEN d.DiagnosisCode LIKE 'C78.6%' OR d.DiagnosisCode LIKE '197.6%' THEN 'peritoneum'
+         WHEN d.DiagnosisCode LIKE 'C79.9%' OR d.DiagnosisCode LIKE '199.0%' THEN 'unspecified_site'
+         ELSE 'other_organ'
+       END                         AS site_group,
+       COUNT(DISTINCT d.PatientID) AS n_patients
+FROM   t_diagnosis_2026m01 d
+JOIN   lot2_doce c ON c.PatientID = d.PatientID
+WHERE  d.DiagnosisDate < c.index_date
+  AND  ((d.DiagnosisCodeSystem = 'ICD-10-CM' AND (d.DiagnosisCode LIKE 'C78%' OR
+                                                  d.DiagnosisCode LIKE 'C79%'))
+    OR  (d.DiagnosisCodeSystem = 'ICD-9-CM'  AND (d.DiagnosisCode LIKE '197%' OR
+                                                  d.DiagnosisCode LIKE '198%' OR
+                                                  d.DiagnosisCode LIKE '199.0%')))
+  -- NODAL DELIBERATELY ABSENT: no C77, no 196. Optum excludes nodal by definition.
+GROUP  BY 1
+ORDER  BY n_patients DESC;
+
+-- ############################################################################
+-- READING PART C
+--   C0  adv_dx_year has nothing before 2017  -> the RWDAP date rule is live
+--       and is the explanation. n_total must be 703 or the filter disagrees.
+--   C2  pre-2017 share of the 1,700          -> how much of the gap it carries
+--   C3  s5 near 703                          -> funnel closed; a residual is
+--       the size of what remains unexplained and should be reported, not tuned
+--   C4  n_doce_plus_other large              -> Part B's 1,700 is a looser
+--       monotherapy definition than Phoebe's and must be quoted as such
+--   C5  not_coded share                      -> why site COUNT is unusable off
+--       ICD; report the three states instead
+--   C6  compartment mix, nodal removed       -> the only Optum-comparable form
+--
+-- WHICH NUMBER SHOULD PHOEBE USE?  703 is the right one for anything that has
+-- to sit inside the RWDAP protocol, and it is the one her covariates exist for.
+-- 1,700 matters because it is the ceiling: it says the 2017 rule, not data
+-- scarcity, is what bounds this cohort, and that a protocol amendment rather
+-- than a different data source is what would grow it.
+-- ############################################################################
