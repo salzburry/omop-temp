@@ -1,382 +1,328 @@
--- ==========================================================================
--- 04_covariate_vocabulary_scan.sql
--- Schema: hive_metastore.clnprw_optum_mc_full_use
--- Runnable on its own. Shared conventions and run order: see README.md
--- in this directory. Executed results: results/ (not yet run)
--- ==========================================================================
+-- ===========================================================================
+-- RDQ 337084 — PDAC / daraxonrasib
+-- STANDALONE DISCOVERY + FUNNEL SQL for Databricks
 --
--- WHY THIS FILE EXISTS.
--- Six of Phoebe's 18 covariates -- ECOG, BMI, systolic BP, smoking, drinking,
--- weight/height -- plus PD-L1 and the molecular drivers cannot be extracted
--- today. Not for want of access: the tables are in the deployment and their
--- COLUMNS are known. What is missing is the VALUE that identifies the row you
--- want. You cannot write `WHERE obs_type = ???`.
+-- Paste into a Databricks SQL editor or notebook and run the blocks in order.
+-- No R, no ODBC, no packages. Every block is independent — run one, read it,
+-- move on. Blocks 1-8 answer the open empirical questions; block 9 produces the
+-- Table 1 attrition funnel in a single query.
 --
--- optum_table_inventory.csv records the reason per table:
---   t_observation   "OBS_TYPE is deferred to an OBS_TYPE lookup tab absent from
---                    every file we hold" -- called the single most blocking gap
---                    in the corpus.
---   t_onc_biomarker  five lookup-controlled columns (ONC_BIO_LU,
---                    ONC_TEST_NAME_LU, ONC_GENE_CHAR_LU,
---                    ONC_NARRATIVE_RESULT_LU, ONC_MODIFIER_NARRATIVE_LU) whose
---                    member lists we do not hold.
---   t_nlp_measure    "column D (Look-Up List Link) is EMPTY for every row on
---                    this sheet -- this table has no controlled lookup list at
---                    all, so a DISTINCT scan on MEASUREMENT_TYPE IS the
---                    vocabulary."
+-- ONE THING TO CHANGE: the cut suffix in the widget below.
 --
--- THAT LAST ONE IS WHY THIS FILE IS THE ANSWER RATHER THAN A REQUEST TO OPTUM.
--- For t_nlp_measure -- the second-priority ECOG source -- no lookup tab exists
--- to ask for. Even if the vendor sends every tab we are missing, that table
--- still needs a scan. So the scan is the route that works for all three.
---
--- WHAT THIS FILE IS NOT. It reads nothing into the pipeline and writes nothing.
--- Every statement is a frequency count or a bounded sample. Its whole output is
--- "here is what is actually in this column", which is the one kind of answer
--- that cannot be silently wrong -- unlike an extractor written against guessed
--- values, which returns plausible rows for the wrong concept and reports a fill
--- rate for it.
---
--- HOW TO RUN. Top to bottom, read-only. Save each result set as CSV under
--- results/ with the query id (A2, B2, C2 ...) in the filename. Part E says what
--- to send back and what each answer unblocks.
---
--- CASING WARNING. t_observation and t_nlp_measure are NOT in the 14-table live
--- DESCRIBE -- the inventory marks their "deployed names and casing unverified".
--- A0 and B0 below DESCRIBE them first. If a column name differs from what is
--- written here, fix it in this file and say so in the results note; do not
--- silently adapt one query and leave the rest.
+-- WHAT TO EXPECT BEFORE YOU START:
+--   The 2026q1 cut ends 2026-03-31. Expanded access for daraxonrasib opened
+--   2026-05-01. So a claims count of ZERO for daraxonrasib is NOT a finding
+--   about patients — there is no observation window. A non-zero count in the
+--   EHR tables (t_prescription / t_administrations) IS meaningful: it is trial
+--   exposure, and NCT05379985 has been PDAC-inclusive since 2022.
+-- ===========================================================================
 
-USE hive_metastore.clnprw_optum_mc_full_use;
+-- Databricks widget; on other engines just find-and-replace ${cut}.
+CREATE WIDGET TEXT cut DEFAULT '2026q1';
 
--- ---------------------------------------------------------------------------
--- The lung denominator, identical to 01_optum_site_capability.sql Q3.
--- Repeated rather than referenced so this file runs on its own, and IDENTICAL
--- so the two files cannot disagree about who has lung cancer -- they did once,
--- over whether a bare ICD-9 '162' counts. It does.
---
--- NOTE THE GATE DIFFERENCE, because it changes the denominator per part:
---   t_observation and t_nlp_measure are NOT note-gated -- they exist for any
---     patient with the underlying record.
---   t_onc_biomarker IS note-gated (t_onc_* is built only for HAS_NOTES = 'Y'),
---     so Part C's denominator is the notes-eligible subset, not all lung.
--- Part A and Part C fill rates are therefore NOT comparable to each other.
--- ---------------------------------------------------------------------------
-CREATE OR REPLACE TEMPORARY VIEW lung AS
-SELECT DISTINCT ptid
-FROM   t_diagnosis_2025q4
-WHERE  (diagnosis_cd_type = 'ICD10' AND diagnosis_cd LIKE 'C34%')
-    OR (diagnosis_cd_type = 'ICD9'  AND diagnosis_cd RLIKE '^162'
-        AND NOT diagnosis_cd RLIKE '^1620');
+USE CATALOG hive_metastore;
+USE SCHEMA  clnprw_optum_mc_full_use;
 
 
--- ###########################################################################
--- PART A - t_observation.  ECOG, BMI, systolic BP, smoking, drinking, weight.
---          Six of the 18, all gated behind one absent lookup list.
--- ###########################################################################
+-- ===========================================================================
+-- 1. DATA CURRENCY  — run this FIRST. It decides whether anything else means
+--    anything. If max(fill_dt) is before 2026-05-01, criterion 7 cannot be met
+--    in claims however good the code lists are.
+-- ===========================================================================
+SELECT 't_clm_med_diagnosis.fst_dt'  AS surface, CAST(MAX(fst_dt)  AS STRING) AS max_dt FROM t_clm_med_diagnosis_${cut}
+UNION ALL SELECT 't_clm_rx.fill_dt (PAID only)', CAST(MAX(CASE WHEN transaction_type = 'PAID' THEN fill_dt END) AS STRING) FROM t_clm_rx_${cut}
+UNION ALL SELECT 't_clm_med_services.fst_dt',    CAST(MAX(fst_dt) AS STRING)   FROM t_clm_med_services_${cut}
+UNION ALL SELECT 't_clm_co_enrollment.eligend',  CAST(MAX(eligend) AS STRING)  FROM t_clm_co_enrollment_${cut}
+UNION ALL SELECT 't_diagnosis.diag_date',        CAST(MAX(diag_date) AS STRING) FROM t_diagnosis_${cut}
+UNION ALL SELECT 't_prescription.rxdate',        CAST(MAX(rxdate) AS STRING)   FROM t_prescription_${cut}
+UNION ALL SELECT 't_administrations.order_date', CAST(MAX(order_date) AS STRING) FROM t_administrations_${cut}
+UNION ALL SELECT 't_administrations.admin_date', CAST(MAX(admin_date) AS STRING) FROM t_administrations_${cut}
+UNION ALL SELECT 't_procedure.proc_date',        CAST(MAX(proc_date) AS STRING) FROM t_procedure_${cut}
+UNION ALL SELECT 't_onc_medications.action_date',CAST(MAX(action_date) AS STRING) FROM t_onc_medications_${cut}
+ORDER BY surface;
 
--- A0. Deployed column names and casing. Everything below assumes the
---     dictionary's 12: PTID, ENCID, OBS_TYPE, NLP, OBS_DATE, OBS_TIME,
---     OBS_RESULT, OBS_UNIT, EVALUATED_FOR_RANGE, VALUE_WITHIN_RANGE,
---     RESULT_DATE, SOURCEID. Confirm before trusting A2-A5.
-DESCRIBE TABLE t_observation_2025q4;
 
--- A1. Size and date span, lung cohort. If this is empty or tiny the rest of
---     Part A is moot and t_nlp_measure (Part B) becomes the only ECOG route.
-SELECT COUNT(*)                    AS n_rows,
-       COUNT(DISTINCT o.ptid)      AS n_patients,
-       MIN(o.obs_date)             AS earliest_obs,
-       MAX(o.obs_date)             AS latest_obs
-FROM   t_observation_2025q4 o
-JOIN   lung l ON l.ptid = o.ptid;
-
--- A2. ****** THE VOCABULARY ******
---     Every distinct OBS_TYPE with its volume, split by the NLP flag.
---     The NLP split is not decoration: a structured vital and an NLP-extracted
---     one are different evidence and the extractor may want to prefer one, so
---     the choice has to be visible before it is made rather than discovered
---     afterwards. OBS_TYPE is varchar(100), so expect free-text-ish variants
---     ("ECOG", "ECOG Performance Status", "Ecog score") -- report them ALL, do
---     not pre-collapse. Collapsing is our job, downstream, in code that can be
---     reviewed.
-SELECT o.obs_type,
-       o.nlp,
-       COUNT(*)               AS n_rows,
-       COUNT(DISTINCT o.ptid) AS n_patients
-FROM   t_observation_2025q4 o
-JOIN   lung l ON l.ptid = o.ptid
-GROUP  BY o.obs_type, o.nlp
-ORDER  BY n_patients DESC;
-
--- A3. What the values LOOK like, per type. A frequency list of type names is
---     not enough to write an extractor: ECOG is 0-4, a pain score is 0-10, and
---     both are small integers. The unit and the observed value range are what
---     separate them.
---     TOP 40 TYPES ONLY, by patient count -- the tail is long and the six
---     covariates we need are high-volume clinical measurements.
-WITH top_types AS (
-  SELECT o.obs_type
-  FROM   t_observation_2025q4 o
-  JOIN   lung l ON l.ptid = o.ptid
-  GROUP  BY o.obs_type
-  ORDER  BY COUNT(DISTINCT o.ptid) DESC
-  LIMIT  40
+-- ===========================================================================
+-- 2. DOES DARAXONRASIB EXIST AT ALL?  Scans every drug-bearing surface for the
+--    INN stem "rasib" plus the development codes, in all three punctuations.
+--    This is the single most important query in the file.
+-- ===========================================================================
+WITH hits AS (
+  SELECT 't_clm_rx'          AS surface, UPPER(COALESCE(brnd_nm, gnrc_nm)) AS nm, ndc, fill_dt AS dt
+  FROM t_clm_rx_${cut}
+  WHERE UPPER(COALESCE(brnd_nm,'') || ' ' || COALESCE(gnrc_nm,'')) RLIKE 'RASIB|RMC.?0?70?6236|RASONQUE|DARAXON'
+  UNION ALL
+  SELECT 't_prescription', UPPER(COALESCE(drug_name, generic_desc)), ndc, rxdate
+  FROM t_prescription_${cut}
+  WHERE UPPER(COALESCE(drug_name,'') || ' ' || COALESCE(generic_desc,'')) RLIKE 'RASIB|RMC.?0?70?6236|RASONQUE|DARAXON'
+  UNION ALL
+  SELECT 't_administrations', UPPER(COALESCE(drug_name, generic_desc)), ndc, COALESCE(admin_date, order_date)
+  FROM t_administrations_${cut}
+  WHERE UPPER(COALESCE(drug_name,'') || ' ' || COALESCE(generic_desc,'')) RLIKE 'RASIB|RMC.?0?70?6236|RASONQUE|DARAXON'
+  UNION ALL
+  SELECT 't_onc_medications', UPPER(COALESCE(drug_name, generic_desc)), CAST(NULL AS STRING), action_date
+  FROM t_onc_medications_${cut}
+  WHERE UPPER(COALESCE(drug_name,'') || ' ' || COALESCE(generic_desc,'')) RLIKE 'RASIB|RMC.?0?70?6236|RASONQUE|DARAXON'
 )
-SELECT o.obs_type,
-       o.obs_unit,
-       COUNT(*)                        AS n_rows,
-       COUNT(DISTINCT o.obs_result)    AS n_distinct_values,
-       MIN(o.obs_result)               AS min_value_lexical,
-       MAX(o.obs_result)               AS max_value_lexical,
-       -- lexical min/max on a varchar is not a numeric range; the sample is
-       -- what tells you whether "10" is ten or a string that sorts before "2".
-       SUBSTRING(CONCAT_WS(' | ', COLLECT_SET(o.obs_result)), 1, 400) AS sample_values
-FROM   t_observation_2025q4 o
-JOIN   lung l ON l.ptid = o.ptid
-JOIN   top_types t ON t.obs_type = o.obs_type
-GROUP  BY o.obs_type, o.obs_unit
-ORDER  BY n_rows DESC;
-
--- A4. TARGETED PROBE. A2 may return thousands of types; these are the six we
---     actually need, found by substring rather than by reading the whole list.
---     Deliberately WIDE patterns -- a false positive here costs one line in a
---     result set, a false negative costs a covariate.
---     Karnofsky is included because it is the other performance scale and
---     converts to ECOG; if ECOG is absent and Karnofsky is present that is a
---     usable finding, not a null result.
-SELECT o.obs_type,
-       o.nlp,
-       o.obs_unit,
-       COUNT(*)               AS n_rows,
-       COUNT(DISTINCT o.ptid) AS n_patients,
-       SUBSTRING(CONCAT_WS(' | ', COLLECT_SET(o.obs_result)), 1, 300) AS sample_values
-FROM   t_observation_2025q4 o
-JOIN   lung l ON l.ptid = o.ptid
-WHERE  LOWER(o.obs_type) RLIKE
-       'ecog|performance|karnofsky|kps|bmi|body mass|blood pressure|systolic|diastolic|smok|tobacco|nicotine|alcohol|drink|weight|height|body surface|bsa'
-GROUP  BY o.obs_type, o.nlp, o.obs_unit
-ORDER  BY n_patients DESC;
-
--- A5. WHICH DATE ANCHORS A BASELINE WINDOW. The inventory flags that this table
---     "carries TWO date semantics on one row: OBS_DATE ('when recorded') and
---     RESULT_DATE ('when measured')". The protocol's baseline window is
---     -30..+7d around index, so when the two disagree by more than a few days
---     they select different rows. This is a DECISION someone has to make, and
---     the size of the disagreement decides whether it matters.
-SELECT CASE
-         WHEN o.result_date IS NULL                              THEN 'result_date null'
-         WHEN o.obs_date    IS NULL                              THEN 'obs_date null'
-         WHEN DATEDIFF(o.obs_date, o.result_date) = 0            THEN 'same day'
-         WHEN ABS(DATEDIFF(o.obs_date, o.result_date)) <= 7      THEN 'within 7d'
-         WHEN ABS(DATEDIFF(o.obs_date, o.result_date)) <= 30     THEN '8-30d'
-         ELSE                                                         'over 30d'
-       END                    AS date_agreement,
-       COUNT(*)               AS n_rows,
-       COUNT(DISTINCT o.ptid) AS n_patients
-FROM   t_observation_2025q4 o
-JOIN   lung l ON l.ptid = o.ptid
-GROUP  BY 1
-ORDER  BY n_rows DESC;
+SELECT surface, nm AS drug_text, ndc,
+       COUNT(*) AS n_rows, CAST(MIN(dt) AS STRING) AS first_dt, CAST(MAX(dt) AS STRING) AS last_dt
+FROM hits
+GROUP BY surface, nm, ndc
+ORDER BY n_rows DESC;
 
 
--- ###########################################################################
--- PART B - t_nlp_measure.  The second-priority ECOG source, and the one where
---          a DISTINCT scan is not a shortcut -- it is the only vocabulary there
---          will ever be.
--- ###########################################################################
+-- ===========================================================================
+-- 3. EXACT NDCs — closes X-CODES-NAME-ONLY and X-NDC-LABELER-NET.
+--    3a: what the 85219 (Revolution Medicines) labeler prefix actually matches.
+--        If this returns products that are NOT daraxonrasib, the prefix is a
+--        false-positive risk and must be replaced by the exact NDCs.
+-- ===========================================================================
+SELECT ndc, UPPER(COALESCE(brnd_nm, gnrc_nm)) AS drug_text, COUNT(*) AS n_rows
+FROM t_clm_rx_${cut}
+WHERE ndc LIKE '85219%'
+GROUP BY ndc, UPPER(COALESCE(brnd_nm, gnrc_nm))
+ORDER BY n_rows DESC;
 
--- B0. Deployed names and casing. Dictionary says 9: PTID, ENCID, NOTE_DATE,
---     MEASUREMENT_TYPE, MEASUREMENT_VALUE, MEASUREMENT_DETAIL, NOTE_SECTION,
---     MEASUREMENT_DATE, SOURCEID. Also NOT in the live DESCRIBE.
-DESCRIBE TABLE t_nlp_measure_2025q4;
-
--- B1. Size and span, lung cohort.
-SELECT COUNT(*)               AS n_rows,
-       COUNT(DISTINCT m.ptid) AS n_patients,
-       MIN(m.note_date)       AS earliest_note,
-       MAX(m.note_date)       AS latest_note
-FROM   t_nlp_measure_2025q4 m
-JOIN   lung l ON l.ptid = m.ptid;
-
--- B2. ****** THE VOCABULARY, and there is no other copy of it ******
---     MEASUREMENT_TYPE is varchar(300) with no controlled list anywhere, so
---     this result set IS the reference document. Save it verbatim.
-SELECT m.measurement_type,
-       COUNT(*)               AS n_rows,
-       COUNT(DISTINCT m.ptid) AS n_patients
-FROM   t_nlp_measure_2025q4 m
-JOIN   lung l ON l.ptid = m.ptid
-GROUP  BY m.measurement_type
-ORDER  BY n_patients DESC;
-
--- B3. Targeted probe with values. MEASUREMENT_DETAIL "often refers to unit of
---     measurement" per the dictionary, so it is carried here -- an ECOG with a
---     unit is probably not an ECOG.
-SELECT m.measurement_type,
-       COUNT(*)               AS n_rows,
-       COUNT(DISTINCT m.ptid) AS n_patients,
-       SUBSTRING(CONCAT_WS(' | ', COLLECT_SET(m.measurement_value)),  1, 300) AS sample_values,
-       SUBSTRING(CONCAT_WS(' | ', COLLECT_SET(m.measurement_detail)), 1, 300) AS sample_details
-FROM   t_nlp_measure_2025q4 m
-JOIN   lung l ON l.ptid = m.ptid
-WHERE  LOWER(m.measurement_type) RLIKE
-       'ecog|performance|karnofsky|kps|bmi|body mass|blood pressure|systolic|weight|height'
-GROUP  BY m.measurement_type
-ORDER  BY n_patients DESC;
+--    3b: NDCs for the oral comparators, which currently match on NAME ONLY.
+SELECT UPPER(COALESCE(brnd_nm, gnrc_nm)) AS drug_text, ndc, COUNT(*) AS n_rows
+FROM t_clm_rx_${cut}
+WHERE UPPER(COALESCE(brnd_nm,'') || ' ' || COALESCE(gnrc_nm,''))
+      RLIKE 'SOTORASIB|LUMAKRAS|ADAGRASIB|KRAZATI|DIVARASIB|ZOLDONRASIB'
+GROUP BY UPPER(COALESCE(brnd_nm, gnrc_nm)), ndc
+ORDER BY n_rows DESC;
 
 
--- ###########################################################################
--- PART C - t_onc_biomarker.  PD-L1 and the molecular drivers.
---          NOTE-GATED: denominator is notes-eligible lung, not all lung.
--- ###########################################################################
+-- ===========================================================================
+-- 4. J-CODE <-> MOLECULE. Confirms the HCPCS mapping on THIS instance. A wrong
+--    J-code contributes zero silently rather than erroring, so an empty row
+--    here is a finding.
+-- ===========================================================================
+SELECT proc_cd, COUNT(*) AS n_rows, COUNT(DISTINCT ptid) AS n_pts,
+       CAST(MIN(fst_dt) AS STRING) AS first_dt, CAST(MAX(fst_dt) AS STRING) AS last_dt
+FROM t_clm_med_services_${cut}
+WHERE proc_cd IN (
+  'J9201','J9198','J9199','J9196','J9184',      -- gemcitabine
+  'J9264',                                       -- nab-paclitaxel
+  'J9267',                                       -- paclitaxel
+  'J9263','J9206','J9205','J9060','J9190',       -- oxaliplatin, irinotecan, iri-liposomal, cisplatin, 5-FU
+  'J0640','J0641','J0642',                       -- leucovorin / levoleucovorin
+  'J9045','J9278','C9308','J9171','J9000','J9181','J9280','J9305','J9320','J9070','J9072')
+GROUP BY proc_cd
+ORDER BY proc_cd;
 
--- C1. Size, span, and the temporal-status split. BIOMARKER_TEMPORAL_STATUS is
---     the one complete vocabulary we already hold -- history / current / plan --
---     and 'plan' is the reason it matters: a PLANNED test is not a result, and
---     counting it would report a PD-L1 status for a patient who has not been
---     tested. This is the only oncology table that allows 'plan'.
-SELECT b.biomarker_temporal_status,
-       COUNT(*)               AS n_rows,
-       COUNT(DISTINCT b.ptid) AS n_patients,
-       MIN(b.note_date)       AS earliest_note,
-       MAX(b.note_date)       AS latest_note
-FROM   t_onc_biomarker_2025q4 b
-JOIN   lung l ON l.ptid = b.ptid
-GROUP  BY b.biomarker_temporal_status
-ORDER  BY n_rows DESC;
 
--- C2. ****** THE BIOMARKER VOCABULARY ****** (ONC_BIO_LU + ONC_TEST_NAME_LU)
---     Which biomarkers are named, and by which assay. 'current' and 'history'
---     only -- see C1.
-SELECT b.biomarker,
-       b.test_name,
-       COUNT(*)               AS n_rows,
-       COUNT(DISTINCT b.ptid) AS n_patients
-FROM   t_onc_biomarker_2025q4 b
-JOIN   lung l ON l.ptid = b.ptid
-WHERE  b.biomarker_temporal_status IN ('current', 'history')
-GROUP  BY b.biomarker, b.test_name
-ORDER  BY n_patients DESC;
+-- ===========================================================================
+-- 5. t_onc_medications.action DOMAIN. The EO exclude lists are worded
+--    ('planned','held',...). If this returns codes (1/2/3) or other wording,
+--    the lists match NOTHING and planned mentions count as treatment received.
+-- ===========================================================================
+SELECT data_source, action, COUNT(*) AS n_rows
+FROM t_onc_medications_${cut}
+GROUP BY data_source, action
+ORDER BY n_rows DESC;
 
--- C3. ****** THE RESULT VOCABULARY ****** (ONC_NARRATIVE_RESULT_LU +
---     ONC_MODIFIER_NARRATIVE_LU + ONC_GENE_CHAR_LU)
---     Restricted to the biomarkers we need, so the result set stays readable.
---     The modifier is carried because "positive" and "NOT positive" may differ
---     only by it -- a negation column read as a result is how a biomarker
---     extractor inverts its own answer.
-SELECT b.biomarker,
-       b.narrative_result,
-       b.modifier_narrative,
-       b.gene_characteristics,
-       COUNT(*)               AS n_rows,
-       COUNT(DISTINCT b.ptid) AS n_patients
-FROM   t_onc_biomarker_2025q4 b
-JOIN   lung l ON l.ptid = b.ptid
-WHERE  b.biomarker_temporal_status IN ('current', 'history')
-   AND LOWER(b.biomarker) RLIKE 'pd-?l1|pd-?1|egfr|alk|ros1|braf|kras|met|ret|ntrk|her2|erbb2|tmb|msi'
-GROUP  BY b.biomarker, b.narrative_result, b.modifier_narrative, b.gene_characteristics
-ORDER  BY n_patients DESC;
 
--- C4. THE PARSER INPUT. NUMERIC_RESULT is varchar(12) and the dictionary
---     "explicitly permits single value or range, with or without units". A
---     PD-L1 TPS is the covariate that lands here, and "1-49", "<1", ">=50" and
---     "50%" all need different parsing. Writing that parser against imagined
---     strings is exactly the guess this file exists to avoid.
-SELECT b.biomarker,
-       b.numeric_result,
-       COUNT(*)               AS n_rows,
-       COUNT(DISTINCT b.ptid) AS n_patients
-FROM   t_onc_biomarker_2025q4 b
-JOIN   lung l ON l.ptid = b.ptid
-WHERE  b.numeric_result IS NOT NULL AND b.numeric_result <> ''
-   AND LOWER(b.biomarker) RLIKE 'pd-?l1|tmb'
-GROUP  BY b.biomarker, b.numeric_result
-ORDER  BY n_rows DESC
-LIMIT  200;
+-- ===========================================================================
+-- 6. PHARMACY REVERSALS. 6a is the rate; 6b is the number the netting cannot
+--    see (a REVERSED row with no drug identifier of its own). If 6b is zero,
+--    RDQ2_REVERSAL_UNCLASSIFIED = 'ignore' is provably safe.
+-- ===========================================================================
+SELECT transaction_type, COUNT(*) AS n_rows FROM t_clm_rx_${cut}
+GROUP BY transaction_type ORDER BY n_rows DESC;
 
--- C5. SIZING A LIMITATION NO VOCABULARY FIXES. This table has NO
---     neoplasm_histology_key and NO ENCID, so a biomarker attaches to the
---     PATIENT, never to the lung tumour. For a patient with one primary that is
---     immaterial; for a patient with two it means pdl1_status may describe the
---     other cancer. This counts how many biomarker-carrying lung patients have
---     more than one distinct neoplasm, which is the size of the exposure.
---     Report it with the variable definition -- it does not go away.
-WITH bio_pts AS (
-  SELECT DISTINCT b.ptid
-  FROM   t_onc_biomarker_2025q4 b
-  JOIN   lung l ON l.ptid = b.ptid
+SELECT COUNT(*) AS n_reversed,
+       SUM(CASE WHEN (brnd_nm IS NULL OR TRIM(brnd_nm) = '')
+                 AND (gnrc_nm IS NULL OR TRIM(gnrc_nm) = '')
+                 AND (ndc     IS NULL OR TRIM(ndc)     = '') THEN 1 ELSE 0 END)
+         AS n_no_identifier_at_all
+FROM t_clm_rx_${cut}
+WHERE transaction_type = 'REVERSED';
+
+
+-- ===========================================================================
+-- 7. SYSTEMIC vs TOPICAL 5-FU. t_clm_rx has no route column, so the split has
+--    to come from the NDC. Put the systemic NDCs into the code list; until then
+--    every 5-FU regimen row is over-inclusive.
+-- ===========================================================================
+SELECT ndc, UPPER(COALESCE(brnd_nm, gnrc_nm)) AS drug_text, COUNT(*) AS n_rows
+FROM t_clm_rx_${cut}
+WHERE UPPER(COALESCE(brnd_nm,'') || ' ' || COALESCE(gnrc_nm,'')) RLIKE 'FLUOROURACIL|ADRUCIL|5.?FU|EFUDEX|CARAC|FLUOROPLEX|TOLAK'
+GROUP BY ndc, UPPER(COALESCE(brnd_nm, gnrc_nm))
+ORDER BY n_rows DESC;
+
+-- 7b: the EHR side DOES have route/dosage_form — use it to label the NDCs above.
+SELECT ndc, UPPER(generic_desc) AS drug_text, LOWER(route) AS route,
+       LOWER(dosage_form) AS dosage_form, COUNT(*) AS n_rows
+FROM t_prescription_${cut}
+WHERE UPPER(COALESCE(drug_name,'') || ' ' || COALESCE(generic_desc,'')) RLIKE 'FLUOROURACIL|ADRUCIL|5.?FU'
+GROUP BY ndc, UPPER(generic_desc), LOWER(route), LOWER(dosage_form)
+ORDER BY n_rows DESC;
+
+
+-- ===========================================================================
+-- 8. POPULATION SANITY. 8a: the step-1 denominators. 8b: how many patients
+--    have an age that cannot be evaluated — a NULL birth_yr makes the adult
+--    predicate NULL, so those patients leave the study silently.
+-- ===========================================================================
+SELECT COUNT(DISTINCT ptid) AS all_pts,
+       COUNT(DISTINCT CASE WHEN market_clarity = 'Y' THEN ptid END) AS market_clarity_y,
+       COUNT(DISTINCT CASE WHEN has_notes      = 'Y' THEN ptid END) AS has_notes_y,
+       COUNT(DISTINCT CASE WHEN birth_yr IS NULL      THEN ptid END) AS birth_yr_null,
+       COUNT(DISTINCT CASE WHEN birth_yr = '1936 and Earlier' THEN ptid END) AS birth_yr_1936,
+       COUNT(DISTINCT CASE WHEN birth_yr RLIKE '^[0-9]{4}$'   THEN ptid END) AS birth_yr_4digit
+FROM t_patient_${cut};
+
+-- 8b: every non-4-digit birth_yr bucket, NULLs included.
+SELECT COALESCE(birth_yr, '(NULL)') AS birth_yr, COUNT(*) AS n
+FROM t_patient_${cut}
+WHERE NOT COALESCE(birth_yr RLIKE '^[0-9]{4}$', FALSE)
+GROUP BY COALESCE(birth_yr, '(NULL)')
+ORDER BY n DESC;
+
+
+-- ===========================================================================
+-- 9. THE FULL TABLE 1 FUNNEL, claims cohort, in ONE query.
+--
+--    Mirrors the R pipeline's defaults after the requestor's answers:
+--      1  adults (age >= 18 at study end), market_clarity = 'Y'
+--      2  >=2 distinct C25 service dates >30 days apart, in the study period
+--      3  >=2 distinct metastatic dates (C77/C78, C79.0-C79.89) on/after index
+--      4  >=183 days continuous medical coverage before the FIRST METASTATIC date
+--      5  exclude C25.4 at any time
+--      6  exclude another primary cancer, both dates within [index-180, index]
+--      7  first daraxonrasib order in the study period
+--
+--    Run this to sanity-check the R output against an independent expression of
+--    the same logic. If the two disagree, one of them is wrong.
+-- ===========================================================================
+WITH params AS (
+  SELECT DATE'2020-01-01' AS study_start,
+         DATE'2026-06-01' AS study_end,
+         LEAST(DATE'2026-06-01', DATE'2026-03-31') AS ceiling_dt,   -- cut end
+         30  AS visit_gap, 180 AS baseline_days, 183 AS enroll_days
 ),
-neo AS (
-  SELECT h.ptid, COUNT(DISTINCT h.neoplasm_histology_key) AS n_neoplasms
-  FROM   t_onc_neoplasm_histology_2025q4 h
-  JOIN   bio_pts p ON p.ptid = h.ptid
-  WHERE  h.neoplasm_qualifier = 'actual'
-  GROUP  BY h.ptid
-)
-SELECT CASE WHEN n_neoplasms = 1 THEN '1 neoplasm'
-            WHEN n_neoplasms = 2 THEN '2 neoplasms'
-            ELSE '3+ neoplasms' END AS neoplasm_count,
-       COUNT(*) AS n_patients
-FROM   neo
-GROUP  BY 1
-ORDER  BY 1;
+-- Step 1 — adults in the Market Clarity population.
+s1 AS (
+  SELECT DISTINCT p.ptid
+  FROM t_patient_${cut} p
+  WHERE p.market_clarity = 'Y'
+    AND (p.birth_yr = '1936 and Earlier'
+         OR (p.birth_yr RLIKE '^[0-9]{4}$' AND CAST(p.birth_yr AS INT) <= 2008))
+),
+-- Claims diagnosis stream, ICD-10 only, bounded by the cut.
+dx AS (
+  SELECT d.ptid, d.diag AS cd, d.fst_dt AS dt
+  FROM t_clm_med_diagnosis_${cut} d, params
+  WHERE d.icd_flag = '10' AND d.fst_dt <= params.ceiling_dt
+),
+-- Step 2 — >=2 distinct C25 dates more than 30 days apart, inside the study period.
+pdac_dates AS (
+  SELECT DISTINCT dx.ptid, dx.dt
+  FROM dx, params
+  WHERE dx.cd IN ('C250','C251','C252','C253','C257','C258','C259')
+    AND dx.dt >= params.study_start AND dx.dt <= params.ceiling_dt
+),
+s2 AS (
+  SELECT ptid, MIN(dt) AS index_date
+  FROM pdac_dates
+  GROUP BY ptid
+  HAVING COUNT(DISTINCT dt) >= 2
+     AND DATEDIFF(MAX(dt), MIN(dt)) > (SELECT visit_gap FROM params)
+),
+s2c AS (SELECT s2.* FROM s2 JOIN s1 USING (ptid)),
+-- Step 3 — metastatic disease on/after index. C79.9x excluded (literal endpoint).
+mets AS (
+  SELECT s2c.ptid, MIN(dx.dt) AS mets_date
+  FROM dx JOIN s2c USING (ptid), params
+  WHERE (SUBSTR(dx.cd, 1, 3) IN ('C77','C78')
+         OR (SUBSTR(dx.cd, 1, 3) = 'C79' AND SUBSTR(dx.cd, 1, 4) <> 'C799'))
+    AND dx.dt >= s2c.index_date AND dx.dt <= params.ceiling_dt
+  GROUP BY s2c.ptid
+  HAVING COUNT(DISTINCT dx.dt) >= 2
+),
+s3 AS (SELECT s2c.ptid, s2c.index_date, mets.mets_date FROM s2c JOIN mets USING (ptid)),
+-- Step 4 — >=183 days of continuous coverage before the FIRST METASTATIC date.
+-- Spans sharing a start date are collapsed to the longest first, then stitched.
+spans AS (
+  SELECT ptid, eligeff, MAX(eligend) AS eligend
+  FROM t_clm_co_enrollment_${cut}
+  WHERE medical_coverage_ind = 'Y'
+  GROUP BY ptid, eligeff
+),
+islands AS (
+  SELECT ptid, eligeff, eligend,
+         CASE WHEN MAX(eligend) OVER (PARTITION BY ptid ORDER BY eligeff
+                                      ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) IS NULL
+                OR DATEDIFF(eligeff, MAX(eligend) OVER (PARTITION BY ptid ORDER BY eligeff
+                                      ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)) > 1
+              THEN 1 ELSE 0 END AS new_island
+  FROM spans
+),
+stitched AS (
+  SELECT ptid, MIN(eligeff) AS eligeff, MAX(eligend) AS eligend
+  FROM (SELECT ptid, eligeff, eligend,
+               SUM(new_island) OVER (PARTITION BY ptid ORDER BY eligeff
+                                     ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS island
+        FROM islands)
+  GROUP BY ptid, island
+),
+s4 AS (
+  SELECT DISTINCT s3.ptid, s3.index_date
+  FROM s3 JOIN stitched st USING (ptid), params
+  WHERE st.eligeff <= s3.mets_date AND st.eligend >= s3.mets_date
+    AND DATEDIFF(s3.mets_date, st.eligeff) >= params.enroll_days
+),
+-- Step 5 — exclude C25.4 at any observed time.
+s5 AS (
+  SELECT s4.* FROM s4
+  WHERE NOT EXISTS (SELECT 1 FROM dx WHERE dx.ptid = s4.ptid AND dx.cd = 'C254')
+),
+-- Step 6 — exclude another primary cancer with BOTH dates in [index-180, index].
+other_primary AS (
+  SELECT s5.ptid
+  FROM dx JOIN s5 USING (ptid), params
+  WHERE (SUBSTR(dx.cd, 1, 3) RLIKE '^C(0[0-9]|1[0-9]|2[0-4]|2[6-9]|3[0-9]|4[0-3]|4[5-9]|5[0-9]|6[0-9]|7[0-5]|8[1-9]|9[0-7])$'
+         -- C76 is a PARTIAL band in the RDQ: C76.0-C76.8, not the whole category.
+         OR (SUBSTR(dx.cd, 1, 3) = 'C76' AND SUBSTR(dx.cd, 4, 1) BETWEEN '0' AND '8'))
+    AND dx.dt >= DATE_SUB(s5.index_date, params.baseline_days)
+    AND dx.dt <= s5.index_date
+  GROUP BY s5.ptid
+  HAVING COUNT(DISTINCT dx.dt) >= 2
+     AND DATEDIFF(MAX(dx.dt), MIN(dx.dt)) > (SELECT visit_gap FROM params)
+),
+s6 AS (SELECT s5.* FROM s5 WHERE ptid NOT IN (SELECT ptid FROM other_primary)),
+-- Step 7 — first daraxonrasib order in the study period (claims: a PAID fill or
+-- a medical service line is the only observable proxy for an order).
+darax AS (
+  SELECT ptid, MIN(dt) AS darax_date FROM (
+    SELECT ptid, fill_dt AS dt FROM t_clm_rx_${cut}
+    WHERE transaction_type = 'PAID'
+      AND (UPPER(COALESCE(brnd_nm,'') || ' ' || COALESCE(gnrc_nm,''))
+             RLIKE 'DARAXONRASIB|DARAXON|RASONQUE|RMC.?0?70?6236'
+           OR ndc LIKE '85219%')
+    UNION ALL
+    SELECT ptid, fst_dt FROM t_clm_med_services_${cut}
+    WHERE ndc LIKE '85219%'
+  ) x, params
+  WHERE dt >= params.study_start AND dt <= params.ceiling_dt
+  GROUP BY ptid
+),
+s7 AS (SELECT s6.ptid FROM s6 JOIN darax USING (ptid))
+SELECT '1. Adults >=18, Market Clarity'                     AS step, COUNT(*) AS n FROM s1
+UNION ALL SELECT '2. Pancreatic cancer (>=2 visits >30d)',        COUNT(*) FROM s2c
+UNION ALL SELECT '3. Metastatic disease (>=2 dates, C77-C79.89)', COUNT(*) FROM s3
+UNION ALL SELECT '4. >=183d coverage before first metastasis',    COUNT(*) FROM s4
+UNION ALL SELECT '5. Exclude C25.4',                              COUNT(*) FROM s5
+UNION ALL SELECT '6. Exclude other primary cancer',               COUNT(*) FROM s6
+UNION ALL SELECT '7. Daraxonrasib order',                         COUNT(*) FROM s7;
 
 
--- ###########################################################################
--- PART D - the two questions that are NOT vocabulary
--- ###########################################################################
-
--- D1. OBSERVABILITY. t_pat_obs_time is described by the inventory as "the
---     correct instrument for observable time, censoring rules, and testing
---     whether apparent 'no further therapy' is loss to follow-up rather than a
---     clinical event" -- and it is read by nothing in this repository. Its
---     roster restriction is a NEW finding and is cohort-defining: the index
---     states the table covers only patients with clinical or claims activity
---     "within the last rolling five years". A patient outside that roster has
---     no observability record at all, which is not the same as having no
---     follow-up.
-SELECT COUNT(DISTINCT l.ptid)                                   AS n_lung,
-       COUNT(DISTINCT t.ptid)                                   AS n_lung_with_obs_time,
-       ROUND(100.0 * COUNT(DISTINCT t.ptid)
-             / NULLIF(COUNT(DISTINCT l.ptid), 0), 1)            AS pct_on_roster
-FROM   lung l
-LEFT   JOIN t_pat_obs_time_2025q4 t ON t.ptid = l.ptid;
-
--- D2. THE DATA CUTOFF. SOURCE_DATA_THROUGH appears nowhere in this repository,
---     and the cutoff is currently applied AFTER line construction rather than
---     bounding the source adapters. Establish where it lives and what it holds
---     before wiring it: a cutoff applied late can let post-cut stage, treatment
---     or activity change a patient who should not have been visible at all.
-DESCRIBE TABLE t_patient_2025q4;
-
-
--- ###########################################################################
--- PART E - what to send back, and what each answer unblocks
--- ###########################################################################
---
---   A2, A3, A4  -> ECOG, BMI, systolic BP, smoking, drinking, weight/height.
---                  Six of the 18. A4 alone may be enough; A2 is the fallback if
---                  the substring probe misses the local naming.
---   A5          -> settles which date anchors the baseline window. Not a
---                  lookup, a decision -- but its SIZE decides whether the
---                  decision is material or a footnote.
---   B2, B3      -> the second ECOG route, and the only vocabulary that table
---                  will ever have. Needed even if Optum sends every missing tab.
---   C2, C3, C4  -> PD-L1 and the molecular drivers, plus the string formats the
---                  TPS parser has to handle.
---   C5          -> sizes the patient-level attribution limitation. Does not
---                  unblock anything; stops us overstating what pdl1_status
---                  means.
---   D1, D2      -> observability and the data cutoff. Independent of the
---                  covariates and independently missing.
---
--- SAVE EVERY RESULT SET, including the empty ones. "t_observation has no ECOG
--- under any spelling" is a finding that redirects the work to Part B; reported
--- as silence it looks like the query was never run.
---
--- WHAT THIS DOES NOT ANSWER. Nothing here measures a FILL RATE in the study
--- cohort. These denominators are all lung patients in the deployment; the 2L
--- docetaxel cohort is smaller, later and more heavily investigated, so its fill
--- rate can be higher OR lower. Phoebe's completeness question needs the cohort
--- first and this vocabulary second -- in that order, and this file is only the
--- second half.
+-- ===========================================================================
+-- 10. TABLES 2/3 STRATA, once step 7 is non-zero. Expect `on_or_after` = 0 on
+--     any cut ending before 2026-05-01 — that is the observation window, not a
+--     clinical result.
+-- ===========================================================================
+-- SELECT COUNT(*) AS total,
+--        SUM(CASE WHEN darax_date <  DATE'2026-05-01' THEN 1 ELSE 0 END) AS before_may1,
+--        SUM(CASE WHEN darax_date >= DATE'2026-05-01' THEN 1 ELSE 0 END) AS on_or_after_may1
+-- FROM darax;   -- (re-run block 9's CTEs, or materialise `darax` as a temp view)
