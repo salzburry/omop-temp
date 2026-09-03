@@ -1,124 +1,382 @@
-Subject: NSCLC prognostic score — covariate review back, Optum feasibility not yet
+-- ==========================================================================
+-- 04_covariate_vocabulary_scan.sql
+-- Schema: hive_metastore.clnprw_optum_mc_full_use
+-- Runnable on its own. Shared conventions and run order: see README.md
+-- in this directory. Executed results: results/ (not yet run)
+-- ==========================================================================
+--
+-- WHY THIS FILE EXISTS.
+-- Six of Phoebe's 18 covariates -- ECOG, BMI, systolic BP, smoking, drinking,
+-- weight/height -- plus PD-L1 and the molecular drivers cannot be extracted
+-- today. Not for want of access: the tables are in the deployment and their
+-- COLUMNS are known. What is missing is the VALUE that identifies the row you
+-- want. You cannot write `WHERE obs_type = ???`.
+--
+-- optum_table_inventory.csv records the reason per table:
+--   t_observation   "OBS_TYPE is deferred to an OBS_TYPE lookup tab absent from
+--                    every file we hold" -- called the single most blocking gap
+--                    in the corpus.
+--   t_onc_biomarker  five lookup-controlled columns (ONC_BIO_LU,
+--                    ONC_TEST_NAME_LU, ONC_GENE_CHAR_LU,
+--                    ONC_NARRATIVE_RESULT_LU, ONC_MODIFIER_NARRATIVE_LU) whose
+--                    member lists we do not hold.
+--   t_nlp_measure    "column D (Look-Up List Link) is EMPTY for every row on
+--                    this sheet -- this table has no controlled lookup list at
+--                    all, so a DISTINCT scan on MEASUREMENT_TYPE IS the
+--                    vocabulary."
+--
+-- THAT LAST ONE IS WHY THIS FILE IS THE ANSWER RATHER THAN A REQUEST TO OPTUM.
+-- For t_nlp_measure -- the second-priority ECOG source -- no lookup tab exists
+-- to ask for. Even if the vendor sends every tab we are missing, that table
+-- still needs a scan. So the scan is the route that works for all three.
+--
+-- WHAT THIS FILE IS NOT. It reads nothing into the pipeline and writes nothing.
+-- Every statement is a frequency count or a bounded sample. Its whole output is
+-- "here is what is actually in this column", which is the one kind of answer
+-- that cannot be silently wrong -- unlike an extractor written against guessed
+-- values, which returns plausible rows for the wrong concept and reports a fill
+-- rate for it.
+--
+-- HOW TO RUN. Top to bottom, read-only. Save each result set as CSV under
+-- results/ with the query id (A2, B2, C2 ...) in the filename. Part E says what
+-- to send back and what each answer unblocks.
+--
+-- CASING WARNING. t_observation and t_nlp_measure are NOT in the 14-table live
+-- DESCRIBE -- the inventory marks their "deployed names and casing unverified".
+-- A0 and B0 below DESCRIBE them first. If a column name differs from what is
+-- written here, fix it in this file and say so in the results note; do not
+-- silently adapt one query and leave the rest.
 
-Hi Phoebe,
+USE hive_metastore.clnprw_optum_mc_full_use;
 
-Short version: your N = 703 is correct, the 18-covariate set is sound with three
-changes, and I can't give you an Optum sample size yet. Detail below.
+-- ---------------------------------------------------------------------------
+-- The lung denominator, identical to 01_optum_site_capability.sql Q3.
+-- Repeated rather than referenced so this file runs on its own, and IDENTICAL
+-- so the two files cannot disagree about who has lung cancer -- they did once,
+-- over whether a bare ICD-9 '162' counts. It does.
+--
+-- NOTE THE GATE DIFFERENCE, because it changes the denominator per part:
+--   t_observation and t_nlp_measure are NOT note-gated -- they exist for any
+--     patient with the underlying record.
+--   t_onc_biomarker IS note-gated (t_onc_* is built only for HAS_NOTES = 'Y'),
+--     so Part C's denominator is the notes-eligible subset, not all lung.
+-- Part A and Part C fill rates are therefore NOT comparable to each other.
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE TEMPORARY VIEW lung AS
+SELECT DISTINCT ptid
+FROM   t_diagnosis_2025q4
+WHERE  (diagnosis_cd_type = 'ICD10' AND diagnosis_cd LIKE 'C34%')
+    OR (diagnosis_cd_type = 'ICD9'  AND diagnosis_cd RLIKE '^162'
+        AND NOT diagnosis_cd RLIKE '^1620');
 
-────────────────────────────────────────────────────────────────────────
-1. YOUR 703 IS RIGHT
-────────────────────────────────────────────────────────────────────────
-The raw Flatiron tables give 1,700 and the RWDAP gives 703, and that gap is
-fully explained — it isn't a discrepancy:
 
-  1,700   2L docetaxel-only segment, raw FHRD
-  1,632   of those, holding a row in t_enh_advancednsclc
-    703   of those, advanced diagnosis on or after 2017-01-01   ← the whole gap
+-- ###########################################################################
+-- PART A - t_observation.  ECOG, BMI, systolic BP, smoking, drinking, weight.
+--          Six of the 18, all gated behind one absent lookup list.
+-- ###########################################################################
 
-2017 is the RWDAP's own cohort-entry floor (protocol §3.2.1), which the raw
-tables don't apply. Nothing else contributes: cohortn removes nobody, and the
-regimen-string difference contributes zero.
+-- A0. Deployed column names and casing. Everything below assumes the
+--     dictionary's 12: PTID, ENCID, OBS_TYPE, NLP, OBS_DATE, OBS_TIME,
+--     OBS_RESULT, OBS_UNIT, EVALUATED_FOR_RANGE, VALUE_WITHIN_RANGE,
+--     RESULT_DATE, SOURCEID. Confirm before trusting A2-A5.
+DESCRIBE TABLE t_observation_2025q4;
 
-Two honest caveats:
-  • This reconciles COUNTS, not patient identity. The check that would show
-    they're the same 703 people is written and hasn't run.
-  • "1,700 2L docetaxel monotherapy" is loose — Flatiron admits a patient if
-    ANY line-2 segment is exactly Docetaxel, which isn't the same as an
-    exclusively-docetaxel second line.
+-- A1. Size and date span, lung cohort. If this is empty or tiny the rest of
+--     Part A is moot and t_nlp_measure (Part B) becomes the only ECOG route.
+SELECT COUNT(*)                    AS n_rows,
+       COUNT(DISTINCT o.ptid)      AS n_patients,
+       MIN(o.obs_date)             AS earliest_obs,
+       MAX(o.obs_date)             AS latest_obs
+FROM   t_observation_2025q4 o
+JOIN   lung l ON l.ptid = o.ptid;
 
-Your censor filter reproduces the protocol's outcome gate exactly:
-n = 703, of whom 691 have ≥3 months' follow-up and 12 have no OS.
+-- A2. ****** THE VOCABULARY ******
+--     Every distinct OBS_TYPE with its volume, split by the NLP flag.
+--     The NLP split is not decoration: a structured vital and an NLP-extracted
+--     one are different evidence and the extractor may want to prefer one, so
+--     the choice has to be visible before it is made rather than discovered
+--     afterwards. OBS_TYPE is varchar(100), so expect free-text-ish variants
+--     ("ECOG", "ECOG Performance Status", "Ecog score") -- report them ALL, do
+--     not pre-collapse. Collapsing is our job, downstream, in code that can be
+--     reviewed.
+SELECT o.obs_type,
+       o.nlp,
+       COUNT(*)               AS n_rows,
+       COUNT(DISTINCT o.ptid) AS n_patients
+FROM   t_observation_2025q4 o
+JOIN   lung l ON l.ptid = o.ptid
+GROUP  BY o.obs_type, o.nlp
+ORDER  BY n_patients DESC;
 
-────────────────────────────────────────────────────────────────────────
-2. THE 18 COVARIATES — SOUND, THREE CHANGES
-────────────────────────────────────────────────────────────────────────
-Eight carry real evidence, counting publications where the factor was
-prognostic AND multivariable-significant for OS AND in an advanced cohort:
+-- A3. What the values LOOK like, per type. A frequency list of type names is
+--     not enough to write an extractor: ECOG is 0-4, a pain score is 0-10, and
+--     both are small integers. The unit and the observed value range are what
+--     separate them.
+--     TOP 40 TYPES ONLY, by patient count -- the tail is long and the six
+--     covariates we need are high-volume clinical measurements.
+WITH top_types AS (
+  SELECT o.obs_type
+  FROM   t_observation_2025q4 o
+  JOIN   lung l ON l.ptid = o.ptid
+  GROUP  BY o.obs_type
+  ORDER  BY COUNT(DISTINCT o.ptid) DESC
+  LIMIT  40
+)
+SELECT o.obs_type,
+       o.obs_unit,
+       COUNT(*)                        AS n_rows,
+       COUNT(DISTINCT o.obs_result)    AS n_distinct_values,
+       MIN(o.obs_result)               AS min_value_lexical,
+       MAX(o.obs_result)               AS max_value_lexical,
+       -- lexical min/max on a varchar is not a numeric range; the sample is
+       -- what tells you whether "10" is ten or a string that sorts before "2".
+       SUBSTRING(CONCAT_WS(' | ', COLLECT_SET(o.obs_result)), 1, 400) AS sample_values
+FROM   t_observation_2025q4 o
+JOIN   lung l ON l.ptid = o.ptid
+JOIN   top_types t ON t.obs_type = o.obs_type
+GROUP  BY o.obs_type, o.obs_unit
+ORDER  BY n_rows DESC;
 
-  Sex (6) · ECOG (5) · Histology (4) · Age (3) · Albumin (3)
-  Overall stage (2) · Race (2) · ALP (2)
+-- A4. TARGETED PROBE. A2 may return thousands of types; these are the six we
+--     actually need, found by substring rather than by reading the whole list.
+--     Deliberately WIDE patterns -- a false positive here costs one line in a
+--     result set, a false negative costs a covariate.
+--     Karnofsky is included because it is the other performance scale and
+--     converts to ECOG; if ECOG is absent and Karnofsky is present that is a
+--     usable finding, not a null result.
+SELECT o.obs_type,
+       o.nlp,
+       o.obs_unit,
+       COUNT(*)               AS n_rows,
+       COUNT(DISTINCT o.ptid) AS n_patients,
+       SUBSTRING(CONCAT_WS(' | ', COLLECT_SET(o.obs_result)), 1, 300) AS sample_values
+FROM   t_observation_2025q4 o
+JOIN   lung l ON l.ptid = o.ptid
+WHERE  LOWER(o.obs_type) RLIKE
+       'ecog|performance|karnofsky|kps|bmi|body mass|blood pressure|systolic|diastolic|smok|tobacco|nicotine|alcohol|drink|weight|height|body surface|bsa'
+GROUP  BY o.obs_type, o.nlp, o.obs_unit
+ORDER  BY n_patients DESC;
 
-The other ten sit at ≤1. Keep them, but as prediction inputs rather than
-evidence-tier prognostic factors — the slide currently reads as evidence-ranked
-and shouldn't.
+-- A5. WHICH DATE ANCHORS A BASELINE WINDOW. The inventory flags that this table
+--     "carries TWO date semantics on one row: OBS_DATE ('when recorded') and
+--     RESULT_DATE ('when measured')". The protocol's baseline window is
+--     -30..+7d around index, so when the two disagree by more than a few days
+--     they select different rows. This is a DECISION someone has to make, and
+--     the size of the disagreement decides whether it matters.
+SELECT CASE
+         WHEN o.result_date IS NULL                              THEN 'result_date null'
+         WHEN o.obs_date    IS NULL                              THEN 'obs_date null'
+         WHEN DATEDIFF(o.obs_date, o.result_date) = 0            THEN 'same day'
+         WHEN ABS(DATEDIFF(o.obs_date, o.result_date)) <= 7      THEN 'within 7d'
+         WHEN ABS(DATEDIFF(o.obs_date, o.result_date)) <= 30     THEN '8-30d'
+         ELSE                                                         'over 30d'
+       END                    AS date_agreement,
+       COUNT(*)               AS n_rows,
+       COUNT(DISTINCT o.ptid) AS n_patients
+FROM   t_observation_2025q4 o
+JOIN   lung l ON l.ptid = o.ptid
+GROUP  BY 1
+ORDER  BY n_rows DESC;
 
-ADD TWO:
-  • Number of metastatic sites — evidence equal to stage and race, and NOT
-    captured by initial overall stage. It's in REVEL's own baseline table.
-  • Neutrophil count — stronger evidence than NLR, which currently absorbs it.
-    The ratio hides the better signal.
 
-EVALUATE, DON'T ADOPT YET:
-  • Time since prior line (<9 vs ≥9 mo). A REVEL baseline field, but already
-    substantially represented by time_1l_to_index, and both its anchor (start
-    vs end of prior line) and the 9-month cut are unspecified. Adding it as
-    written risks entering the same information twice at a different cut.
+-- ###########################################################################
+-- PART B - t_nlp_measure.  The second-priority ECOG source, and the one where
+--          a DISTINCT scan is not a shortcut -- it is the only vocabulary there
+--          will ever be.
+-- ###########################################################################
 
-RECLASSIFY ONE, AND PLEASE DON'T DROP IT:
-  • Smoking status — 24 publications, every advanced-setting multivariable
-    estimate null. That's weak evidence for a prognostic claim, but it is not
-    grounds to remove it. Prespecified adjustment covariates should be chosen
-    from anticipated relevance and design considerations, not by counting
-    significant results — selecting on observed significance is what the
-    covariate-adjustment guidance warns against. The evidence tier is a label
-    on the slide, not a decision rule.
+-- B0. Deployed names and casing. Dictionary says 9: PTID, ENCID, NOTE_DATE,
+--     MEASUREMENT_TYPE, MEASUREMENT_VALUE, MEASUREMENT_DETAIL, NOTE_SECTION,
+--     MEASUREMENT_DATE, SOURCEID. Also NOT in the live DESCRIBE.
+DESCRIBE TABLE t_nlp_measure_2025q4;
 
-FOUR PARAMETERISATIONS TO FIX:
-  • Stage means the wrong thing. Flatiron holds stage at INITIAL diagnosis, not
-    restaged at the 2L index, so it reads as de-novo vs recurrent. A coefficient
-    fitted on that won't transfer to a trial's entry stage. Label it or drop it.
-  • ECOG — don't collapse 2/3/4, and keep Unknown separate from Missing until
-    we've seen the distribution. The numeric codebook is asserted from a spec we
-    don't hold; a one-position offset would silently reclassify every ECOG 1.
-  • Race — both supporting results are the Asian/Other-vs-White contrast, not
-    White-vs-rest.
-  • PD-L1 — currently blends two time-attribution methods, which makes the
-    variable patient-dependent. Pick one as primary.
+-- B1. Size and span, lung cohort.
+SELECT COUNT(*)               AS n_rows,
+       COUNT(DISTINCT m.ptid) AS n_patients,
+       MIN(m.note_date)       AS earliest_note,
+       MAX(m.note_date)       AS latest_note
+FROM   t_nlp_measure_2025q4 m
+JOIN   lung l ON l.ptid = m.ptid;
 
-────────────────────────────────────────────────────────────────────────
-3. OPTUM — NOT ANSWERABLE YET
-────────────────────────────────────────────────────────────────────────
-I don't have an Optum sample size or covariate fill rates for you, and I'd
-rather say that than give you a number I can't stand behind.
+-- B2. ****** THE VOCABULARY, and there is no other copy of it ******
+--     MEASUREMENT_TYPE is varchar(300) with no controlled list anywhere, so
+--     this result set IS the reference document. Save it verbatim.
+SELECT m.measurement_type,
+       COUNT(*)               AS n_rows,
+       COUNT(DISTINCT m.ptid) AS n_patients
+FROM   t_nlp_measure_2025q4 m
+JOIN   lung l ON l.ptid = m.ptid
+GROUP  BY m.measurement_type
+ORDER  BY n_patients DESC;
 
-What HAS run against Optum is a deployment profile — corpus size, site
-vocabulary, notes gate. What has NOT run is a 2L docetaxel cohort, so there is
-no attrition funnel, no N, and no per-covariate completeness on that source.
+-- B3. Targeted probe with values. MEASUREMENT_DETAIL "often refers to unit of
+--     measurement" per the dictionary, so it is carried here -- an ECOG with a
+--     unit is probably not an ECOG.
+SELECT m.measurement_type,
+       COUNT(*)               AS n_rows,
+       COUNT(DISTINCT m.ptid) AS n_patients,
+       SUBSTRING(CONCAT_WS(' | ', COLLECT_SET(m.measurement_value)),  1, 300) AS sample_values,
+       SUBSTRING(CONCAT_WS(' | ', COLLECT_SET(m.measurement_detail)), 1, 300) AS sample_details
+FROM   t_nlp_measure_2025q4 m
+JOIN   lung l ON l.ptid = m.ptid
+WHERE  LOWER(m.measurement_type) RLIKE
+       'ecog|performance|karnofsky|kps|bmi|body mass|blood pressure|systolic|weight|height'
+GROUP  BY m.measurement_type
+ORDER  BY n_patients DESC;
 
-The cohort builder is written and tested, but only against synthetic fixtures.
-It has never been given a database connection. Two things gate it:
 
-  • Optum's native line-of-therapy table can't be used. It's built from IV and
-    procedure-coded records only, so a patient whose 1L was an oral (osimertinib,
-    alectinib, lorlatinib) reads as 1L docetaxel instead of 2L. That's exactly
-    the EGFR/ALK-positive group, whose prognosis differs — misassignment
-    correlated with the outcome, inside a prognostic score. So we re-implement
-    Flatiron's line rules on Optum source data instead.
-  • That re-implementation is a rules-inspired reconstruction with documented
-    substitutions, not a faithful reproduction. It hasn't been validated against
-    Flatiron's own answer key yet. Until it has, I can't tell you an Optum N
-    means the same thing as your Flatiron 703.
+-- ###########################################################################
+-- PART C - t_onc_biomarker.  PD-L1 and the molecular drivers.
+--          NOTE-GATED: denominator is notes-eligible lung, not all lung.
+-- ###########################################################################
 
-────────────────────────────────────────────────────────────────────────
-4. TWO THINGS I NEED
-────────────────────────────────────────────────────────────────────────
-  • A terminology check, because it changes what we're building. "PS" is used
-    for both prognostic score and propensity score in the source material.
-    Protocol 308769 asks for a prognostic score — a regression on each patient's
-    contribution to the covariate-adjusted log-rank statistic — which is a
-    different object from a propensity score and isn't evaluated by a C-index.
-    Worth confirming we mean the same thing before we freeze the covariate set.
+-- C1. Size, span, and the temporal-status split. BIOMARKER_TEMPORAL_STATUS is
+--     the one complete vocabulary we already hold -- history / current / plan --
+--     and 'plan' is the reason it matters: a PLANNED test is not a result, and
+--     counting it would report a PD-L1 status for a patient who has not been
+--     tested. This is the only oncology table that allows 'plan'.
+SELECT b.biomarker_temporal_status,
+       COUNT(*)               AS n_rows,
+       COUNT(DISTINCT b.ptid) AS n_patients,
+       MIN(b.note_date)       AS earliest_note,
+       MAX(b.note_date)       AS latest_note
+FROM   t_onc_biomarker_2025q4 b
+JOIN   lung l ON l.ptid = b.ptid
+GROUP  BY b.biomarker_temporal_status
+ORDER  BY n_rows DESC;
 
-  • SME sign-off. Everything above is analyst-level. The clinical adjudication
-    column is empty on all 154 inventory rows, so none of these recommendations
-    is clinically signed off yet.
+-- C2. ****** THE BIOMARKER VOCABULARY ****** (ONC_BIO_LU + ONC_TEST_NAME_LU)
+--     Which biomarkers are named, and by which assay. 'current' and 'history'
+--     only -- see C1.
+SELECT b.biomarker,
+       b.test_name,
+       COUNT(*)               AS n_rows,
+       COUNT(DISTINCT b.ptid) AS n_patients
+FROM   t_onc_biomarker_2025q4 b
+JOIN   lung l ON l.ptid = b.ptid
+WHERE  b.biomarker_temporal_status IN ('current', 'history')
+GROUP  BY b.biomarker, b.test_name
+ORDER  BY n_patients DESC;
 
-One thing worth flagging for the analysis plan: eight of the ten strongest
-covariates are collected in REVEL- and LUME-style trials under eligibility
-restrictions that truncate their range. LUME-Lung 1 enrolled one PS-2 patient
-of 1,314, so in-trial ECOG is effectively binary; stage is 100% IV in REVEL;
-the organ-function labs are range-truncated by screening. How much prognostic
-signal survives that is an empirical question — the direction isn't knowable in
-advance and should be estimated, not assumed.
+-- C3. ****** THE RESULT VOCABULARY ****** (ONC_NARRATIVE_RESULT_LU +
+--     ONC_MODIFIER_NARRATIVE_LU + ONC_GENE_CHAR_LU)
+--     Restricted to the biomarkers we need, so the result set stays readable.
+--     The modifier is carried because "positive" and "NOT positive" may differ
+--     only by it -- a negation column read as a result is how a biomarker
+--     extractor inverts its own answer.
+SELECT b.biomarker,
+       b.narrative_result,
+       b.modifier_narrative,
+       b.gene_characteristics,
+       COUNT(*)               AS n_rows,
+       COUNT(DISTINCT b.ptid) AS n_patients
+FROM   t_onc_biomarker_2025q4 b
+JOIN   lung l ON l.ptid = b.ptid
+WHERE  b.biomarker_temporal_status IN ('current', 'history')
+   AND LOWER(b.biomarker) RLIKE 'pd-?l1|pd-?1|egfr|alk|ros1|braf|kras|met|ret|ntrk|her2|erbb2|tmb|msi'
+GROUP  BY b.biomarker, b.narrative_result, b.modifier_narrative, b.gene_characteristics
+ORDER  BY n_patients DESC;
 
-Happy to walk through any of this.
+-- C4. THE PARSER INPUT. NUMERIC_RESULT is varchar(12) and the dictionary
+--     "explicitly permits single value or range, with or without units". A
+--     PD-L1 TPS is the covariate that lands here, and "1-49", "<1", ">=50" and
+--     "50%" all need different parsing. Writing that parser against imagined
+--     strings is exactly the guess this file exists to avoid.
+SELECT b.biomarker,
+       b.numeric_result,
+       COUNT(*)               AS n_rows,
+       COUNT(DISTINCT b.ptid) AS n_patients
+FROM   t_onc_biomarker_2025q4 b
+JOIN   lung l ON l.ptid = b.ptid
+WHERE  b.numeric_result IS NOT NULL AND b.numeric_result <> ''
+   AND LOWER(b.biomarker) RLIKE 'pd-?l1|tmb'
+GROUP  BY b.biomarker, b.numeric_result
+ORDER  BY n_rows DESC
+LIMIT  200;
+
+-- C5. SIZING A LIMITATION NO VOCABULARY FIXES. This table has NO
+--     neoplasm_histology_key and NO ENCID, so a biomarker attaches to the
+--     PATIENT, never to the lung tumour. For a patient with one primary that is
+--     immaterial; for a patient with two it means pdl1_status may describe the
+--     other cancer. This counts how many biomarker-carrying lung patients have
+--     more than one distinct neoplasm, which is the size of the exposure.
+--     Report it with the variable definition -- it does not go away.
+WITH bio_pts AS (
+  SELECT DISTINCT b.ptid
+  FROM   t_onc_biomarker_2025q4 b
+  JOIN   lung l ON l.ptid = b.ptid
+),
+neo AS (
+  SELECT h.ptid, COUNT(DISTINCT h.neoplasm_histology_key) AS n_neoplasms
+  FROM   t_onc_neoplasm_histology_2025q4 h
+  JOIN   bio_pts p ON p.ptid = h.ptid
+  WHERE  h.neoplasm_qualifier = 'actual'
+  GROUP  BY h.ptid
+)
+SELECT CASE WHEN n_neoplasms = 1 THEN '1 neoplasm'
+            WHEN n_neoplasms = 2 THEN '2 neoplasms'
+            ELSE '3+ neoplasms' END AS neoplasm_count,
+       COUNT(*) AS n_patients
+FROM   neo
+GROUP  BY 1
+ORDER  BY 1;
+
+
+-- ###########################################################################
+-- PART D - the two questions that are NOT vocabulary
+-- ###########################################################################
+
+-- D1. OBSERVABILITY. t_pat_obs_time is described by the inventory as "the
+--     correct instrument for observable time, censoring rules, and testing
+--     whether apparent 'no further therapy' is loss to follow-up rather than a
+--     clinical event" -- and it is read by nothing in this repository. Its
+--     roster restriction is a NEW finding and is cohort-defining: the index
+--     states the table covers only patients with clinical or claims activity
+--     "within the last rolling five years". A patient outside that roster has
+--     no observability record at all, which is not the same as having no
+--     follow-up.
+SELECT COUNT(DISTINCT l.ptid)                                   AS n_lung,
+       COUNT(DISTINCT t.ptid)                                   AS n_lung_with_obs_time,
+       ROUND(100.0 * COUNT(DISTINCT t.ptid)
+             / NULLIF(COUNT(DISTINCT l.ptid), 0), 1)            AS pct_on_roster
+FROM   lung l
+LEFT   JOIN t_pat_obs_time_2025q4 t ON t.ptid = l.ptid;
+
+-- D2. THE DATA CUTOFF. SOURCE_DATA_THROUGH appears nowhere in this repository,
+--     and the cutoff is currently applied AFTER line construction rather than
+--     bounding the source adapters. Establish where it lives and what it holds
+--     before wiring it: a cutoff applied late can let post-cut stage, treatment
+--     or activity change a patient who should not have been visible at all.
+DESCRIBE TABLE t_patient_2025q4;
+
+
+-- ###########################################################################
+-- PART E - what to send back, and what each answer unblocks
+-- ###########################################################################
+--
+--   A2, A3, A4  -> ECOG, BMI, systolic BP, smoking, drinking, weight/height.
+--                  Six of the 18. A4 alone may be enough; A2 is the fallback if
+--                  the substring probe misses the local naming.
+--   A5          -> settles which date anchors the baseline window. Not a
+--                  lookup, a decision -- but its SIZE decides whether the
+--                  decision is material or a footnote.
+--   B2, B3      -> the second ECOG route, and the only vocabulary that table
+--                  will ever have. Needed even if Optum sends every missing tab.
+--   C2, C3, C4  -> PD-L1 and the molecular drivers, plus the string formats the
+--                  TPS parser has to handle.
+--   C5          -> sizes the patient-level attribution limitation. Does not
+--                  unblock anything; stops us overstating what pdl1_status
+--                  means.
+--   D1, D2      -> observability and the data cutoff. Independent of the
+--                  covariates and independently missing.
+--
+-- SAVE EVERY RESULT SET, including the empty ones. "t_observation has no ECOG
+-- under any spelling" is a finding that redirects the work to Part B; reported
+-- as silence it looks like the query was never run.
+--
+-- WHAT THIS DOES NOT ANSWER. Nothing here measures a FILL RATE in the study
+-- cohort. These denominators are all lung patients in the deployment; the 2L
+-- docetaxel cohort is smaller, later and more heavily investigated, so its fill
+-- rate can be higher OR lower. Phoebe's completeness question needs the cohort
+-- first and this vocabulary second -- in that order, and this file is only the
+-- second half.
