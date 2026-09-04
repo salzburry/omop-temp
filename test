@@ -1,292 +1,211 @@
 -- ==========================================================================
--- 06_ecog_source_decision.sql
--- Schema: hive_metastore.clnprw_optum_mc_full_use
--- Runnable on its own. Shared conventions and run order: see README.md
--- in this directory. Executed results: results/ (not yet run)
+-- 09_lab_analyte_vocabulary.sql
+-- Schema: dvmt_rwop.rwd_optum_marketclarity_25q4  (tables have NO cut suffix)
+-- Runnable on its own. Run order and conventions: README.md in this directory.
+-- Executed results: results/ (not yet run)
 -- ==========================================================================
 --
--- ONE DECISION: which table R/nsclc_covariates.R should read ECOG from.
+-- FIVE OF PHOEBE'S 18 COVARIATES ARE BLOCKED ON ONE THING: nobody knows what
+-- an analyte is called in this deployment. Albumin, ALP, haemoglobin,
+-- platelets and NLR all live in t_lab, the table is read by the engine for R24
+-- activity, and its ANALYTE vocabulary has never been scanned. No analyte name
+-- appears in any of the ten vendor PDFs and the TEST_TYPE lookup tab is absent,
+-- so a DISTINCT scan IS the vocabulary -- the same position t_nlp_measure was
+-- in before 04, and the same fix.
 --
--- 05 established that t_onc_evaluation_system holds ECOG for 73,422 lung
--- patients against t_nlp_measure's 54,231. That is an EXISTENCE finding and it
--- is decisive as one. It is NOT a source decision, and the difference is the
--- whole reason this file exists rather than a one-line edit to the extractor.
+-- COLUMN NAMES HERE ARE LIVE-DESCRIBE VERIFIED (optum_table_inventory.csv:
+-- t_lab 33 columns, t_clm_lab_results 16). They are not from the dictionary.
 --
--- THREE THINGS THE COUNT DOES NOT SAY.
+-- THREE HAZARDS THIS FILE IS SHAPED AROUND, all documented before it ran:
 --
---   1. 73,422 counts patients with a ROW, not patients with a SCORE. RESULT is
---      varchar(5); the dictionary gives it no vocabulary. Rows whose RESULT is
---      null, or holds a grading token ('High'), or holds prose, are all inside
---      that number. A source with more rows and fewer parseable 0-5 values is
---      worse, not better, and nothing run so far can tell the two apart.
+--   1. NO SPECIMEN-TYPE COLUMN on either lab table. Serum-vs-urine separation
+--      rests ENTIRELY on the name string, so 'microalbumin' and 'albumin' are
+--      distinguished by text or not at all. A1 returns the names precisely so
+--      that separation can be made on evidence.
 --
---   2. The two sources OVERLAP BY AN UNMEASURED AMOUNT. 73,422 > 54,231 does
---      not mean the second set is contained in the first. If 12,000 patients
---      have an NLP ECOG and no evaluation-system row, a straight swap silently
---      DROPS 12,000 patients from a covariate that is a prognostic anchor of
---      the score. The right change is then coalesce, not switch -- and the
---      difference is invisible from marginal counts.
+--   2. THE DIFFERENTIAL IS THE NLR PROBLEM. Neutrophils and lymphocytes are
+--      reported both as a PERCENT and as an ABSOLUTE count, and NLR needs
+--      absolutes. Whether anything beyond TEST_NAME and RESULT_UNIT
+--      distinguishes them is unresolved by any document (EO/Optum question 22).
+--      B2 is written to show both forms side by side rather than to assume one.
 --
---   3. THE DENOMINATORS ARE NESTED, NOT EQUAL. t_onc_evaluation_system draws
---      from lung INTERSECT Enriched Oncology (cancer dx AND an NLP cancer
---      concept); t_nlp_measure draws from lung INTERSECT has-notes, a strictly
---      LARGER pool. The results doc first called this "like-for-like", which is
---      wrong -- but it is wrong in the finding's favour: the bigger count comes
---      out of the smaller pool, so +35% is a floor. Recorded because a floor
---      and a like-for-like comparison license different claims.
---
--- Six statements, all aggregates, no window functions. Minutes, not hours --
--- 05 was ~21 minutes and this is a smaller cut of the same tables.
+--   3. AN ENGLISH-WORD PROBE MISSES TERSE CODES. 04's A4 searched
+--      ecog|performance|karnofsky|kps and found nothing, while the same probe
+--      in the same table missed SBP, DBP, WT and HT because Optum uses terse
+--      codes. So A1 -- the UNFILTERED list -- is the evidence here, and B1's
+--      targeted probe is a convenience. If they disagree, A1 wins.
 
-USE hive_metastore.clnprw_optum_mc_full_use;
+USE dvmt_rwop.rwd_optum_marketclarity_25q4;
 
--- Same lung denominator as 01, 04 and 05, repeated verbatim so this file runs
--- on its own and cannot disagree with them about who has lung cancer.
+-- Same lung denominator as 01/04/05/06/07/08, verbatim.
 CREATE OR REPLACE TEMPORARY VIEW lung AS
 SELECT DISTINCT ptid
-FROM   t_diagnosis_2025q4
+FROM   t_diagnosis
 WHERE  (diagnosis_cd_type = 'ICD10' AND diagnosis_cd LIKE 'C34%')
     OR (diagnosis_cd_type = 'ICD9'  AND diagnosis_cd RLIKE '^162'
         AND NOT diagnosis_cd RLIKE '^1620');
 
 
 -- ###########################################################################
--- A - what an ECOG row in t_onc_evaluation_system ACTUALLY CONTAINS
+-- PART A - the vocabulary itself
 -- ###########################################################################
 
--- A1. ****** THE ONE THAT DECIDES WHETHER THE SOURCE IS USABLE ******
---     The full cross-tabulation of the three value columns on ECOG rows. No
---     LIMIT: if the vocabulary is wide that is itself the answer, and a LIMIT
---     would hide exactly the tail that makes it unparseable.
+-- A1. ****** THE ONE THAT UNBLOCKS THE FIVE COVARIATES ******
+--     Every analyte in the lung cohort, by patient count. LOINC alongside the
+--     name because LOINC is the stable key and TEST_NAME is LOINC
+--     long-common-name style, so the pair is what a codelist gets written
+--     against.
 --
---     WHAT EACH COLUMN IS BEING ASKED.
---       RESULT           varchar(5). Expected '0'..'5'. varchar(5) is wide
---                        enough for '0 - 1' or 'ECOG0', and the extractor's
---                        parser has to be written against what is there.
---       RESULT_NARRATIVE varchar(17). Its DOCUMENTED vocabulary is
---                        High/Intermediate/Low, which is GRADING terminology --
---                        Nottingham and Gleason share this table. What it holds
---                        on an ECOG row has never been observed. Do not assume
---                        it is the score and do not assume it is empty.
---       TEMPORAL_STATUS  varchar(7). Documented history/current, no 'plan'. If
---                        a third value appears, the biomarker lesson repeats:
---                        04's own C2/C3 filtered IN ('current','history') and
---                        discarded 117,040 patients whose status was NULL.
+--     LIMIT 1000 and not 50: the five we need are common and will be near the
+--     top, but the TAIL is where a second spelling of the same analyte hides,
+--     and a codelist built from the head alone silently drops it. SAVE ALL
+--     ROWS -- this output IS the reference document, exactly as 04's B2 became
+--     the only copy of the t_nlp_measure vocabulary.
+SELECT l.loinc,
+       l.test_name,
+       l.result_unit,
+       COUNT(*)               AS n_rows,
+       COUNT(DISTINCT l.ptid) AS n_patients
+FROM   t_lab l
+JOIN   lung g ON g.ptid = l.ptid
+GROUP  BY l.loinc, l.test_name, l.result_unit
+ORDER  BY n_patients DESC
+LIMIT  1000;
+
+-- A2. How many distinct analytes exist at all, so it is possible to say
+--     whether A1's 1,000 rows are the whole list or a truncation. If this
+--     comes back above 1,000, A1 is a head and the tail is unread -- say so
+--     rather than treating A1 as complete.
+SELECT COUNT(*) AS n_distinct_loinc_name_unit
+FROM  (SELECT DISTINCT l.loinc, l.test_name, l.result_unit
+       FROM   t_lab l JOIN lung g ON g.ptid = l.ptid) x;
+
+
+-- ###########################################################################
+-- PART B - the five, and the differential trap
+-- ###########################################################################
+
+-- B1. The targeted probe. A CONVENIENCE, not the evidence -- see hazard 3.
+--     Deliberately wide: 'albumin' catches microalbumin so the specimen
+--     ambiguity is visible rather than silently included, and both the
+--     percent and absolute differential spellings are wanted.
+SELECT l.loinc, l.test_name, l.result_unit,
+       COUNT(*)               AS n_rows,
+       COUNT(DISTINCT l.ptid) AS n_patients
+FROM   t_lab l
+JOIN   lung g ON g.ptid = l.ptid
+WHERE  upper(l.test_name) RLIKE
+       'ALBUMIN|ALKALINE|PHOSPHATASE|HEMOGLOB|HAEMOGLOB|PLATELET|NEUTROPHIL|LYMPHOCYTE|ANC|ALC|WBC|LEUKOCYTE'
+GROUP  BY l.loinc, l.test_name, l.result_unit
+ORDER  BY n_patients DESC;
+
+-- B2. ****** THE NLR MAKE-OR-BREAK ******
+--     Percent and absolute, side by side, for the two differential analytes.
+--     NLR needs ABSOLUTE counts; a ratio built from percentages is a different
+--     quantity and is not comparable to any published NLR cut-point.
 --
---     NULLs are counted, not filtered. "How many rows have no result" is the
---     question; a WHERE clause that drops them answers a different one.
-SELECT e.result,
-       e.result_narrative,
-       e.temporal_status,
-       COUNT(*)                AS n_rows,
-       COUNT(DISTINCT e.ptid)  AS n_patients
-FROM   t_onc_evaluation_system_2025q4 e
-JOIN   lung l ON l.ptid = e.ptid
-WHERE  e.system_name = 'ECOG performance status'
-GROUP  BY e.result, e.result_narrative, e.temporal_status
+--     RESULT_UNIT is the discriminator if anything is: '%' versus '10*3/uL' or
+--     'K/uL'. If both forms share a unit string, or the unit is null, then
+--     TEST_NAME is the only discriminator and that is a finding worth stating
+--     plainly rather than working around.
+SELECT CASE WHEN upper(l.test_name) RLIKE 'NEUTROPHIL' THEN 'neutrophil'
+            WHEN upper(l.test_name) RLIKE 'LYMPHOCYTE' THEN 'lymphocyte'
+            ELSE 'other' END                       AS analyte,
+       l.result_unit,
+       l.result_datatype,
+       COUNT(*)                                    AS n_rows,
+       COUNT(DISTINCT l.ptid)                      AS n_patients,
+       MIN(l.test_name)                            AS example_name
+FROM   t_lab l
+JOIN   lung g ON g.ptid = l.ptid
+WHERE  upper(l.test_name) RLIKE 'NEUTROPHIL|LYMPHOCYTE'
+GROUP  BY 1, l.result_unit, l.result_datatype
 ORDER  BY n_rows DESC;
 
--- A2. The headline number A1 breaks down: how many of the 73,422 have at least
---     one row whose RESULT parses as a bare 0-5.
+-- B3. The value shape, for the unit map and the parser. TEST_RESULT is
+--     Character(635) -- a free-text field, not a number -- so this is the
+--     PD-L1 NUMERIC_RESULT question again: how much of it parses.
 --
---     THIS IS THE NUMBER THAT COMPARES TO 54,231, and 73,422 is not. If it
---     comes in below 54,231 then t_nlp_measure stays primary and the rest of
---     this file is moot -- t_onc_evaluation_system has more ROWS about ECOG and
---     fewer PATIENTS WITH A SCORE, which is the opposite of an upgrade.
---
---     '^[0-5]$' is deliberately strict. Whatever A1 shows can be admitted
---     later on purpose; admitting it here by writing a loose pattern first
---     would fold the parser question into the count and lose it.
-SELECT COUNT(DISTINCT e.ptid)                                              AS n_any_row,
-       COUNT(DISTINCT CASE WHEN e.result RLIKE '^[0-5]$'
-                           THEN e.ptid END)                                AS n_parseable_result,
-       COUNT(DISTINCT CASE WHEN e.result IS NULL
-                            AND e.result_narrative IS NULL
-                           THEN e.ptid END)                                AS n_both_value_cols_null
-FROM   t_onc_evaluation_system_2025q4 e
-JOIN   lung l ON l.ptid = e.ptid
-WHERE  e.system_name = 'ECOG performance status';
+--     RELATIVE_INDICATOR ('<','>','<=','>=','==') is returned because an
+--     inequality is a different finding from a value, and 04's PD-L1 work
+--     established that carrying it beats discarding it.
+SELECT l.result_datatype,
+       l.relative_indicator,
+       l.normalized_result,
+       l.standard_units,
+       COUNT(*)                                                        AS n_rows,
+       SUM(CASE WHEN l.test_result RLIKE '^[0-9]+(\.[0-9]+)?$'
+                THEN 1 ELSE 0 END)                                     AS n_bare_numeric
+FROM   t_lab l
+JOIN   lung g ON g.ptid = l.ptid
+WHERE  upper(l.test_name) RLIKE
+       'ALBUMIN|ALKALINE|PHOSPHATASE|HEMOGLOB|PLATELET|NEUTROPHIL|LYMPHOCYTE'
+GROUP  BY 1, 2, 3, 4
+ORDER  BY n_rows DESC;
 
 
 -- ###########################################################################
--- B - how far the two sources overlap
+-- PART C - the second, independent lab source
 -- ###########################################################################
 
--- B1. ****** THE ONE THAT DECIDES SWITCH vs COALESCE ******
---     A FULL OUTER JOIN of the two patient sets. Marginal counts cannot answer
---     this: 73,422 and 54,231 are consistent with total containment and with
---     almost no overlap, and those imply opposite changes to the extractor.
---
---     READING THE OUTPUT.
---       nlp_only ~ 0        -> t_nlp_measure adds nothing. Switch.
---       nlp_only material   -> COALESCE, not switch. Read the evaluation system
---                              first and fall back to NLP. nlp_only is exactly
---                              the patient count a swap would throw away, and
---                              it is a per-patient loss on a covariate that
---                              carries the prognostic score.
---       union_total         -> what a coalescing extractor gets. If it exceeds
---                              73,422 -- which it does whenever nlp_only > 0 --
---                              then neither single source is the best answer.
---
---     Both sides are restricted to lung inside the subqueries, so the join is
---     patient-to-patient on the same denominator and no row multiplies.
-WITH eo AS (
-    SELECT DISTINCT e.ptid
-    FROM   t_onc_evaluation_system_2025q4 e
-    JOIN   lung l ON l.ptid = e.ptid
-    WHERE  e.system_name = 'ECOG performance status'
-), nlp AS (
-    SELECT DISTINCT m.ptid
-    FROM   t_nlp_measure_2025q4 m
-    JOIN   lung l ON l.ptid = m.ptid
-    WHERE  m.measurement_type = 'ECOG'
-)
-SELECT COUNT(*)                                                    AS union_total,
-       COUNT(CASE WHEN nlp.ptid IS NULL THEN 1 END)                AS eo_only,
-       COUNT(CASE WHEN eo.ptid IS NOT NULL
-                   AND nlp.ptid IS NOT NULL THEN 1 END)            AS both,
-       COUNT(CASE WHEN eo.ptid IS NULL THEN 1 END)                 AS nlp_only
-FROM   eo FULL OUTER JOIN nlp ON eo.ptid = nlp.ptid;
-
--- B2. The same question one level deeper, for the coalesce case only. Among
---     patients in BOTH, do the two sources agree on the score?
---
---     A coalescing extractor picks a winner per patient, and "prefer the
---     evaluation system" is only defensible if the two do not systematically
---     disagree. Nearest-in-time is not compared here -- this is the crude
---     version: the set of distinct values each source ever recorded, per
---     patient. Wholesale disagreement means the two are not measuring the same
---     thing and neither should silently override the other.
---
---     LIMIT 200 because this is a shape question, not a count.
---     DISTINCT INSIDE BOTH CTEs, NOT OPTIONAL. Without it this joins 736,635
---     rows against 245,158 on ptid and multiplies serial assessments together;
---     COUNT(DISTINCT ptid) would still be right and the query would still be
---     the most expensive statement in this directory. Deduping to one row per
---     (patient, value) makes it a set comparison, which is the question.
-WITH eo AS (
-    SELECT DISTINCT e.ptid, e.result AS eo_val
-    FROM   t_onc_evaluation_system_2025q4 e
-    JOIN   lung l ON l.ptid = e.ptid
-    WHERE  e.system_name = 'ECOG performance status'
-      AND  e.result RLIKE '^[0-5]$'
-), nlp AS (
-    SELECT DISTINCT m.ptid, m.measurement_value AS nlp_val
-    FROM   t_nlp_measure_2025q4 m
-    JOIN   lung l ON l.ptid = m.ptid
-    WHERE  m.measurement_type = 'ECOG'
-      AND  m.measurement_value RLIKE '^[0-5]$'
-)
-SELECT eo.eo_val,
-       nlp.nlp_val,
-       COUNT(DISTINCT eo.ptid) AS n_patients
-FROM   eo JOIN nlp ON eo.ptid = nlp.ptid
-GROUP  BY eo.eo_val, nlp.nlp_val
+-- C1. t_clm_lab_results. A SECOND lab source that was never considered until
+--     the reference read turned it up, and it has fields t_lab lacks --
+--     HI_NRML/LOW_NRML numeric reference bounds and an abnormality code.
+--     Different column names entirely: LOINC_CD, TST_DESC, RSLT_UNIT_NM.
+SELECT c.loinc_cd, c.tst_desc, c.rslt_unit_nm,
+       COUNT(*)               AS n_rows,
+       COUNT(DISTINCT c.ptid) AS n_patients
+FROM   t_clm_lab_results c
+JOIN   lung g ON g.ptid = c.ptid
+GROUP  BY c.loinc_cd, c.tst_desc, c.rslt_unit_nm
 ORDER  BY n_patients DESC
-LIMIT  200;
---     NOTE ON THE COLUMN NAME. MEASUREMENT_VALUE is the dictionary's name
---     (Character(150)) and is what nc_ecog() in R/nsclc_covariates.R already
---     reads, so an error here would break the extractor too. But t_nlp_measure
---     is one of the eight tables ABSENT from the only live DESCRIBE we hold
---     (optum_capability_inventory.md, open questions), so its deployed name and
---     casing are PDF-derived. If B2 errors on an unresolved column, run
---     DESCRIBE t_nlp_measure_2025q4 and substitute -- that is a naming miss,
---     and it is also a defect in the R reader.                   # UNVERIFIED
---
---     NOTE ON THE RANGE. A1/A2 above admit '^[0-5]$' because the Enriched
---     Oncology manual p.4 sec 1.3 documents ECOG as 0-5 and says Optum QCs the
---     frequency of each score. nc_ecog() bounds it at 0-4. Both are defensible
---     -- ECOG 5 is death, which cannot be a baseline covariate for a patient
---     alive at index -- but they are different, and the wider bound is used
---     here on purpose so the output SHOWS how many 5s exist instead of hiding
---     them behind the extractor's own filter.
+LIMIT  500;
+
+-- C2. RSLT_NBR versus RSLT_TXT, which the vendor warns about VERBATIM: "not
+--     all vendors give a separate numeric field. Numeric results may also be
+--     in the Result Text field." If RSLT_NBR is sparse, every claims-side lab
+--     value needs parsing out of an 18-character text field, and TST_DESC is
+--     documented as "specific to each laboratory vendor" -- i.e. not a
+--     controlled vocabulary at all.
+SELECT COUNT(*)                                                   AS n_rows,
+       COUNT(c.rslt_nbr)                                          AS n_rslt_nbr,
+       ROUND(100.0 * COUNT(c.rslt_nbr) / COUNT(*), 2)             AS pct_nbr,
+       SUM(CASE WHEN c.rslt_txt IS NOT NULL
+                 AND trim(c.rslt_txt) <> '' THEN 1 ELSE 0 END)    AS n_rslt_txt,
+       COUNT(c.rslt_unit_nm)                                      AS n_unit
+FROM   t_clm_lab_results c
+JOIN   lung g ON g.ptid = c.ptid;
 
 
 -- ###########################################################################
--- C - settle the transcription that could not be read off the scan
--- ###########################################################################
-
--- C1. The three rows under ECOG in 05's B1 output, re-run so they are read
---     from a result set instead of from a rotated photograph.
---
---     The scan admits two readings, and they disagree about which label owns
---     which count:
---         reading 1   (null) 66,248/16,770 · Karnofsky 54,714/12,262
---                     · Performance Status 34,904/10,476
---         reading 2   Karnofsky 66,248/16,770 · (null) 54,714/12,262
---                     · Performance Status n_rows 34,494
---
---     An earlier note argued the pairing was self-proving because n_patients
---     descends monotonically. THAT ARGUMENT IS VOID: monotonicity is a property
---     of the numeric column alone and survives any relabelling of the rows
---     beside it. The ECOG row is unaffected either way -- it is the top row of
---     a descending sort with no competitor -- but the Karnofsky headline count
---     is 16,770 under one reading and 12,262 under the other, and
---     optum_covariate_coverage.csv is about to be corrected with it.
---
---     COALESCE makes the null row print as a label rather than as blank space,
---     which is how the ambiguity got in.
-SELECT COALESCE(e.system_name, '<<NULL>>') AS system_name,
-       COUNT(*)               AS n_rows,
-       COUNT(DISTINCT e.ptid) AS n_patients
-FROM   t_onc_evaluation_system_2025q4 e
-JOIN   lung l ON l.ptid = e.ptid
-WHERE  e.system_name IS NULL
-    OR e.system_name IN ('Karnofsky Performance Status', 'Performance Status')
-GROUP  BY COALESCE(e.system_name, '<<NULL>>')
-ORDER  BY n_patients DESC;   -- same ORDER BY as 05 B1, so the rows come back in
-                             -- the same sequence and the readings can be matched
-                             -- against the scan line for line.
-
--- C2. What the NULL system_name rows are. 05 left a five-figure block of rows
---     with no system name and nothing was said about them; if they are
---     unlabelled performance status they belong in the ECOG source, and if they
---     are unlabelled grading they do not.
-SELECT e.result,
-       e.result_narrative,
-       COUNT(*)               AS n_rows,
-       COUNT(DISTINCT e.ptid) AS n_patients
-FROM   t_onc_evaluation_system_2025q4 e
-JOIN   lung l ON l.ptid = e.ptid
-WHERE  e.system_name IS NULL
-GROUP  BY e.result, e.result_narrative
-ORDER  BY n_rows DESC
-LIMIT  100;
-
-
--- ###########################################################################
--- D - what each answer changes in the code
+-- PART D - what each answer unblocks
 -- ###########################################################################
 --
---   A2 parseable < 54,231
---       t_nlp_measure STAYS primary. The existence finding stands and the
---       source does not change. Record the parseable count next to 73,422 in
---       the results file so the marginal count is never read as a score count
---       again.
+--   A1  THE DELIVERABLE. Five of Phoebe's 18 become writable WHERE clauses.
+--       Save every row: it is the only copy of this vocabulary, as 04's B2 is
+--       for t_nlp_measure.
 --
---   A2 parseable > 54,231 AND B1 nlp_only ~ 0
---       Switch. NC_NLP_TYPE['ecog'] becomes the fallback, nc_ecog() reads
---       t_onc_evaluation_system first, and the parser is written against A1's
---       observed RESULT vocabulary rather than against '0'-'5' by assumption.
+--   A2  Says whether A1 is the list or the head of it.
 --
---   A2 parseable > 54,231 AND B1 nlp_only material
---       COALESCE. nc_ecog() reads both, prefers the evaluation system per
---       patient, and falls back to NLP. B2 says whether that preference is
---       defensible or whether the two sources disagree badly enough that
---       neither can override the other. This is the outcome the marginal
---       counts cannot distinguish from the one above, and it is the reason the
---       source change was held rather than made from 05 alone.
+--   B2  Decides whether NLR is feasible AT ALL. Absolute neutrophil and
+--       lymphocyte counts present -> feasible. Percent only -> NLR cannot be
+--       built from t_lab without a WBC to multiply through, and that is a
+--       derivation with its own error, not a measurement.
 --
---   A1 shows a TEMPORAL_STATUS value outside history/current
---       The biomarker lesson repeats. Decide the exclusion on what the value
---       MEANS, not on which values happen to be frequent -- 04's C2/C3 excluded
---       by an inclusion list and dropped 117,040 NULL-status patients.
+--   B3  The parser. TEST_RESULT is free text; this is how much of it is a bare
+--       number and how much carries an inequality.
 --
---   C1 / C2
---       Corrects the Karnofsky count in the results file and in
---       optum_covariate_coverage.csv, and says whether the unlabelled block is
---       performance status.
+--   C1/C2  Whether the claims lab source adds patients or is a parsing
+--       liability. Both may be true.
 --
--- SAVE EVERY RESULT SET, INCLUDING THE EMPTY ONES, and save them as text rather
--- than as photographs -- C1 exists only because the last run came back as a
--- rotated scan and two readers paired the same three rows differently.
+-- WHAT THIS FILE DELIBERATELY DOES NOT DO: the same-day neutrophil-plus-
+-- lymphocyte co-occurrence rate, which is the number that decides whether NLR
+-- is computable per patient. It is NOT here because it must be run against a
+-- FROZEN analyte allow-list -- run it on a guessed list and the co-occurrence
+-- rate is a property of the guess. It is a follow-up to this file, after A1
+-- and B2 are read.
+--
+-- SAVE EVERY RESULT SET, AS TEXT AND NOT AS PHOTOGRAPHS. Three transcription
+-- errors have already come out of rotated scans in this project: two swapped
+-- labels, one invented row, and one misread count that took three runs and a
+-- reconciliation query to correct.
