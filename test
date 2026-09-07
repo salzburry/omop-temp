@@ -1,629 +1,550 @@
 -- =========================================================================
---  RUN_ONCE.sql — everything worth asking the warehouse, in one sitting
+--  RUN_ONCE_2.sql — round two. Everything a query can still settle.
 -- =========================================================================
 --
---  Ordered so that a failure late costs the least. Blocks A and B are
---  instant, cannot fail on a column name, and answer several questions on
---  their own. The expensive scans are last on purpose.
+--  NO PLACEHOLDERS. Block 0 builds a proxy MM population as a temporary view
+--  and everything else reuses it, so the whole file runs as-is.
 --
---  TWO EDITS BEFORE RUNNING
---    1. <COHORT>   -> the cohort table, e.g. myschema.ndmm_NDMM_COHORT
---    2. _2026q1    -> whatever block A says actually exists. The config
---                     resolves to 2026q1; the only describe-table screenshot
---                     in docs/ is 2025q4. Block A tells you; if you can only
---                     run once, do a find-replace to the vintage you believe
---                     is right and let block A confirm it.
+--  IF YOU HAVE THE COHORT TABLE, say so by replacing block 0's body with
+--      SELECT DISTINCT cast(PATID as string) AS PATID FROM <your cohort table>
+--  Four answers get sharper; nothing else changes. Round one skipped every
+--  cohort-dependent query, which is why Q11, Q13, Q16 and Q25 are still open.
 --
---  IF A STATEMENT ERRORS and the editor stops: everything above it is still
---  valid output — send that. Each block is independent.
+--  Round one already closed Q8, Q10, Q22, Q24 and Q26.
 --
---  Roughly 10-15 minutes end to end, almost all of it in blocks G and H.
-
-
--- =========================================================================
--- BLOCK A — what exists.                                    ~5 seconds, safe
--- =========================================================================
--- Answers on its own: which vintage the study can actually read, and whether
--- a DOD table exists at all.
-
-SHOW TABLES IN hive_metastore.clnprw_optum;
-
-
--- =========================================================================
--- BLOCK B — the shape of every table this study reads.     ~10 seconds, safe
--- =========================================================================
--- This is the highest value-per-risk in the file. It cannot fail on a column
--- name because it asks for the column names. It settles, with no further work:
+--  Blocks 1-9 SETTLE:  Q1, Q2, Q5, Q9, Q11, Q13, Q14, Q16, Q19, Q25, Q27, Q28
+--  Blocks 10-13 PRICE: Q21, Q23, Q7, Q3, Q6 - they cannot decide these, but
+--      they say how many patients each reading moves, which is usually what
+--      the study team needs in order to decide at all. Proxy code lists
+--      stand in for Annexes 2 and 3; the order of magnitude does not turn
+--      on the exact list.
+--  Blocks 14-16 CHECK the value lists and columns the package assumes but has
+--      never seen data for. No open question, but a wrong assumption here is
+--      silent - a value outside the expected set is dropped, not flagged.
 --
---   * whether ADMIT_DATE / DISCH_DATE / FST_DT are DATE or the documented
---     YYYYMMDD — both builds cast them to date, and casting an integer yields
---     NULL, which would silently drop every hospitalisation;
---   * whether CONFINEMENT.ICD_FLAG is present in this vintage (Q27 rests on it);
---   * whether MEDICAL.PAID_STATUS exists (Q25) and BILL_PROC_CD landed;
---   * what DOD's columns are actually called — the V9 dictionary has a sheet
---     for all fifteen CDM tables and none for DOD, so this is the only source.
-
-DESCRIBE TABLE hive_metastore.clnprw_optum.t_member_enrollment_2026q1;
-DESCRIBE TABLE hive_metastore.clnprw_optum.t_confinement_2026q1;
-DESCRIBE TABLE hive_metastore.clnprw_optum.t_medical_2026q1;
-DESCRIBE TABLE hive_metastore.clnprw_optum.t_diagnosis_2026q1;
-DESCRIBE TABLE hive_metastore.clnprw_optum.t_procedure_2026q1;
-DESCRIBE TABLE hive_metastore.clnprw_optum.t_rx_2026q1;
-DESCRIBE TABLE hive_metastore.clnprw_optum.t_dod_2026q1;
-DESCRIBE TABLE <COHORT>;
-
-
--- =========================================================================
--- BLOCK C — can DOD be joined at all?      Q26 / Q8.    ~1 minute, low risk
--- =========================================================================
--- THE ONE THAT MATTERS MOST. The Optum business-rules document says DOD
--- "cannot be joined since both tables are encrypted differently"; its own join
--- diagram draws a PATID edge to DOD; and the existing build joins on PATID.
--- DEATH_DT sets follow-up end, censors overall survival, and gates the
--- time-to-event analysis set.
+--  What NO query can answer, now or ever:
+--      Q12, Q15, Q20 - the protocol author, or annexes we do not hold.
+--  Q3, Q6, Q7 and Q23 need those annexes to DECIDE; blocks 10-13 only size
+--  them. Q21 is arithmetic rather than data - block 10 shows the days at stake.
 --
---   match_pct near 0  -> the keys are in different encryption domains. Every
---                        death date in both builds is spurious or absent and
---                        OS is unreportable as built.
---   match_pct high    -> the note is stale; nothing to do.
+--  The 2026q1 vintage is confirmed to exist. Roughly 10 minutes.
 
-SELECT count(DISTINCT d.PATID)                                  AS dod_patients,
-       count(DISTINCT m.PATID)                                  AS matched_in_enrollment,
-       round(100.0 * count(DISTINCT m.PATID)
-                   / nullif(count(DISTINCT d.PATID), 0), 1)     AS match_pct
-FROM       hive_metastore.clnprw_optum.t_dod_2026q1 d
-LEFT JOIN (SELECT DISTINCT PATID
-           FROM hive_metastore.clnprw_optum.t_member_enrollment_2026q1) m
-       ON  m.PATID = d.PATID;
 
--- Q22: how precise is a death date? Length 6 is year+month; length 4 is year
--- only, which makes the build's constructed day six months wide.
-SELECT length(trim(YMDOD)) AS ymdod_length, count(*) AS n,
-       min(YMDOD) AS example_lo, max(YMDOD) AS example_hi
+-- =========================================================================
+-- BLOCK 0 — the population everything else is scoped to.        ~1 minute
+-- =========================================================================
+-- Anyone with a myeloma diagnosis in the study window. NOT the study cohort -
+-- no age, enrolment or exclusion criteria - but it bounds every scan below to
+-- the right order of magnitude and needs nothing from outside the CDM.
+
+CREATE OR REPLACE TEMPORARY VIEW mm_pts AS
+SELECT DISTINCT cast(PATID as string) AS PATID
+FROM   hive_metastore.clnprw_optum.t_med_diagnosis_2026q1
+WHERE  cast(FST_DT as date) >= date('2016-01-01')
+  AND  upper(regexp_replace(DIAG, '[^A-Za-z0-9]', '')) LIKE 'C90%';
+
+SELECT count(*) AS mm_patients FROM mm_pts;
+
+
+-- =========================================================================
+-- BLOCK 1 — Q28. What is DOD.MBR_MATCH_TYPE?                   ~5 seconds
+-- =========================================================================
+-- The fifth DOD column, in no Optum document we hold. If it grades how each
+-- member was linked to the death record, some fraction of those 11.5M deaths
+-- are lower-confidence links and nothing filters on them. Overall survival is
+-- a secondary objective.
+
+SELECT MBR_MATCH_TYPE, count(*) AS n,
+       round(100.0 * count(*) / sum(count(*)) OVER (), 2) AS pct
 FROM   hive_metastore.clnprw_optum.t_dod_2026q1
-GROUP BY length(trim(YMDOD)) ORDER BY ymdod_length;
+GROUP BY MBR_MATCH_TYPE ORDER BY n DESC;
 
 
 -- =========================================================================
--- BLOCK D — the enrolment columns the demographics table reads.   ~1 minute
+-- BLOCK 2 — Q9. Does a member's STATE change?                   ~1 minute
 -- =========================================================================
--- Q10. RACE and ETHNICITY are varchar(1) and NEITHER value list is published:
--- the dictionary gives RACE's labels only ("African American, Asian,
--- Caucasian, Other/Unknown") and marks ETHNICITY's list "Intentionally Blank".
--- The package currently guesses A->Asian, B->Black, W/C->White. If the coding
--- differs, a whole Table 4 row is mislabelled and nothing would show it.
+-- REGION is absent from this extract, so region comes from a STATE crosswalk.
+-- The open half of Q9 is what to do when STATE changes between enrolment rows.
+-- If almost nobody moves, "take the row covering the index date" is a
+-- formality. If many do, it is a real choice.
 
-SELECT RACE, ETHNICITY, RACE_SOURCE, count(*) AS n
-FROM   hive_metastore.clnprw_optum.t_member_enrollment_2026q1
-GROUP BY RACE, ETHNICITY, RACE_SOURCE ORDER BY n DESC;
-
--- The package maps BUS 'MCR'->Medicare and 'COM'->Commercial; anything else
--- silently becomes Unknown.
-SELECT BUS, PRODUCT, CDHP, count(*) AS n
-FROM   hive_metastore.clnprw_optum.t_member_enrollment_2026q1
-GROUP BY BUS, PRODUCT, CDHP ORDER BY n DESC LIMIT 40;
-
--- Is YRDOB capped, and at what? The dictionary says 89 years, changed from 90
--- in April 2025. A cap shows up as a pile-up at the lowest birth year. The age
--- BANDS are unaffected; a mean or median age is right-censored.
-SELECT YRDOB, count(*) AS n
-FROM   hive_metastore.clnprw_optum.t_member_enrollment_2026q1
-GROUP BY YRDOB ORDER BY YRDOB LIMIT 12;
+SELECT n_states, count(*) AS n_members
+FROM ( SELECT PATID, count(DISTINCT STATE) AS n_states
+       FROM   hive_metastore.clnprw_optum.t_member_enrollment_2026q1
+       WHERE  STATE IS NOT NULL
+       GROUP BY PATID )
+GROUP BY n_states ORDER BY n_states;
 
 
 -- =========================================================================
--- BLOCK E — Q24. Does ICD_FLAG ever name neither family?          ~2 minutes
+-- BLOCK 3 — Q16. Do enrolment rows overlap, and do they disagree? ~2 minutes
 -- =========================================================================
--- Business rule 1 says '9' or '10'. Every code-list join in both builds treats
--- anything else as matching NEITHER family, so such a row silently stops
--- qualifying or excluding anyone. The existing build reports these rather than
--- gating on them; whether that is enough depends on how many there are.
+-- MEMBER_ENROLLMENT gets a new row whenever anything changes, and a member on
+-- two concurrent plans has two rows covering the same day. Ranked on ELIGEFF
+-- alone the winner was arbitrary, so race, ethnicity, region and insurance
+-- could differ between two runs of identical code. The package now breaks the
+-- tie on (ELIGEFF, ELIGEND, PAT_PLANID); this says how much was at stake.
 
-SELECT ICD_FLAG, count(*) AS n
-FROM   hive_metastore.clnprw_optum.t_diagnosis_2026q1
-GROUP BY ICD_FLAG ORDER BY n DESC;
-
-
--- =========================================================================
--- BLOCK F — the cohort as built.        Q26b, Q13, Q16.    ~2 minutes
--- =========================================================================
--- Needs <COHORT>. Death rate is the practical read on block C: a 1L NDMM
--- cohort followed from 2019 should be tens of percent dead — not ~0%, which
--- means the DOD join matches nothing, and not ~100%, which means it matches
--- the wrong people.
-
-SELECT count(*)                                                     AS n_cohort,
-       count(DEATH_DT)                                              AS n_with_death,
-       round(100.0 * count(DEATH_DT) / count(*), 1)                 AS pct_dead,
-       min(DEATH_DT) AS earliest_death, max(DEATH_DT) AS latest_death,
-       -- Q13: how often censoring at disenrolment actually bites.
-       sum(CASE WHEN ENDDATE_CE < ENDDATE THEN 1 ELSE 0 END)        AS n_censored_early,
-       round(avg(datediff(ENDDATE_CE, INDEX_DATE) + 1) / 365.25, 2) AS mean_yrs_censored,
-       round(avg(datediff(ENDDATE,    INDEX_DATE) + 1) / 365.25, 2) AS mean_yrs_uncensored
-FROM <COHORT>;
-
--- Q16. MEMBER_ENROLLMENT gets a new row whenever anything changes, and a
--- member with two concurrent plans has two rows covering the same index date.
--- Ranked on ELIGEFF alone those tie and the winner was arbitrary, so race,
--- ethnicity, region and insurance could differ between two runs of identical
--- code. `n_where_rows_disagree` is the size of that exposure.
-WITH idx AS (
-  SELECT cast(c.PATID as string) AS PATID,
-         count(*)                AS n_rows,
-         count(DISTINCT e.RACE)  AS n_race,
-         count(DISTINCT e.BUS)   AS n_bus,
-         count(DISTINCT e.STATE) AS n_state
-  FROM       <COHORT> c
-  INNER JOIN hive_metastore.clnprw_optum.t_member_enrollment_2026q1 e
-          ON cast(e.PATID as string) = cast(c.PATID as string)
-         AND e.ELIGEFF <= c.INDEX_DATE AND e.ELIGEND >= c.INDEX_DATE
-  GROUP BY cast(c.PATID as string)
+WITH pairs AS (
+  SELECT a.PATID,
+         CASE WHEN a.RACE  IS DISTINCT FROM b.RACE  THEN 1 ELSE 0 END AS d_race,
+         CASE WHEN a.BUS   IS DISTINCT FROM b.BUS   THEN 1 ELSE 0 END AS d_bus,
+         CASE WHEN a.STATE IS DISTINCT FROM b.STATE THEN 1 ELSE 0 END AS d_state
+  FROM       hive_metastore.clnprw_optum.t_member_enrollment_2026q1 a
+  INNER JOIN hive_metastore.clnprw_optum.t_member_enrollment_2026q1 b
+          ON b.PATID = a.PATID
+         AND b.PAT_PLANID <> a.PAT_PLANID
+         AND a.ELIGEFF <= b.ELIGEND AND b.ELIGEFF <= a.ELIGEND   -- overlapping
+  INNER JOIN mm_pts m ON m.PATID = cast(a.PATID as string)
 )
-SELECT count(*)                                                    AS n_matched,
-       sum(CASE WHEN n_rows > 1 THEN 1 ELSE 0 END)                 AS n_multi_row_at_index,
-       sum(CASE WHEN n_race > 1 OR n_bus > 1 OR n_state > 1
-                THEN 1 ELSE 0 END)                                 AS n_where_rows_disagree
-FROM idx;
+SELECT count(DISTINCT PATID)                                        AS members_with_overlap,
+       count(DISTINCT CASE WHEN d_race  = 1 THEN PATID END)         AS disagree_on_race,
+       count(DISTINCT CASE WHEN d_bus   = 1 THEN PATID END)         AS disagree_on_bus,
+       count(DISTINCT CASE WHEN d_state = 1 THEN PATID END)         AS disagree_on_state
+FROM pairs;
 
 
 -- =========================================================================
--- BLOCK G — Q25. How much of the medical table is DENIED?      ~3-5 minutes
+-- BLOCK 4 — Q19 and Q13. Enrolment gaps, and what censoring costs. ~2 minutes
 -- =========================================================================
--- MEDICAL.PAID_STATUS separates PAID from DENIED, and the CDM fills it in
--- where the source left it null. Nothing in either build filters on it, so
--- every count built on medical claims includes denied lines. Restricted to the
--- cohort's own patients to bound the scan.
---
--- A percent or two is a footnote. Ten percent inflates every claims-based rate
--- by roughly that much.
+-- Q19: the protocol bridges gaps of 30 days or fewer. Those bridged days are
+-- covered on paper and unobserved in fact. This says how many days the study
+-- would be counting as person-time that nobody was enrolled for.
+-- Q13: the same rows price censoring — a member with no gaps is unaffected
+-- either way.
+
+WITH spans AS (
+  SELECT cast(e.PATID as string) AS PATID,
+         cast(e.ELIGEFF as date) AS s,
+         cast(e.ELIGEND as date) AS e_end,
+         lag(cast(e.ELIGEND as date)) OVER (PARTITION BY e.PATID
+                                            ORDER BY e.ELIGEFF) AS prev_end
+  FROM       hive_metastore.clnprw_optum.t_member_enrollment_2026q1 e
+  INNER JOIN mm_pts m ON m.PATID = cast(e.PATID as string)
+),
+gaps AS (
+  SELECT PATID, datediff(s, prev_end) - 1 AS gap_days
+  FROM   spans WHERE prev_end IS NOT NULL AND s > prev_end
+)
+SELECT count(*)                                                    AS n_gaps,
+       count(DISTINCT PATID)                                       AS members_with_a_gap,
+       sum(CASE WHEN gap_days <= 30 THEN 1 ELSE 0 END)             AS gaps_bridged_le_30,
+       sum(CASE WHEN gap_days <= 30 THEN gap_days ELSE 0 END)      AS bridged_days_total,
+       sum(CASE WHEN gap_days = 30 THEN 1 ELSE 0 END)              AS gaps_exactly_30,
+       sum(CASE WHEN gap_days = 29 THEN 1 ELSE 0 END)              AS gaps_exactly_29,
+       round(avg(gap_days), 1)                                     AS mean_gap_days
+FROM gaps;
+
+
+-- =========================================================================
+-- BLOCK 5 — Q2 and Q1. Which MM codes, and which start year.     ~2 minutes
+-- =========================================================================
+-- Q2: the outpatient arm of I1 may use a broader code set than the inpatient
+-- arm. This is every myeloma-adjacent stem actually present, with patient
+-- counts, so the study team can see exactly what "broad" would add.
+--   C90.0 multiple myeloma   C90.1 plasma cell leukaemia
+--   C90.2 plasmacytoma       C88.x malignant immunoproliferative
+--   203.0x is the ICD-9 equivalent.
+
+SELECT upper(regexp_replace(DIAG, '[^A-Za-z0-9]', '')) AS code,
+       ICD_FLAG,
+       count(DISTINCT cast(PATID as string))           AS patients,
+       count(*)                                        AS claim_lines
+FROM   hive_metastore.clnprw_optum.t_med_diagnosis_2026q1
+WHERE  cast(FST_DT as date) >= date('2016-01-01')
+  AND (upper(regexp_replace(DIAG, '[^A-Za-z0-9]', '')) LIKE 'C90%'
+    OR upper(regexp_replace(DIAG, '[^A-Za-z0-9]', '')) LIKE 'C88%'
+    OR upper(regexp_replace(DIAG, '[^A-Za-z0-9]', '')) LIKE '2030%'
+    OR upper(regexp_replace(DIAG, '[^A-Za-z0-9]', '')) LIKE '2731%')
+GROUP BY 1, 2 ORDER BY patients DESC LIMIT 40;
+
+-- Q1: the study period starts 2016 or 2018, and the figure and the body text
+-- disagree. This is what the two years differ by, in patients: the year of
+-- each member's FIRST myeloma diagnosis.
+SELECT year(first_dx) AS first_dx_year, count(*) AS patients
+FROM ( SELECT cast(PATID as string) AS PATID,
+              min(cast(FST_DT as date)) AS first_dx
+       FROM   hive_metastore.clnprw_optum.t_med_diagnosis_2026q1
+       WHERE  upper(regexp_replace(DIAG, '[^A-Za-z0-9]', '')) LIKE 'C90%'
+       GROUP BY cast(PATID as string) )
+WHERE year(first_dx) BETWEEN 2015 AND 2026
+GROUP BY 1 ORDER BY 1;
+
+
+-- =========================================================================
+-- BLOCK 6 — Q25. How much of the medical table is DENIED?        ~3 minutes
+-- =========================================================================
+-- Skipped in round one because it was scoped to a cohort table that was not
+-- supplied. MEDICAL.PAID_STATUS separates PAID from DENIED and nothing in
+-- either build filters on it, so every count built on medical claims includes
+-- denied lines. A percent or two is a footnote; ten inflates every rate.
 
 SELECT m.PAID_STATUS, count(*) AS n_lines,
-       round(100.0 * count(*) / sum(count(*)) OVER (), 1) AS pct
+       round(100.0 * count(*) / sum(count(*)) OVER (), 2) AS pct
 FROM       hive_metastore.clnprw_optum.t_medical_2026q1 m
-INNER JOIN (SELECT DISTINCT cast(PATID as string) AS PATID FROM <COHORT>) c
-        ON cast(m.PATID as string) = c.PATID
+INNER JOIN mm_pts p ON p.PATID = cast(m.PATID as string)
 GROUP BY m.PAID_STATUS ORDER BY n_lines DESC;
 
 
 -- =========================================================================
--- BLOCK H — Q11. The three ED constructions, side by side.     ~3-5 minutes
+-- BLOCK 7 — Q11. The three ED constructions, side by side.       ~3 minutes
 -- =========================================================================
--- The CDM has no ED flag and the vendor says so outright: non-inpatient
--- records are classified "as per the study requirements". The three usual
--- constructions select structurally different claim types — RVNU_CD is
--- "Facility Claims only", CPT 9928x is professional — so they disagree by
--- construction, not merely in number.
---
--- `then_admitted` is the sub-question nobody has answered: an ED claim
--- carrying a CONF_ID is one that became an admission (business rule 14). Those
--- are the visits at risk of being counted twice, as an ED visit and again as a
--- hospitalisation.
+-- Also skipped in round one. The CDM has no ED flag and the vendor says the
+-- classification is "as per the study requirements". The three constructions
+-- select structurally different claim types - RVNU_CD is facility-only, CPT
+-- 9928x is professional - so they disagree by construction, not just in
+-- number. `then_admitted` is the sub-question: an ED claim carrying a CONF_ID
+-- became an admission (business rule 14), and is at risk of being counted
+-- twice.
 
 WITH ed AS (
   SELECT cast(m.PATID as string) AS PATID,
          cast(m.FST_DT as date)  AS dt,
          CASE WHEN upper(regexp_replace(trim(m.RVNU_CD),'[^A-Za-z0-9]',''))
-                   RLIKE '^(045[0-9]|0981)$'                THEN 1 ELSE 0 END AS by_rev,
-         CASE WHEN trim(m.POS) = '23'                       THEN 1 ELSE 0 END AS by_pos,
-         CASE WHEN trim(m.PROC_CD) BETWEEN '99281' AND '99285'
-                                                            THEN 1 ELSE 0 END AS by_cpt,
+                   RLIKE '^(045[0-9]|0981)$'                 THEN 1 ELSE 0 END AS by_rev,
+         CASE WHEN trim(m.POS) = '23'                        THEN 1 ELSE 0 END AS by_pos,
+         CASE WHEN trim(m.PROC_CD) BETWEEN '99281' AND '99285' THEN 1 ELSE 0 END AS by_cpt,
          CASE WHEN m.CONF_ID IS NOT NULL AND trim(m.CONF_ID) <> ''
-                                                            THEN 1 ELSE 0 END AS inpat
+                                                             THEN 1 ELSE 0 END AS inpat
   FROM       hive_metastore.clnprw_optum.t_medical_2026q1 m
-  INNER JOIN (SELECT DISTINCT cast(PATID as string) AS PATID FROM <COHORT>) c
-          ON cast(m.PATID as string) = c.PATID
+  INNER JOIN mm_pts p ON p.PATID = cast(m.PATID as string)
+  WHERE  cast(m.FST_DT as date) >= date('2018-01-01')
 )
-SELECT count(DISTINCT CASE WHEN by_rev=1 THEN concat(PATID,'|',cast(dt as string)) END) AS by_revenue,
+SELECT count(DISTINCT CASE WHEN by_rev=1 THEN concat(PATID,'|',cast(dt as string)) END) AS by_revenue_045x,
        count(DISTINCT CASE WHEN by_pos=1 THEN concat(PATID,'|',cast(dt as string)) END) AS by_pos_23,
        count(DISTINCT CASE WHEN by_cpt=1 THEN concat(PATID,'|',cast(dt as string)) END) AS by_cpt_9928x,
        count(DISTINCT CASE WHEN by_rev+by_pos+by_cpt>0
                            THEN concat(PATID,'|',cast(dt as string)) END)                AS any_of_three,
+       count(DISTINCT CASE WHEN by_rev=1 AND by_cpt=1
+                           THEN concat(PATID,'|',cast(dt as string)) END)                AS revenue_and_cpt_same_day,
        count(DISTINCT CASE WHEN by_rev+by_pos+by_cpt>0 AND inpat=1
                            THEN concat(PATID,'|',cast(dt as string)) END)                AS then_admitted
 FROM ed;
 
 
--- Profiling queries for the study team
--- =====================================
---
--- If you get ONE run at the warehouse, use RUN_ONCE.sql instead - same
--- questions, ordered so a late failure costs least, with the schema discovery
--- first. This file is the same material split into blocks you can run
--- separately when there is no such constraint.
---
--- Each block answers a specific open question from OPEN_QUESTIONS.md. They are
--- ordered by how much turns on the answer. Every one is a count or a group-by;
--- none writes anything.
---
--- Two placeholders to set before running:
---   <WORK>     the schema the cohort build wrote to      e.g. hive_metastore.myschema
---   <PREFIX>   OBJECT_PREFIX from Jul 28/ndmm/config.csv e.g. ndmm_
---
--- The CDM quarter below is written as 2026q1, which is what STUDY_END=2026-03-31
--- resolves to. Block 0 checks that vintage exists - the describe-table
--- screenshot in docs/ is 2025q4, so they may not be the same.
-
-
--- What this file does and does not answer
--- --------------------------------------
---
---   settled by a query here      Q2, Q8, Q9, Q10, Q11, Q13, Q16, Q22, Q24,
---                                Q25, Q26, Q27
---   already priced by the build  Q3, Q5, Q6, Q23 - the ndmm build writes
---                                NDMM_FU_CE_COUNTS, NDMM_PREG_WINDOW_COUNTS,
---                                NDMM_INDEX_AGENTS and NDMM_OTHER_MALIG_GRAIN
---                                on every run; read those rather than re-query
---   arithmetic, no query needed  Q1, Q14, Q19, Q21 - the difference between
---                                the two readings is a day count
---   NO query can answer          Q7, Q12, Q15, Q20 - these need the protocol
---                                author or the missing annexes. Q15 is the
---                                one that blocks six of thirteen modules.
---
--- So: of 27 open questions, 12 are settled below, 4 are already costed by
--- tables you have, 4 are arithmetic, and 4 need a person. Two (Q4, Q17) are
--- answered already.
-
-
--- ---------------------------------------------------------------------------
--- 0.  Does the vintage the config points at exist?           (2 seconds)
--- ---------------------------------------------------------------------------
--- If these come back empty, every table name in this file needs its suffix
--- changed, and so does STUDY_END or USE_QUARTERLY_TABLES.
-
-SHOW TABLES IN hive_metastore.clnprw_optum LIKE 't_*_2026q1';
-SHOW TABLES IN hive_metastore.clnprw_optum LIKE 't_dod*';
-
-
--- ---------------------------------------------------------------------------
--- 1.  Can DOD be joined at all?             OPEN_QUESTIONS Q26   (~1 minute)
--- ---------------------------------------------------------------------------
--- THE IMPORTANT ONE. The Optum business-rules document says DOD "cannot be
--- joined" to the claims tables because it is encrypted with a different key;
--- its own join diagram draws a PATID edge to DOD; and the existing build joins
--- on PATID. DEATH_DT sets follow-up end, censors overall survival, and gates
--- the time-to-event analysis set.
---
--- 1a is the decisive test, and it needs no cohort: how many DOD patients exist
--- in the enrolment table at all?
---
---   match_pct near 0    -> the keys are in different encryption domains. The
---                          note is right, every death date is spurious or
---                          absent, and OS is unreportable as built.
---   match_pct high      -> the keys are compatible and the note is stale.
---   match_pct in between-> ask Optum; a partial match is its own problem.
-
-SELECT count(DISTINCT d.PATID)                                   AS dod_patients,
-       count(DISTINCT m.PATID)                                   AS matched_in_enrollment,
-       round(100.0 * count(DISTINCT m.PATID)
-                   / nullif(count(DISTINCT d.PATID), 0), 1)      AS match_pct
-FROM        hive_metastore.clnprw_optum.t_dod_2026q1 d
-LEFT JOIN  (SELECT DISTINCT PATID
-            FROM hive_metastore.clnprw_optum.t_member_enrollment_2026q1) m
-       ON  m.PATID = d.PATID;
-
--- 1b. The same question asked of the cohort actually built. A 1L NDMM cohort
---     followed from 2019 should be tens of percent dead - not ~0%, not ~100%.
-
-SELECT count(*)                                                  AS n_cohort,
-       count(DEATH_DT)                                           AS n_with_death,
-       round(100.0 * count(DEATH_DT) / count(*), 1)              AS pct_dead,
-       min(DEATH_DT)                                             AS earliest,
-       max(DEATH_DT)                                             AS latest
-FROM <WORK>.<PREFIX>NDMM_COHORT;
-
-
--- ---------------------------------------------------------------------------
--- 2.  RACE and ETHNICITY code values          OPEN_QUESTIONS Q10  (~30 seconds)
--- ---------------------------------------------------------------------------
--- Both are varchar(1) and neither value list is published. The dictionary gives
--- RACE's labels only - "African American, Asian, Caucasian, Other/Unknown" -
--- and marks ETHNICITY's list "Intentionally Blank" because the column is a V9
--- addition.
---
--- The package currently guesses A->Asian, B->Black, W/C->White. If the real
--- coding differs, that guess silently mislabels a whole demographic row.
--- Table 4 wants Asian / Black / White / Unknown.
-
-SELECT RACE, ETHNICITY, RACE_SOURCE, count(*) AS n
-FROM   hive_metastore.clnprw_optum.t_member_enrollment_2026q1
-GROUP BY RACE, ETHNICITY, RACE_SOURCE
-ORDER BY n DESC;
-
--- 2b. Insurance type and the columns the demographics table reads. The package
---     maps BUS 'MCR'->Medicare and 'COM'->Commercial; anything else becomes
---     Unknown, so a different coding empties the column silently.
-
-SELECT BUS, PRODUCT, CDHP, count(*) AS n
-FROM   hive_metastore.clnprw_optum.t_member_enrollment_2026q1
-GROUP BY BUS, PRODUCT, CDHP
-ORDER BY n DESC
-LIMIT 50;
-
-
--- ---------------------------------------------------------------------------
--- 3.  The deployed shape of the other five tables               (10 seconds)
--- ---------------------------------------------------------------------------
--- There is a describe-table screenshot for member_enrollment and nothing else.
--- Everything this study assumes about the other five is inferred from the
--- dictionary plus that one example. These settle:
---   * whether ADMIT_DATE / DISCH_DATE / FST_DT are DATE or the documented
---     YYYYMMDD - the package casts them to date, which silently yields NULL
---     for an integer and would drop every hospitalisation;
---   * whether CONFINEMENT.ICD_FLAG is actually present in this vintage;
---   * whether BILL_PROC_CD (a V9 addition) landed on MEDICAL.
-
-DESCRIBE TABLE hive_metastore.clnprw_optum.t_confinement_2026q1;
-DESCRIBE TABLE hive_metastore.clnprw_optum.t_medical_2026q1;
-DESCRIBE TABLE hive_metastore.clnprw_optum.t_diagnosis_2026q1;
-DESCRIBE TABLE hive_metastore.clnprw_optum.t_procedure_2026q1;
-DESCRIBE TABLE hive_metastore.clnprw_optum.t_rx_2026q1;
-DESCRIBE TABLE hive_metastore.clnprw_optum.t_dod_2026q1;
-
-
--- ---------------------------------------------------------------------------
--- 4.  Is YRDOB capped, and at what?                             (~30 seconds)
--- ---------------------------------------------------------------------------
--- The V9 dictionary says "capped at 89 years", changed in April 2025 from a cap
--- at 90. A cap shows up as a pile-up at the lowest birth year. The age BANDS
--- are unaffected either way; a mean or median age is right-censored.
-
-SELECT YRDOB, count(*) AS n
-FROM   hive_metastore.clnprw_optum.t_member_enrollment_2026q1
-GROUP BY YRDOB
-ORDER BY YRDOB
-LIMIT 12;
-
-
--- ---------------------------------------------------------------------------
--- 5.  How much do denied claims matter?       OPEN_QUESTIONS Q25  (~2 minutes)
--- ---------------------------------------------------------------------------
--- MEDICAL.PAID_STATUS separates PAID from DENIED, and nothing in either build
--- has ever filtered on it. Restricted to the cohort's own patients to keep the
--- scan bounded.
---
--- If DENIED is a percent or two, this is a footnote. If it is ten, every rate
--- built on medical claims is inflated by roughly that much.
-
-SELECT m.PAID_STATUS, count(*) AS n_lines,
-       round(100.0 * count(*) / sum(count(*)) OVER (), 1) AS pct
-FROM       hive_metastore.clnprw_optum.t_medical_2026q1 m
-INNER JOIN (SELECT DISTINCT cast(PATID as string) AS PATID
-            FROM <WORK>.<PREFIX>NDMM_COHORT) c
-        ON cast(m.PATID as string) = c.PATID
-GROUP BY m.PAID_STATUS
-ORDER BY n_lines DESC;
-
-
--- ---------------------------------------------------------------------------
--- 6.  The three ED constructions, side by side  OPEN_QUESTIONS Q11 (~3 minutes)
--- ---------------------------------------------------------------------------
--- The CDM has no ED flag and the vendor says so outright: "Non-inpatient
--- records can be classified into various categories as per the study
--- requirements". The three usual constructions select structurally different
--- claim types - RVNU_CD is "Facility Claims only", CPT 9928x is professional -
--- so they disagree by construction, not just by number.
---
--- `became_inpatient` is the sub-question: an ED claim carrying a CONF_ID is one
--- that turned into an admission (business rule 14). That is what ED_ADMITTED
--- switches on.
-
-WITH coh AS (
-  SELECT DISTINCT cast(PATID as string) AS PATID
-  FROM <WORK>.<PREFIX>NDMM_COHORT
-),
-ed AS (
-  SELECT cast(m.PATID as string) AS PATID,
-         cast(m.FST_DT as date)  AS dt,
-         CASE WHEN upper(regexp_replace(trim(m.RVNU_CD),'[^A-Za-z0-9]',''))
-                   RLIKE '^(045[0-9]|0981)$'            THEN 1 ELSE 0 END AS by_revenue,
-         CASE WHEN trim(m.POS) = '23'                   THEN 1 ELSE 0 END AS by_pos,
-         CASE WHEN trim(m.PROC_CD) BETWEEN '99281' AND '99285'
-                                                        THEN 1 ELSE 0 END AS by_cpt,
-         CASE WHEN m.CONF_ID IS NOT NULL
-               AND trim(m.CONF_ID) <> ''                THEN 1 ELSE 0 END AS became_inpatient
-  FROM       hive_metastore.clnprw_optum.t_medical_2026q1 m
-  INNER JOIN coh ON coh.PATID = cast(m.PATID as string)
-)
-SELECT count(DISTINCT CASE WHEN by_revenue = 1 THEN concat(PATID, dt) END) AS visits_revenue,
-       count(DISTINCT CASE WHEN by_pos     = 1 THEN concat(PATID, dt) END) AS visits_pos,
-       count(DISTINCT CASE WHEN by_cpt     = 1 THEN concat(PATID, dt) END) AS visits_cpt,
-       count(DISTINCT CASE WHEN by_revenue + by_pos + by_cpt > 0
-                           THEN concat(PATID, dt) END)                     AS visits_any,
-       count(DISTINCT CASE WHEN by_revenue + by_pos + by_cpt > 0
-                            AND became_inpatient = 1
-                           THEN concat(PATID, dt) END)                     AS visits_then_admitted
-FROM ed;
-
-
--- ---------------------------------------------------------------------------
--- 7.  Which inpatient definition agrees with CONFINEMENT?        (~2 minutes)
--- ---------------------------------------------------------------------------
--- Business rule 14 gives two approaches. The package uses CONFINEMENT directly
--- (approach 2). This checks the other one agrees, and shows the TOS_CD values
--- actually present - the rule names four and there may be more.
-
-SELECT m.POS, m.TOS_CD,
-       count(*)                                              AS n_lines,
-       sum(CASE WHEN m.CONF_ID IS NOT NULL
-                 AND trim(m.CONF_ID) <> '' THEN 1 ELSE 0 END) AS n_with_conf_id
-FROM       hive_metastore.clnprw_optum.t_medical_2026q1 m
-INNER JOIN (SELECT DISTINCT cast(PATID as string) AS PATID
-            FROM <WORK>.<PREFIX>NDMM_COHORT) c
-        ON cast(m.PATID as string) = c.PATID
-WHERE  m.POS IN ('21','51','61','23')
-    OR m.TOS_CD LIKE 'FAC.IP%' OR m.TOS_CD LIKE 'PROF.INP%'
-GROUP BY m.POS, m.TOS_CD
-ORDER BY n_lines DESC
-LIMIT 40;
-
-
--- ===========================================================================
---  Blocks 8-13: the rest of the questions a query can actually settle
--- ===========================================================================
-
-
--- ---------------------------------------------------------------------------
--- 8.  Does the "attribute at index" tiebreak matter?  OPEN_QUESTIONS Q16
--- ---------------------------------------------------------------------------                                                     (~1 minute)
--- MEMBER_ENROLLMENT gets a new row whenever anything about the member changes,
--- and a member with two concurrent plans has two rows covering the same index
--- date. Ranked on ELIGEFF alone, which row wins is arbitrary - so race,
--- ethnicity, region and insurance could differ between two runs of identical
--- code. The package now breaks the tie on (ELIGEFF, ELIGEND, PAT_PLANID).
---
--- This says whether that was a real problem or a theoretical one, and - the
--- second query - whether the tied rows actually disagree about anything.
-
-WITH coh AS (
-  SELECT cast(PATID as string) AS PATID, INDEX_DATE
-  FROM <WORK>.<PREFIX>NDMM_COHORT
-),
-spans AS (
-  SELECT c.PATID, c.INDEX_DATE, e.RACE, e.ETHNICITY, e.BUS, e.STATE
-  FROM       coh c
-  INNER JOIN hive_metastore.clnprw_optum.t_member_enrollment_2026q1 e
-          ON cast(e.PATID as string) = c.PATID
-         AND e.ELIGEFF <= c.INDEX_DATE AND e.ELIGEND >= c.INDEX_DATE
-)
-SELECT count(DISTINCT PATID)                                        AS n_cohort,
-       count(*)                                                     AS n_rows_covering_index,
-       count(DISTINCT CASE WHEN n_rows > 1 THEN PATID END)          AS n_with_multiple_rows,
-       count(DISTINCT CASE WHEN n_distinct_race > 1
-                             OR n_distinct_bus  > 1
-                             OR n_distinct_state > 1 THEN PATID END) AS n_where_rows_disagree
-FROM (
-  SELECT PATID,
-         count(*)                    AS n_rows,
-         count(DISTINCT RACE)        AS n_distinct_race,
-         count(DISTINCT BUS)         AS n_distinct_bus,
-         count(DISTINCT STATE)       AS n_distinct_state
-  FROM spans GROUP BY PATID
-) t;
-
-
--- ---------------------------------------------------------------------------
--- 9.  How precise are the death dates?        OPEN_QUESTIONS Q22   (~20 seconds)
--- ---------------------------------------------------------------------------
--- DOD carries YMDOD - month and year. The existing build constructs a day: the
--- 15th of the month, pulled to month-end if that would put death before the MM
--- diagnosis. This shows how many rows have a usable month at all, since a
--- year-only row makes that construction six months wide.
---
--- Run this even if block 1 says the keys do not match - it costs nothing and
--- tells you what DOD contains.
-
-SELECT length(trim(YMDOD))    AS ymdod_length,
-       count(*)               AS n,
-       min(YMDOD)             AS example_min,
-       max(YMDOD)             AS example_max
-FROM   hive_metastore.clnprw_optum.t_dod_2026q1
-GROUP BY length(trim(YMDOD))
-ORDER BY ymdod_length;
-
-
--- ---------------------------------------------------------------------------
--- 10. Does ICD_FLAG ever name neither family?  OPEN_QUESTIONS Q24  (~2 minutes)
--- ---------------------------------------------------------------------------
--- Business rule 1 says ICD_FLAG is '9' or '10'. Every code-list join in both
--- builds treats anything else as matching NEITHER family, so such a row
--- silently stops qualifying or excluding anyone. The existing build reports
--- these rather than gating on them; whether that is enough depends on how many
--- there are.
-
-SELECT ICD_FLAG, count(*) AS n
-FROM   hive_metastore.clnprw_optum.t_diagnosis_2026q1
-GROUP BY ICD_FLAG
-ORDER BY n DESC;
-
-
--- ---------------------------------------------------------------------------
--- 11. The two routes to "MM in first or second position"  Q27      (~3 minutes)
--- ---------------------------------------------------------------------------
+-- =========================================================================
+-- BLOCK 8 — Q27. The two routes to "MM in first or second position". ~4 min
+-- =========================================================================
 -- Route A - CONFINEMENT.DIAG1/DIAG2, the stay's own first two diagnoses. This
---           is what the package implements.
+--           is what the package implements: five positions, stay level.
 -- Route B - MED_DIAGNOSIS.DIAG_POSITION 1 or 2 on a claim carrying that
---           CONF_ID, which is the route business rule 13 documents.
---
--- Stay positions are five; claim positions are twenty-five. If the two columns
--- come back close, the choice does not matter. If they differ materially,
--- somebody has to say which one s7.8.1 means.
---
--- Replace the MM code list with the study's own; C90% is the ICD-10 stem.
+--           CONF_ID, which is the route business rule 13 documents:
+--           twenty-five positions, claim line level.
+-- If the counts come back close, the choice does not matter. If they differ
+-- materially, somebody has to say which one s7.8.1 means.
 
-WITH coh AS (
-  SELECT DISTINCT cast(PATID as string) AS PATID
-  FROM <WORK>.<PREFIX>NDMM_COHORT
-),
-stays AS (
+WITH stays AS (
   SELECT cast(cf.PATID as string) AS PATID, cf.CONF_ID,
          CASE WHEN upper(regexp_replace(coalesce(cf.DIAG1,''),'[^A-Za-z0-9]','')) LIKE 'C90%'
                 OR upper(regexp_replace(coalesce(cf.DIAG2,''),'[^A-Za-z0-9]','')) LIKE 'C90%'
-              THEN 1 ELSE 0 END AS route_a
+              THEN 1 ELSE 0 END AS route_a,
+         CASE WHEN upper(regexp_replace(coalesce(cf.DIAG3,''),'[^A-Za-z0-9]','')) LIKE 'C90%'
+                OR upper(regexp_replace(coalesce(cf.DIAG4,''),'[^A-Za-z0-9]','')) LIKE 'C90%'
+                OR upper(regexp_replace(coalesce(cf.DIAG5,''),'[^A-Za-z0-9]','')) LIKE 'C90%'
+              THEN 1 ELSE 0 END AS mm_in_pos_3_to_5
   FROM       hive_metastore.clnprw_optum.t_confinement_2026q1 cf
-  INNER JOIN coh ON coh.PATID = cast(cf.PATID as string)
+  INNER JOIN mm_pts p ON p.PATID = cast(cf.PATID as string)
+  WHERE  cast(cf.ADMIT_DATE as date) >= date('2018-01-01')
 ),
-claims AS (
+route_b AS (
   SELECT DISTINCT cast(m.PATID as string) AS PATID, m.CONF_ID
   FROM       hive_metastore.clnprw_optum.t_medical_2026q1 m
-  INNER JOIN hive_metastore.clnprw_optum.t_diagnosis_2026q1 d
-          ON d.PATID = m.PATID AND d.CLMID = m.CLMID
-  INNER JOIN coh ON coh.PATID = cast(m.PATID as string)
+  INNER JOIN hive_metastore.clnprw_optum.t_med_diagnosis_2026q1 d
+          ON cast(d.PATID as string) = cast(m.PATID as string)
+         AND d.CLMID = m.CLMID
+  INNER JOIN mm_pts p ON p.PATID = cast(m.PATID as string)
   WHERE  m.CONF_ID IS NOT NULL AND trim(m.CONF_ID) <> ''
-    AND  cast(d.DIAG_POSITION as int) IN (1, 2)
+    AND  try_cast(d.DIAG_POSITION as int) IN (1, 2)
     AND  upper(regexp_replace(d.DIAG,'[^A-Za-z0-9]','')) LIKE 'C90%'
 )
-SELECT count(*)                                              AS n_stays,
-       sum(s.route_a)                                        AS mm_by_confinement_diag1_2,
-       count(c.CONF_ID)                                      AS mm_by_claim_position_1_2,
-       sum(CASE WHEN s.route_a = 1 AND c.CONF_ID IS NULL
-                THEN 1 ELSE 0 END)                           AS route_a_only,
-       sum(CASE WHEN s.route_a = 0 AND c.CONF_ID IS NOT NULL
-                THEN 1 ELSE 0 END)                           AS route_b_only
+SELECT count(*)                                                     AS n_stays,
+       sum(s.route_a)                                               AS route_a_conf_diag1_2,
+       count(b.CONF_ID)                                             AS route_b_claim_pos_1_2,
+       sum(CASE WHEN s.route_a=1 AND b.CONF_ID IS NULL THEN 1 ELSE 0 END) AS route_a_only,
+       sum(CASE WHEN s.route_a=0 AND b.CONF_ID IS NOT NULL THEN 1 ELSE 0 END) AS route_b_only,
+       sum(s.mm_in_pos_3_to_5)                                      AS mm_only_in_conf_pos_3_5
 FROM      stays s
-LEFT JOIN claims c ON c.PATID = s.PATID AND c.CONF_ID = s.CONF_ID;
+LEFT JOIN route_b b ON b.PATID = s.PATID AND b.CONF_ID = s.CONF_ID;
 
 
--- ---------------------------------------------------------------------------
--- 12. Strict vs broad outpatient MM codes      OPEN_QUESTIONS Q2   (~3 minutes)
--- ---------------------------------------------------------------------------
--- I1 needs two outpatient MM diagnoses within 90 days, or one inpatient. The
--- open question is whether the outpatient arm uses the same strict code set as
--- the inpatient arm or a broader one. This counts the patients each reading
--- qualifies, WITHOUT applying any other criterion - so it is an upper bound on
--- the difference, not a cohort size.
---
--- Substitute the study's two code lists for the two LIKE patterns.
+-- =========================================================================
+-- BLOCK 9 — Q5 and Q14. Two boundary readings, priced.           ~3 minutes
+-- =========================================================================
+-- Q5: "evidence of follow-up" is at least one claim from the index date. Read
+-- literally the index claim itself satisfies it and it excludes nobody. These
+-- three counts are the three readings, against each member's first myeloma
+-- diagnosis as a stand-in index.
+-- Q14: how many members have a claim exactly ON that date - the population
+-- that moves when the baseline window includes or excludes the index day.
 
-WITH dx AS (
-  SELECT cast(d.PATID as string) AS PATID,
-         cast(d.FST_DT as date)  AS dt,
-         CASE WHEN upper(regexp_replace(d.DIAG,'[^A-Za-z0-9]','')) LIKE 'C90%'
-              THEN 1 ELSE 0 END AS strict,
-         CASE WHEN upper(regexp_replace(d.DIAG,'[^A-Za-z0-9]','')) LIKE 'C90%'
-                OR upper(regexp_replace(d.DIAG,'[^A-Za-z0-9]','')) LIKE 'C88%'
-              THEN 1 ELSE 0 END AS broad
-  FROM  hive_metastore.clnprw_optum.t_diagnosis_2026q1 d
-  WHERE d.FST_DT >= date('2018-01-01')
+WITH idx AS (
+  SELECT cast(PATID as string) AS PATID, min(cast(FST_DT as date)) AS ix
+  FROM   hive_metastore.clnprw_optum.t_med_diagnosis_2026q1
+  WHERE  upper(regexp_replace(DIAG,'[^A-Za-z0-9]','')) LIKE 'C90%'
+    AND  cast(FST_DT as date) >= date('2018-01-01')
+  GROUP BY cast(PATID as string)
+),
+clm AS (
+  SELECT i.PATID, i.ix,
+         max(CASE WHEN cast(m.FST_DT as date) >= i.ix THEN 1 ELSE 0 END) AS from_index,
+         max(CASE WHEN cast(m.FST_DT as date) >  i.ix THEN 1 ELSE 0 END) AS after_index,
+         max(CASE WHEN cast(m.FST_DT as date)  = i.ix THEN 1 ELSE 0 END) AS on_index
+  FROM       idx i
+  INNER JOIN hive_metastore.clnprw_optum.t_medical_2026q1 m
+          ON cast(m.PATID as string) = i.PATID
+  GROUP BY i.PATID, i.ix
 )
-SELECT count(DISTINCT CASE WHEN strict = 1 THEN PATID END) AS patients_strict,
-       count(DISTINCT CASE WHEN broad  = 1 THEN PATID END) AS patients_broad,
-       count(DISTINCT CASE WHEN broad = 1 AND strict = 0
-                           THEN PATID END)                 AS patients_broad_only
-FROM dx;
+SELECT count(*)              AS n_members,
+       sum(from_index)       AS have_a_claim_from_index,
+       sum(after_index)      AS have_a_claim_after_index,
+       sum(on_index)         AS have_a_claim_on_index,
+       count(*) - sum(after_index) AS excluded_by_the_stricter_reading
+FROM clm;
 
 
--- ---------------------------------------------------------------------------
--- 13. How much follow-up does censoring at disenrolment cost?  Q13 (~1 minute)
--- ---------------------------------------------------------------------------
--- The protocol says follow-up ends at the earliest of disenrolment, study end
--- or death. The LOT engine's primary reading is the opposite - "disenrollment
--- is not censoring" - and the two builds carry both columns. This prices the
--- disagreement in person-time rather than in argument.
+-- =========================================================================
+-- BLOCK 10 — Q21. Calendar months versus fixed day counts.       ~1 minute
+-- =========================================================================
+-- "12 months" can be read as 365 days or as add_months(-12). They differ by
+-- 0-2 days depending on leap years and the day of the month, and the build
+-- applies the day count. This says how often the two disagree at all, and by
+-- how much - which is the whole of the question.
 
-SELECT count(*)                                                      AS n_cohort,
-       round(avg(datediff(ENDDATE_CE, INDEX_DATE) + 1) / 365.25, 2)  AS mean_years_censored,
-       round(avg(datediff(ENDDATE,    INDEX_DATE) + 1) / 365.25, 2)  AS mean_years_uncensored,
-       sum(CASE WHEN ENDDATE_CE < ENDDATE THEN 1 ELSE 0 END)         AS n_where_it_differs,
-       round(100.0 * sum(CASE WHEN ENDDATE_CE < ENDDATE THEN 1 ELSE 0 END)
-                   / count(*), 1)                                    AS pct_where_it_differs
-FROM <WORK>.<PREFIX>NDMM_COHORT;
+WITH idx AS (
+  SELECT cast(PATID as string) AS PATID, min(cast(FST_DT as date)) AS ix
+  FROM   hive_metastore.clnprw_optum.t_med_diagnosis_2026q1
+  WHERE  upper(regexp_replace(DIAG,'[^A-Za-z0-9]','')) LIKE 'C90%'
+    AND  cast(FST_DT as date) >= date('2018-01-01')
+  GROUP BY cast(PATID as string)
+)
+SELECT datediff(add_months(ix, -12), date_sub(ix, 365)) AS days_apart,
+       count(*)                                         AS n_members
+FROM idx GROUP BY 1 ORDER BY 1;
+
+
+-- =========================================================================
+-- BLOCK 11 — Q23. Which pregnancy window, priced.                ~3 minutes
+-- =========================================================================
+-- X3 excludes pregnancy. The open question is whether the window is the study
+-- period or each patient's own baseline. Proxy codes only - ICD-10 O00-O9A
+-- plus Z33/Z34/Z3A - because Annex 3 has not been delivered; the shape of the
+-- answer does not depend on the exact list.
+--
+-- If the two windows exclude nearly the same people, the choice is academic.
+
+WITH idx AS (
+  SELECT cast(PATID as string) AS PATID, min(cast(FST_DT as date)) AS ix
+  FROM   hive_metastore.clnprw_optum.t_med_diagnosis_2026q1
+  WHERE  upper(regexp_replace(DIAG,'[^A-Za-z0-9]','')) LIKE 'C90%'
+    AND  cast(FST_DT as date) >= date('2018-01-01')
+  GROUP BY cast(PATID as string)
+),
+preg AS (
+  SELECT cast(d.PATID as string) AS PATID, cast(d.FST_DT as date) AS dt
+  FROM       hive_metastore.clnprw_optum.t_med_diagnosis_2026q1 d
+  INNER JOIN mm_pts p ON p.PATID = cast(d.PATID as string)
+  WHERE  upper(regexp_replace(d.DIAG,'[^A-Za-z0-9]','')) RLIKE '^(O[0-9A-Z]|Z3[34A])'
+)
+SELECT count(DISTINCT i.PATID)                                          AS mm_members,
+       count(DISTINCT CASE WHEN pr.dt BETWEEN date('2018-01-01')
+                                          AND date('2026-03-31')
+                           THEN i.PATID END)                            AS excluded_study_period,
+       count(DISTINCT CASE WHEN pr.dt BETWEEN date_sub(i.ix, 365)
+                                          AND date_sub(i.ix, 1)
+                           THEN i.PATID END)                            AS excluded_own_baseline,
+       count(DISTINCT CASE WHEN pr.dt BETWEEN date('2018-01-01') AND date('2026-03-31')
+                            AND NOT (pr.dt BETWEEN date_sub(i.ix,365) AND date_sub(i.ix,1))
+                           THEN i.PATID END)                            AS study_period_only
+FROM      idx i
+LEFT JOIN preg pr ON pr.PATID = i.PATID;
+
+
+-- =========================================================================
+-- BLOCK 12 — Q7 and Q3. Prior malignancy, and the pairing window. ~4 minutes
+-- =========================================================================
+-- Q7: the secondary 2L cohort permits a prior malignancy where the primary
+-- cohorts exclude it. This is the size of the population that turns on it -
+-- how many myeloma members carry another cancer code in their baseline year.
+-- Q3: X2 pairs two outpatient claims of the same cancer within a window. This
+-- prices 30 days against 60 - how many members the wider window would exclude
+-- that the narrower one would not.
+--
+-- Proxy: any C-code that is not myeloma (C90) and not a non-melanoma skin
+-- cancer (C44), which the protocol usually exempts. Annex 3 supplies the real
+-- grouping; this is the order of magnitude.
+
+WITH idx AS (
+  SELECT cast(PATID as string) AS PATID, min(cast(FST_DT as date)) AS ix
+  FROM   hive_metastore.clnprw_optum.t_med_diagnosis_2026q1
+  WHERE  upper(regexp_replace(DIAG,'[^A-Za-z0-9]','')) LIKE 'C90%'
+    AND  cast(FST_DT as date) >= date('2018-01-01')
+  GROUP BY cast(PATID as string)
+),
+other AS (
+  SELECT cast(d.PATID as string)                            AS PATID,
+         cast(d.FST_DT as date)                             AS dt,
+         substr(upper(regexp_replace(d.DIAG,'[^A-Za-z0-9]','')), 1, 3) AS cat
+  FROM       hive_metastore.clnprw_optum.t_med_diagnosis_2026q1 d
+  INNER JOIN mm_pts p ON p.PATID = cast(d.PATID as string)
+  WHERE  upper(regexp_replace(d.DIAG,'[^A-Za-z0-9]','')) RLIKE '^C[0-9]'
+    AND  upper(regexp_replace(d.DIAG,'[^A-Za-z0-9]','')) NOT LIKE 'C90%'
+    AND  upper(regexp_replace(d.DIAG,'[^A-Za-z0-9]','')) NOT LIKE 'C44%'
+),
+baseline AS (
+  SELECT o.PATID, o.cat, o.dt
+  FROM       other o
+  INNER JOIN idx i ON i.PATID = o.PATID
+  WHERE  o.dt BETWEEN date_sub(i.ix, 365) AND date_sub(i.ix, 1)
+),
+paired AS (
+  SELECT a.PATID, a.cat, min(datediff(b.dt, a.dt)) AS gap
+  FROM       baseline a
+  INNER JOIN baseline b ON b.PATID = a.PATID AND b.cat = a.cat AND b.dt > a.dt
+  GROUP BY a.PATID, a.cat
+)
+SELECT n.mm_members,
+       count(DISTINCT pr.PATID)                                         AS with_a_paired_other_cancer,
+       count(DISTINCT CASE WHEN pr.gap <= 30 THEN pr.PATID END)         AS paired_within_30d,
+       count(DISTINCT CASE WHEN pr.gap <= 60 THEN pr.PATID END)         AS paired_within_60d,
+       count(DISTINCT CASE WHEN pr.gap > 30 AND pr.gap <= 60
+                           THEN pr.PATID END)                           AS only_the_60d_window
+FROM      (SELECT count(*) AS mm_members FROM idx) n
+LEFT JOIN paired pr ON true
+GROUP BY n.mm_members;
+
+
+-- =========================================================================
+-- BLOCK 13 — Q6. Do steroid-only claims trigger the exclusion?    ~3 minutes
+-- =========================================================================
+-- X1 excludes prior MM therapy in baseline. The question is whether a claim
+-- for a steroid alone counts as "MM oncology therapy". Proxy J-codes only -
+-- J1100 dexamethasone, J7509/J7510/J7512 prednisolone and prednisone,
+-- J2920/J2930 methylprednisolone - against a handful of unambiguous myeloma
+-- agents. cl_mma_codelist is the real list.
+--
+-- `steroid_only` is the population the answer moves.
+
+WITH idx AS (
+  SELECT cast(PATID as string) AS PATID, min(cast(FST_DT as date)) AS ix
+  FROM   hive_metastore.clnprw_optum.t_med_diagnosis_2026q1
+  WHERE  upper(regexp_replace(DIAG,'[^A-Za-z0-9]','')) LIKE 'C90%'
+    AND  cast(FST_DT as date) >= date('2018-01-01')
+  GROUP BY cast(PATID as string)
+),
+tx AS (
+  SELECT cast(m.PATID as string) AS PATID, cast(m.FST_DT as date) AS dt,
+         CASE WHEN trim(m.PROC_CD) IN ('J1100','J7509','J7510','J7512',
+                                       'J2920','J2930')          THEN 1 ELSE 0 END AS steroid,
+         CASE WHEN trim(m.PROC_CD) IN ('J9041','J9044','J9047','J9145',
+                                       'J9228','J9308','J9999','J0202',
+                                       'J9037','J9061')          THEN 1 ELSE 0 END AS mm_agent
+  FROM       hive_metastore.clnprw_optum.t_medical_2026q1 m
+  INNER JOIN mm_pts p ON p.PATID = cast(m.PATID as string)
+  WHERE  m.PROC_CD IS NOT NULL
+),
+base AS (
+  SELECT t.PATID, max(t.steroid) AS any_steroid, max(t.mm_agent) AS any_agent
+  FROM       tx t
+  INNER JOIN idx i ON i.PATID = t.PATID
+  WHERE  t.dt BETWEEN date_sub(i.ix, 365) AND date_sub(i.ix, 1)
+  GROUP BY t.PATID
+)
+SELECT count(*)                                                       AS members_with_baseline_tx,
+       sum(CASE WHEN any_agent = 1 THEN 1 ELSE 0 END)                 AS any_mm_agent,
+       sum(CASE WHEN any_steroid = 1 THEN 1 ELSE 0 END)               AS any_steroid,
+       sum(CASE WHEN any_steroid = 1 AND any_agent = 0 THEN 1 ELSE 0 END) AS steroid_only
+FROM base;
+
+
+-- =========================================================================
+-- BLOCK 14 — the value lists the code assumes.                    ~2 minutes
+-- =========================================================================
+-- Not open questions, but each is a mapping the package applies and has never
+-- seen data for. A value outside the expected set is silently dropped.
+
+-- Sex. The package maps M and F and sends everything else to Unknown.
+SELECT GDR_CD, count(*) AS n
+FROM   hive_metastore.clnprw_optum.t_member_enrollment_2026q1
+GROUP BY GDR_CD ORDER BY n DESC;
+
+-- STATE. The census crosswalk carries the 50 states plus DC. Anything else -
+-- PR, VI, GU, a blank, a territory - falls to region Unknown, and this is the
+-- only place that would show it.
+SELECT STATE, count(*) AS n
+FROM   hive_metastore.clnprw_optum.t_member_enrollment_2026q1
+GROUP BY STATE ORDER BY n DESC LIMIT 70;
+
+-- DIAG_POSITION. The rule is "first or second position", and the package casts
+-- this to int. If it is zero-padded, or carries a non-numeric value, that cast
+-- decides whether a row is read at all.
+SELECT DIAG_POSITION, count(*) AS n
+FROM   hive_metastore.clnprw_optum.t_med_diagnosis_2026q1
+GROUP BY DIAG_POSITION ORDER BY n DESC LIMIT 30;
+
+
+-- =========================================================================
+-- BLOCK 15 — the two columns round one could not see.             ~3 minutes
+-- =========================================================================
+-- The DESCRIBE results were truncated to the first rows on screen, so neither
+-- of these was confirmed. Both are load-bearing, and both are LAST in the file
+-- because if a column does not exist the statement errors - and that error is
+-- itself the answer.
+
+-- CONFINEMENT.ICD_FLAG. The MM-related hospitalisation test now reads it, with
+-- the admit date only as a fallback. If this errors, the column is absent and
+-- 07_hcru.R must go back to the date.
+SELECT ICD_FLAG, count(*) AS n
+FROM   hive_metastore.clnprw_optum.t_confinement_2026q1
+GROUP BY ICD_FLAG ORDER BY n DESC;
+
+-- MEDICAL.PAID_STATUS. Block 6 above depends on it; if that block errored,
+-- this says why.
+SELECT PAID_STATUS, count(*) AS n
+FROM   hive_metastore.clnprw_optum.t_medical_2026q1
+WHERE  cast(FST_DT as date) >= date('2024-01-01')
+GROUP BY PAID_STATUS ORDER BY n DESC;
+
+
+-- =========================================================================
+-- BLOCK 16 — hospitalisation shape.                               ~2 minutes
+-- =========================================================================
+-- Three things the HCRU module assumes and has never checked.
+--   * how often a stay has no discharge date - the protocol counts those as
+--     events and excludes them from LOS summaries, so this is how much of the
+--     LOS denominator goes missing;
+--   * whether CONFINEMENT.LOS agrees with discharge minus admit. The
+--     dictionary says LOS spans bundled records, so it may not, and the
+--     package computes its own rather than reading it;
+--   * how much of MEDICAL is inpatient, which is what business rule 14's
+--     CONF_ID test turns on.
+
+SELECT count(*)                                                        AS stays,
+       sum(CASE WHEN DISCH_DATE IS NULL THEN 1 ELSE 0 END)             AS no_discharge_date,
+       sum(CASE WHEN DISCH_DATE IS NOT NULL
+                 AND try_cast(LOS as int) = datediff(cast(DISCH_DATE as date),
+                                                     cast(ADMIT_DATE as date))
+                THEN 1 ELSE 0 END)                                     AS los_equals_datediff,
+       sum(CASE WHEN DISCH_DATE IS NOT NULL
+                 AND try_cast(LOS as int) <> datediff(cast(DISCH_DATE as date),
+                                                      cast(ADMIT_DATE as date))
+                THEN 1 ELSE 0 END)                                     AS los_differs,
+       round(avg(try_cast(LOS as int)), 2)                             AS mean_los_column,
+       round(avg(datediff(cast(DISCH_DATE as date),
+                          cast(ADMIT_DATE as date))), 2)               AS mean_datediff
+FROM       hive_metastore.clnprw_optum.t_confinement_2026q1 cf
+INNER JOIN mm_pts p ON p.PATID = cast(cf.PATID as string)
+WHERE  cast(cf.ADMIT_DATE as date) >= date('2018-01-01');
+
+-- And how business rule 14's test actually behaves. The ED filter is
+-- `CONF_ID IS NULL OR trim(CONF_ID) = ''`. If a non-inpatient claim carries 0
+-- rather than NULL, that filter matches nothing and every ED visit disappears
+-- from Table 7. This says which shape the absence takes.
+SELECT CASE WHEN CONF_ID IS NULL                        THEN 'null'
+            WHEN trim(cast(CONF_ID as string)) = ''     THEN 'blank'
+            WHEN trim(cast(CONF_ID as string)) = '0'    THEN 'zero'
+            ELSE 'populated' END                  AS conf_id_state,
+       count(*)                                   AS claims,
+       count(DISTINCT cast(PATID as string))      AS members
+FROM   hive_metastore.clnprw_optum.t_medical_2026q1
+WHERE  cast(FST_DT as date) >= date('2024-01-01')
+GROUP BY 1 ORDER BY claims DESC;
