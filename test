@@ -1,0 +1,9 @@
+cat > /tmp/migrate_snapshot.sql <<'EOF'
+USE CATALOG ${catalog};
+ALTER TABLE ${schema}.pre_q82_ads      RENAME TO ${schema}.pre_ruling_ads;
+ALTER TABLE ${schema}.pre_q82_ads_meta RENAME TO ${schema}.pre_ruling_ads_meta;
+-- @assert no-rows
+SHOW TABLES IN ${schema} LIKE 'pre_q82_ads*';
+EOF
+  
+Rscript validation/run_sql.R /tmp/migrate_snapshot.sql
