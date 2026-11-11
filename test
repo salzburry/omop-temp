@@ -1,0 +1,618 @@
+# =============================================================================
+# 00_discover.R : EC RDQ303944 - what is in the Flatiron Advanced Endometrial
+# schema, and how many patients each open RDQ question affects
+# =============================================================================
+# Run once, set up the same way as the LA-HNSCC RDQ (DSN RWDE, DATABRICKS_PWD
+# set), from the project root:
+#
+#   source("R/00_discover.R")
+#
+# Writes ec_discovery_<DDMONYYYY>.xlsx to out_dir and prints a summary to the
+# console.
+#
+# Part 1 describes the schema: tables, columns, value lists, date ranges,
+#   chemotherapy names, cross-tabulations.
+# Part 2 answers or sizes the open RDQ questions. It finds the tables and
+#   columns it needs by name (Mapping sheet), builds both cohorts
+#   provisionally and counts the patients each open choice affects
+#   (Questions sheet). The Summary sheet gives one verdict per question:
+#   answered by the data, closed (the choice changes no counts) or open
+#   (affects N patients, so the requestors decide). It is a sizing aid, not
+#   the deliverable: every count rests on the Mapping sheet and the notes.
+#
+# Only aggregates are written: value lists are limited to columns with at most
+# max_levels distinct values (never IDs, dates or free text), and counts from
+# 1 to min_cell - 1 are shown as "<5". A query that fails is logged on the
+# Errors sheet and the run carries on.
+# =============================================================================
+
+suppressPackageStartupMessages({ library(DBI); library(dplyr); library(openxlsx) })
+
+# ---- Parameters (edit here) -----------------------------------------------------------
+catalog        <- "hive_metastore"
+schema         <- NULL                 # NULL: the one schema matching schema_pattern
+schema_pattern <- "*endo*|*edm*"       # SHOW SCHEMAS LIKE: * is a wildcard, | separates patterns
+refresh        <- NULL                 # NULL: the latest _<yyyy>m<mm> table suffix, e.g. "2026m10"
+expected_n     <- 8114                 # "Full Flatiron Database" N in the RDQ shell
+window         <- as.Date(c("2020-04-01", "2026-09-30"))   # RDQ inclusion window for the index date
+study_start    <- as.Date("2020-03-01")                    # RDQ study period start (differs from window)
+cutoff         <- as.Date("2026-09-30")                    # data cutoff (check D2 on the Questions sheet)
+max_levels     <- 50                   # list a column's values only up to this many distinct values
+min_cell       <- 5                    # counts below this are masked; 0 = no masking
+out_dir        <- "/mnt/artifacts/results"
+out_file       <- file.path(out_dir, paste0("ec_discovery_", toupper(format(Sys.Date(), "%d%b%Y")), ".xlsx"))
+
+# RDQ chemotherapy list. The stems also catch paclitaxel protein-bound and
+# doxorubicin pegylated liposomal; brand names in case a name column holds them.
+chemo_re <- paste0("carboplatin|paclitaxel|docetaxel|cisplatin|gemcitabine|doxorubicin|ifosfamide|",
+                   "capecitabine|topotecan|mitomycin|abraxane|doxil|caelyx")
+io_re    <- "pembrolizumab|dostarlimab|durvalumab|atezolizumab|nivolumab|avelumab|cemiplimab|retifanlimab"
+
+# Table roles, matched on the lower-case table name without the _<refresh>
+# suffix (GSK renames tables on load). A table may take several roles and a
+# role several tables: every table with a role is profiled.
+roles <- c(cohort       = "enh|endo|edm|uter",     # Enhanced_AdvEndometrial and the other enhanced tables
+           biomarker    = "bio|bmk",               # MMR / MSI results
+           lot          = "line.*ther|(^|_)lot(_|$)",
+           drugepisode  = "dr?u?g_?ep",
+           demographics = "demog",
+           setting      = "adjuv|early")           # any separate adjuvant / early-line table
+
+# Cross-tabulations: for a table with this role, the first (up to 3) listable
+# columns whose names match these patterns, in this order.
+xt_pats <- list(lot       = c("setting", "mainten", "line_?num"),
+                setting   = c("setting", "mainten", "line_?num"),
+                biomarker = c("biomarker_?name", "biomarker_?status|status", "test_?type"))
+
+# Part 2: the columns each table must supply, found by name. Each field lists
+# patterns in priority order; the first pattern that matches a column wins. A
+# field with no match is read as missing. Names follow the Flatiron data
+# dictionary (Jul 2026 data model): Enhanced_AdvancedEndometrial,
+# Enhanced_AdvEndometrialBiomarkers, LineOfTherapy, DrugEpisode, Demographics.
+fld <- list(
+  cohort = list(patientid = "^patientid$", dx = c("^diagnosis_?date$", "initial_?diag"),
+                adv = "advanced_?diag", stage = c("^group_?stage$", "group_?stage", "figo"),
+                localrec = "local_?recur", distrec = "distant_?recur", firsttx = "first_?treatment"),
+  demo   = list(patientid = "^patientid$", birthyear = "birth_?year"),
+  lot    = list(patientid = "^patientid$", linename = "line_?name", linenumber = "line_?num",
+                start = c("^startdate$", "start_?date"), setting = c("line_?setting", "setting"),
+                maint = "mainten", cohort = "enhanced_?cohort"),
+  drug   = list(patientid = "^patientid$", date = "episode_?date"),
+  bmk    = list(patientid = "^patientid$", name = "biomarker_?name", status = c("biomarker_?status", "status"),
+                date = c("^resultdate$", "result_?date", "specimen_?collected")))
+ec_re <- "endo|edm"   # EnhancedCohort value(s) of endometrial lines; the delivery may hold other cohorts
+
+# ---- Connection and helpers -----------------------------------------------------------
+pwd <- Sys.getenv("DATABRICKS_PWD")
+if (!nzchar(pwd)) stop("Set the DATABRICKS_PWD environment variable.", call. = FALSE)
+con <- dbConnect(odbc::odbc(), dsn = "RWDE", pwd = pwd, timeout = 120, bigint = "numeric")
+invisible(dbExecute(con, paste("USE CATALOG", catalog)))
+
+errors <- tibble(step = character(), sql = character(), error = character())
+log_error <- function(step, sql, msg)
+  errors <<- bind_rows(errors, tibble(step = step, sql = sql, error = msg))
+q <- function(sql, step) tryCatch(dbGetQuery(con, sql), error = function(e) {
+  log_error(step, sql, conditionMessage(e))
+  NULL
+})
+num1 <- function(x) if (length(x)) as.numeric(x[[1]]) else NA_real_   # first value, NA if absent
+bq   <- function(x) paste0("`", x, "`")
+fq   <- function(t) paste0(schema, ".", bq(t))
+pick <- function(cols, pats)
+  head(unique(unlist(lapply(pats, function(p) grep(p, cols, value = TRUE, ignore.case = TRUE)))), 3)
+mask <- function(n) ifelse(is.na(n), NA_character_,
+                           ifelse(n > 0 & n < min_cell, paste0("<", min_cell),
+                                  format(n, scientific = FALSE, trim = TRUE)))
+cells   <- function(d) mutate(d, across(any_of(c("n_rows", "n_patients", "n_missing", "n_not_a_date")), mask))
+stack_l <- function(l) if (length(l)) cells(bind_rows(l)) else tibble(note = "nothing found")
+
+# ---- Schema and refresh ---------------------------------------------------------------
+flatiron_schemas <- tryCatch(sort(dbGetQuery(con, "SHOW SCHEMAS LIKE '*flatiron*'")[[1]]),
+                             error = function(e) character())
+if (is.null(schema)) {
+  hits <- dbGetQuery(con, paste0("SHOW SCHEMAS LIKE '", schema_pattern, "'"))[[1]]
+  if (length(hits) != 1)
+    stop(length(hits), " schemas match '", schema_pattern, "': ", paste(hits, collapse = ", "),
+         "\nSet `schema` in 00_discover.R. Flatiron schemas:\n  ",
+         paste(flatiron_schemas, collapse = "\n  "), call. = FALSE)
+  schema <- hits
+}
+
+all_tabs  <- dbGetQuery(con, paste("SHOW TABLES IN", schema))$tableName
+sfx_re    <- "_([0-9]{4}m[0-9]{2})$"
+sfx       <- ifelse(grepl(sfx_re, tolower(all_tabs)), sub(paste0(".*", sfx_re), "\\1", tolower(all_tabs)), NA)
+refreshes <- sort(unique(na.omit(sfx)))
+if (is.null(refresh)) refresh <- if (length(refreshes)) tail(refreshes, 1) else NA
+refresh   <- tolower(refresh)
+tabs      <- if (is.na(refresh)) all_tabs else all_tabs[sfx %in% refresh]
+if (!length(tabs))
+  stop("No tables in ", schema, " for refresh ", refresh, ". Refreshes found: ",
+       paste(refreshes, collapse = ", "), call. = FALSE)
+stems <- if (is.na(refresh)) tolower(tabs) else sub(paste0("_", refresh, "$"), "", tolower(tabs))
+
+role_of <- vapply(stems, function(s) paste(names(roles)[vapply(roles, grepl, logical(1), x = s)],
+                                           collapse = ", "), "")
+cat("Schema:", schema, " Refresh:", refresh, " Tables:", length(tabs), "\n")
+
+# =============================================================================
+# Part 1: describe the schema
+# =============================================================================
+tables <- tibble(table = tabs, stem = stems, role = unname(role_of),
+                 n_rows = unname(vapply(tabs, function(t)
+                   num1(q(paste("SELECT count(*) AS n FROM", fq(t)), paste("count", t))$n), numeric(1))),
+                 n_patients = NA_real_)
+cat("All tables (role, rows):\n")
+print(as.data.frame(tables[c("table", "role", "n_rows")]), row.names = FALSE)
+
+describe <- function(t) {
+  d <- q(paste("DESCRIBE TABLE", fq(t)), paste("describe", t))
+  if (is.null(d)) return(NULL)
+  d <- d[!is.na(d$col_name) & nzchar(trimws(d$col_name)) & !startsWith(d$col_name, "#"),
+         c("col_name", "data_type")]
+  distinct(tibble(table = t, column = d$col_name, type = d$data_type))   # partition columns repeat
+}
+columns <- bind_rows(lapply(tabs, describe))
+if (!nrow(columns)) stop("DESCRIBE failed for every table. First error: ", errors$error[1], call. = FALSE)
+
+profile <- list(); values <- list(); dates <- list(); drugs <- list(); xtabs <- list()
+prof_tabs <- tables$table[nzchar(tables$role)]
+if (!length(prof_tabs)) {
+  message("No table name matched a role: profiling every table.")
+  prof_tabs <- tables$table
+}
+
+for (t in prof_tabs) {
+  message("Profiling ", t)
+  cl <- filter(columns, table == t, !grepl("^(array|map|struct|binary|void|null)", tolower(type)))
+  if (!nrow(cl)) next
+  pid     <- cl$column[tolower(cl$column) == "patientid"][1]
+  pid_sql <- if (is.na(pid)) "" else paste0(", count(DISTINCT ", bq(pid), ") AS n_patients")
+  k       <- seq_len(nrow(cl))
+
+  # One pass for patients and each column's distinct values and missing count.
+  # If it fails (one awkward column fails the whole pass), retry column by column.
+  ex <- c(if (is.na(pid)) "CAST(NULL AS BIGINT) AS n_patients"
+          else paste0("count(DISTINCT ", bq(pid), ") AS n_patients"),
+          paste0("approx_count_distinct(", bq(cl$column), ") AS d", k),
+          paste0("sum(CASE WHEN ", bq(cl$column), " IS NULL THEN 1 ELSE 0 END) AS m", k))
+  r <- q(paste("SELECT", paste(ex, collapse = ", "), "FROM", fq(t)), paste("profile", t))
+  if (!is.null(r)) {
+    np <- num1(r$n_patients)
+    nd <- vapply(paste0("d", k), function(a) num1(r[[a]]), numeric(1))
+    nm <- vapply(paste0("m", k), function(a) num1(r[[a]]), numeric(1))
+  } else {
+    np <- if (is.na(pid)) NA_real_ else
+      num1(q(paste0("SELECT count(DISTINCT ", bq(pid), ") AS n FROM ", fq(t)), paste("patients", t))$n)
+    per <- lapply(cl$column, function(cn)
+      q(paste0("SELECT approx_count_distinct(", bq(cn), ") AS d, sum(CASE WHEN ", bq(cn),
+               " IS NULL THEN 1 ELSE 0 END) AS m FROM ", fq(t)), paste("profile", t, cn)))
+    nd <- vapply(per, function(x) num1(x$d), numeric(1))
+    nm <- vapply(per, function(x) num1(x$m), numeric(1))
+  }
+  tables$n_patients[tables$table == t] <- np
+  cl <- mutate(cl, n_distinct_approx = nd, n_missing = nm,
+               is_date = grepl("^(date|timestamp)", tolower(type)) | grepl("date$", tolower(column)))
+  profile[[t]] <- select(cl, table, column, n_distinct_approx, n_missing)
+
+  # Date ranges (string dates too); n_not_a_date counts values that do not
+  # parse as a full date, e.g. month-only "2021-03"
+  dc <- cl$column[cl$is_date]
+  if (length(dc)) {
+    j  <- seq_along(dc)
+    ex <- c(paste0("CAST(min(try_cast(", bq(dc), " AS DATE)) AS STRING) AS lo", j),
+            paste0("CAST(max(try_cast(", bq(dc), " AS DATE)) AS STRING) AS hi", j),
+            paste0("sum(CASE WHEN ", bq(dc), " IS NOT NULL AND try_cast(", bq(dc),
+                   " AS DATE) IS NULL THEN 1 ELSE 0 END) AS u", j))
+    r <- q(paste("SELECT", paste(ex, collapse = ", "), "FROM", fq(t)), paste("dates", t))
+    if (!is.null(r))
+      dates[[t]] <- tibble(table = t, column = dc,
+                           min = as.character(unlist(r[1, paste0("lo", j)])),
+                           max = as.character(unlist(r[1, paste0("hi", j)])),
+                           n_not_a_date = as.numeric(unlist(r[1, paste0("u", j)])))
+  }
+
+  # Value lists of low-cardinality columns (never the patient ID, dates or free text)
+  lc <- filter(cl, !is_date, !is.na(n_distinct_approx), n_distinct_approx > 0,
+               n_distinct_approx <= max_levels, is.na(pid) | column != pid)
+  for (cn in lc$column) {
+    r <- q(paste0("SELECT CAST(", bq(cn), " AS STRING) AS value, count(*) AS n_rows", pid_sql,
+                  " FROM ", fq(t), " GROUP BY 1 ORDER BY n_rows DESC LIMIT ", 2 * max_levels),
+           paste("values", t, cn))
+    if (!is.null(r))
+      values[[paste(t, cn)]] <- tibble(table = t, column = cn, value = r$value, n_rows = as.numeric(r$n_rows),
+                                       n_patients = if (is.na(pid)) NA_real_ else as.numeric(r$n_patients))
+  }
+
+  # Drug and line names that contain an RDQ chemotherapy
+  for (cn in cl$column[grepl("(drug|line|regimen|agent)_?name|regimen", tolower(cl$column))]) {
+    r <- q(paste0("SELECT ", bq(cn), " AS value, count(*) AS n_rows", pid_sql, " FROM ", fq(t),
+                  " WHERE lower(", bq(cn), ") RLIKE '", chemo_re, "' GROUP BY 1 ORDER BY n_rows DESC LIMIT 500"),
+           paste("chemo names", t, cn))
+    if (!is.null(r) && nrow(r))
+      drugs[[paste(t, cn)]] <- tibble(table = t, column = cn, value = r$value, n_rows = as.numeric(r$n_rows),
+                                      n_patients = if (is.na(pid)) NA_real_ else as.numeric(r$n_patients))
+  }
+
+  # Cross-tabulations: LOT setting x maintenance x line number; biomarker name x status x test
+  for (rl in intersect(strsplit(tables$role[tables$table == t], ", ")[[1]], names(xt_pats))) {
+    xc <- pick(lc$column, xt_pats[[rl]])
+    if (length(xc) < 2) next
+    v  <- paste0("v", seq_along(xc))
+    r  <- q(paste0("SELECT ", paste0("CAST(", bq(xc), " AS STRING) AS ", v, collapse = ", "),
+                   ", count(*) AS n_rows", pid_sql, " FROM ", fq(t),
+                   " GROUP BY ", paste(seq_along(xc), collapse = ", "), " ORDER BY n_rows DESC LIMIT 500"),
+            paste("crosstab", t))
+    if (!is.null(r))
+      xtabs[[paste(t, paste(xc, collapse = "|"))]] <- tibble(
+        table = t, columns = paste(xc, collapse = " x "),
+        values = do.call(paste, c(lapply(r[v], function(x) coalesce(x, "<missing>")), sep = " | ")),
+        n_rows = as.numeric(r$n_rows), n_patients = if (is.na(pid)) NA_real_ else as.numeric(r$n_patients))
+  }
+}
+
+checks <- tables %>% filter(grepl("cohort|demographics", role)) %>%
+  transmute(table, role, n_rows, n_patients,
+            one_row_per_patient = n_rows == n_patients,
+            matches_rdq_n       = n_patients == expected_n)
+
+# =============================================================================
+# Part 2: answer or size the open questions
+# =============================================================================
+# Question numbers follow the RDQ review: 1 treated >12 m, 2 adjuvant cohort,
+# 3 stage as recurrence proxy, 4 study start, 5 study end, 6 adjuvant anchoring,
+# 7 adjuvant criterion 7, 8 union vs sum, 9 MMRp definition, 10 unknown rows,
+# 11 chemo + IO, 12 measurable disease. D1-D3 are data checks; 1L.x / Adj.x
+# are provisional attrition rows in the order of the RDQ shells.
+#
+# Every metric has a kind:
+#   answer  the data settles the question
+#   impact  patients whose count depends on the open choice. If every impact
+#           metric of a question is 0, the choice changes nothing and the
+#           question can be closed; otherwise the requestors decide
+#   info    context for reading the other two
+# The Summary sheet turns these into one verdict per question.
+
+q_list <- tibble(
+  id = c("D1", "D2", "D3", as.character(1:12)),
+  question = c(
+    "Is the full database N 8114?",
+    "What is the data cutoff?",
+    "Which disease settings are in LineOfTherapy?",
+    "Allow recurrent patients treated >12 months before index? Tx-naive and no-tx-in-1-year: nested or alternatives?",
+    "Can adjuvant lines be identified, and what is the adjuvant cohort for?",
+    "Should initial stage stand in for recurrent vs de novo advanced disease?",
+    "Study start: 1 Mar or 1 Apr 2020?",
+    "Study end: 30 Sep 2026 or 7 days before cutoff?",
+    "Anchor the adjuvant window and age to the index line?",
+    "Does adjuvant criterion 7 remove anyone?",
+    "Is the union table the sum of the two cohort tables?",
+    "How is MMRp defined (MSI-L, conflicting results, result timing)?",
+    "Show unknown stage / MMR rows?",
+    "Do chemo + IO regimens count as 1L chemotherapy?",
+    "Is measurable disease available?"))
+
+mapping   <- tibble(role = character(), field = character(), table = character(), column = character())
+questions <- tibble(id = character(), kind = character(), metric = character(), value = character(),
+                    note = character(), n_raw = numeric())
+qa <- function(id, metric, value, note = "", kind = "info")
+  questions <<- bind_rows(questions, tibble(
+    id = id, kind = kind, metric = metric, note = note,
+    value = if (is.numeric(value)) mask(value) else as.character(value),
+    n_raw = if (is.numeric(value)) as.numeric(value) else NA_real_))
+
+cols_of  <- function(t) if (is.na(t)) character() else columns$column[columns$table == t]
+find_col <- function(t, re) {   # re: patterns in priority order
+  cc <- cols_of(t)
+  for (p in re) { hit <- cc[grepl(p, tolower(cc))]; if (length(hit)) return(hit[1]) }
+  NA_character_
+}
+# The shortest-named table with this role that has every needed column,
+# preferring tables whose name matches `prefer`
+find_tab <- function(role, need, prefer = NULL) {
+  cand <- tables$table[grepl(paste0("(^|, )", role, "(,|$)"), tables$role)]
+  ok   <- cand[vapply(cand, function(t) all(!is.na(vapply(need, function(re) find_col(t, re), ""))), logical(1))]
+  if (!is.null(prefer) && any(grepl(prefer, tolower(ok)))) ok <- ok[grepl(prefer, tolower(ok))]
+  if (length(ok)) ok[which.min(nchar(ok))] else NA_character_
+}
+tb <- c(cohort = find_tab("cohort",       c("^patientid$", "advanced_?diag"), prefer = ec_re),
+        demo   = find_tab("demographics", c("^patientid$", "birth_?year")),
+        lot    = find_tab("lot",          c("^patientid$", "line_?num", "start")),
+        drug   = find_tab("drugepisode",  c("^patientid$", "episode_?date")),
+        bmk    = find_tab("biomarker",    c("^patientid$", "status"), prefer = ec_re))
+
+load_tab <- function(key) {   # patient-level rows stay in this R session; only counts are written
+  t <- tb[[key]]
+  if (is.na(t)) {
+    mapping <<- bind_rows(mapping, tibble(role = key, field = "(table)", table = NA_character_, column = "not found"))
+    return(NULL)
+  }
+  cc <- vapply(fld[[key]], function(re) find_col(t, re), "")
+  mapping <<- bind_rows(mapping, tibble(role = key, field = names(cc), table = t, column = unname(cc)))
+  q(paste("SELECT", paste0(ifelse(is.na(cc), "CAST(NULL AS STRING)", bq(cc)), " AS ", names(cc), collapse = ", "),
+          "FROM", fq(t)), paste("load", key))
+}
+
+yr  <- function(d) as.numeric(format(d, "%Y"))
+d_  <- function(x) as.Date(substr(as.character(x), 1, 10), format = "%Y-%m-%d")
+lc_ <- function(x) tolower(trimws(as.character(x)))
+stage_grp <- function(x) {   # GroupStage at initial diagnosis (I, IA ... IIC, III ... IVC, Unknown/not documented)
+  y <- toupper(gsub("stage|figo|[[:space:]]", "", as.character(x), ignore.case = TRUE))
+  case_when(grepl("^(III|IV)", y) ~ "III/IV", grepl("^I{1,2}([ABC][0-9]?)?$", y) ~ "I/II", TRUE ~ "Unknown")
+}
+# Patients in idx (patientid, index) with a line in `lines` starting before index
+before  <- function(lines, idx) lines %>% inner_join(select(idx, patientid, index), by = "patientid") %>%
+  filter(!is.na(start), start < index) %>% distinct(patientid) %>% pull(patientid)
+# Days from the last drug episode before index to index
+last_tx <- function(idx) drug %>% inner_join(select(idx, patientid, index), by = "patientid") %>%
+  filter(!is.na(date), date < index) %>% group_by(patientid) %>%
+  summarise(gap = as.numeric(first(index) - max(date)), .groups = "drop")
+
+tryCatch({
+  coh <- load_tab("cohort"); demo <- load_tab("demo"); lot <- load_tab("lot")
+  drug <- load_tab("drug");  bmk  <- load_tab("bmk")
+  if (is.null(coh) || is.null(lot) || is.null(demo))
+    stop("the cohort, demographics or line-of-therapy table was not found or not read (see Mapping)")
+
+  coh  <- coh %>%
+    transmute(patientid = as.character(patientid), dx = d_(dx), adv = d_(adv), stage = stage_grp(stage),
+              firsttx = d_(firsttx), first_rec = pmin(d_(localrec), d_(distrec), na.rm = TRUE)) %>%
+    distinct(patientid, .keep_all = TRUE)
+  demo <- demo %>% transmute(patientid = as.character(patientid),
+                             birthyear = suppressWarnings(as.numeric(birthyear))) %>%
+    distinct(patientid, .keep_all = TRUE)
+  lot  <- lot %>%
+    transmute(patientid = as.character(patientid), start = d_(start),
+              linenumber = suppressWarnings(as.numeric(linenumber)), setting = lc_(setting),
+              maint = lc_(maint) %in% c("true", "1", "yes", "y", "t"), cohort = lc_(cohort),
+              chemo = grepl(chemo_re, lc_(linename)), io = grepl(io_re, lc_(linename))) %>%
+    mutate(early    = grepl("adjuv|early|periop|neo", setting),
+           adjuvant = grepl("adjuv", setting) & !grepl("neo", setting),
+           advanced = !early)                  # no setting value: standard Flatiron LOT is the advanced setting
+
+  # ---- Data checks ----
+  qa("D1", paste("Patients in", tb[["cohort"]]), n_distinct(coh$patientid), paste("RDQ shell:", expected_n),
+     kind = "answer")
+  qa("D2", "Latest LineOfTherapy start / DrugEpisode date",
+     paste(suppressWarnings(max(lot$start, na.rm = TRUE)), "/",
+           if (!is.null(drug) && nrow(drug)) suppressWarnings(max(d_(drug$date), na.rm = TRUE)) else "-"),
+     paste("Parameter cutoff:", cutoff, "- change it if the data says otherwise"), kind = "answer")
+  qa("D3", "EnhancedCohort values in LineOfTherapy", paste(sort(unique(na.omit(lot$cohort))), collapse = ", "),
+     paste("Lines kept: EnhancedCohort matching", ec_re), kind = "answer")
+
+  # Only endometrial patients, and only lines in the endometrial setting when
+  # LineOfTherapy.EnhancedCohort says so (a patient can be in several cohorts)
+  lot <- filter(lot, patientid %in% coh$patientid)
+  if (any(grepl(ec_re, lot$cohort))) lot <- filter(lot, grepl(ec_re, cohort))
+  drug <- if (is.null(drug)) tibble(patientid = character(), date = as.Date(character())) else
+    transmute(drug, patientid = as.character(patientid), date = d_(date))
+  bm   <- if (is.null(bmk)) tibble(patientid = character(), name = character(), status = character(),
+                                   date = as.Date(character())) else
+    transmute(bmk, patientid = as.character(patientid), name = lc_(name), status = lc_(status), date = d_(date))
+
+  # MMR / MSI, coded as in the data dictionary (BiomarkerName "MMR/MSI").
+  # Proficient: "Normal MMR protein expression (...)", MSS, MSI-L.
+  # Deficient:  "Loss of MMR protein expression (...)", MSI-H.
+  # Anything else (Equivocal, MSI-Ambiguous, Indeterminate, Results pending,
+  # Unsuccessful/indeterminate test, Unknown, Positive, Negative, Other, ...) is no result.
+  # A patient with both proficient and deficient results is "conflicting" and not MMRp.
+  bm <- bm %>% filter(grepl("mmr|msi", name)) %>%
+    mutate(kind = case_when(grepl("mmr protein", status) ~ "IHC", grepl("^mss$|^msi", status) ~ "MSI",
+                            TRUE ~ "other"),
+           call = case_when(grepl("^normal mmr protein", status) | status %in% c("mss", "msi-l", "msi-low") ~ "proficient",
+                            grepl("^loss of mmr protein", status) | status %in% c("msi-h", "msi-high")   ~ "deficient",
+                            TRUE ~ "no result"))
+  bm_pt <- bm %>% filter(call != "no result") %>% group_by(patientid) %>%
+    summarise(by_mmr = any(kind == "IHC"), by_msi = any(kind == "MSI"),
+              def = any(call == "deficient"), prof = any(call == "proficient"),
+              msil_only = prof & !def & all(status[call == "proficient"] %in% c("msi-l", "msi-low")),
+              first_result = if (all(is.na(date))) as.Date(NA) else min(date, na.rm = TRUE), .groups = "drop") %>%
+    mutate(mmr = case_when(def & prof ~ "conflicting", def ~ "deficient", TRUE ~ "proficient"))
+
+  chemo_lines <- filter(lot, !maint, chemo)
+
+  # Stage / MMR / treatment-history rows shared by both cohorts
+  tail_steps <- function(idx, L) {
+    d <- idx %>% select(patientid, index) %>% left_join(coh, by = "patientid") %>% left_join(bm_pt, by = "patientid")
+    naive  <- setdiff(d$patientid, before(lot, d))          # no systemic line of any kind before index
+    lt     <- last_tx(d)
+    recent <- lt$patientid[lt$gap <= 365]                   # a drug episode in [index - 365 d, index - 1 d]
+    s34  <- filter(d, stage == "III/IV", !is.na(mmr)); s34p <- filter(s34, mmr == "proficient")
+    s12  <- filter(d, stage == "I/II",   !is.na(mmr)); s12p <- filter(s12, mmr == "proficient")
+    s12n <- filter(s12p, patientid %in% naive);        s12y <- filter(s12n, !patientid %in% recent)
+    qa(paste0(L, ".5"),  "Stage III/IV (known MMR status)", nrow(s34))
+    qa(paste0(L, ".6"),  "  MMRp", nrow(s34p))
+    qa(paste0(L, ".7"),  "Stage I/II (known MMR status)", nrow(s12))
+    qa(paste0(L, ".8"),  "  MMRp", nrow(s12p))
+    qa(paste0(L, ".9"),  "    Tx-naive", nrow(s12n))
+    qa(paste0(L, ".10"), "      No tx in 1 year prior to index", nrow(s12y))
+
+    alt <- sum(s12p$patientid %in% naive | !s12p$patientid %in% recent)
+    qa("1", paste(L, "Stage I/II MMRp kept as alternatives (tx-naive OR no tx in prior year)"), alt)
+    qa("1", paste(L, "  ... patients the alternative wording adds over the nested rows"), alt - nrow(s12y),
+       "DrugEpisode only holds drugs that belong to a line, so nested, the last row equals Tx-naive", kind = "impact")
+    qa("1", paste(L, "Stage I/II MMRp with no systemic treatment before index by FirstTreatmentDate"),
+       sum(is.na(s12p$firsttx) | s12p$firsttx >= s12p$index), "Cross-check of the Tx-naive row")
+    qa("3", paste(L, "Stage III/IV MMRp with a recurrence date (local or distant) on or before index"),
+       sum(!is.na(s34p$first_rec) & s34p$first_rec <= s34p$index),
+       "Recurrent at index, but the shell applies no recurrence rule to stage III/IV", kind = "impact")
+    qa("3", paste(L, "Stage I/II MMRp with no recurrence date on or before index"),
+       sum(is.na(s12p$first_rec) | s12p$first_rec > s12p$index),
+       "Treated as recurrent by the shell, but no recurrence is recorded before index", kind = "impact")
+    qa("9", paste(L, "known MMR status from IHC only / MSI only / both"),
+       paste(mask(sum(d$by_mmr & !d$by_msi, na.rm = TRUE)), mask(sum(!d$by_mmr & d$by_msi, na.rm = TRUE)),
+             mask(sum(d$by_mmr & d$by_msi, na.rm = TRUE)), sep = " / "))
+    qa("9", paste(L, "conflicting results (deficient and proficient)"), sum(d$mmr %in% "conflicting"),
+       "Not counted as MMRp here", kind = "impact")
+    qa("9", paste(L, "MMRp only because of an MSI-L result"), sum(d$msil_only %in% TRUE),
+       "MSI-L counted as proficient here", kind = "impact")
+    qa("9", paste(L, "first MMR/MSI result after index"), sum(d$first_result > d$index, na.rm = TRUE),
+       "Counted as known here", kind = "impact")
+    qa("10", paste(L, "stage unknown (dropped silently by the shell)"),
+       sum(d$stage %in% "Unknown" | is.na(d$stage)), kind = "impact")
+    qa("10", paste(L, "no MMR/MSI result (dropped silently by the shell)"), sum(is.na(d$mmr)), kind = "impact")
+  }
+
+  # ---- 1L cohort: index = start of the non-maintenance 1L advanced line ----
+  f1 <- lot %>% filter(advanced, !maint, linenumber == 1, !is.na(start)) %>% group_by(patientid) %>%
+    slice_min(start, n = 1, with_ties = FALSE) %>% ungroup() %>% transmute(patientid, index = start, chemo, io)
+  a1 <- filter(f1, index >= window[1], index <= window[2])
+  a2 <- a1 %>% left_join(demo, by = "patientid") %>% filter(yr(index) - birthyear >= 18)
+  a3 <- filter(a2, chemo)
+  pc <- before(chemo_lines, a3)
+  a4 <- filter(a3, !patientid %in% pc)
+  qa("1L.0", "Full Flatiron database", n_distinct(coh$patientid))
+  qa("1L.1", "Non-maintenance 1L advanced starting in the window", nrow(a1))
+  qa("1L.2", "Age >= 18 years", nrow(a2), "Age = index year - birth year")
+  qa("1L.3", "1L contains an RDQ chemotherapy", nrow(a3), "Matched on the line name")
+  qa("1L.4", "No non-maintenance chemo line before index", nrow(a4), "Any setting, including adjuvant")
+  tail_steps(a4, "1L")
+
+  lt3 <- last_tx(filter(a3, patientid %in% pc))
+  q1  <- lt3$patientid[lt3$gap > 365]
+  qa("1", "1L chemo patients removed for a prior chemo line", length(pc))
+  qa("1", "  ... whose last treatment was more than 12 months before index", length(q1),
+     "Eligible under the rationale, excluded by the shell", kind = "impact")
+  qa("1", "  ... and MMRp", sum(bm_pt$mmr[match(q1, bm_pt$patientid)] %in% "proficient"))
+  qa("4", "Non-maintenance 1L starting 1-31 Mar 2020", sum(f1$index >= study_start & f1$index < window[1]),
+     "Before the age and chemo steps", kind = "impact")
+  qa("5", paste("Non-maintenance 1L starting", cutoff - 6, "to", window[2]),
+     sum(f1$index > cutoff - 7 & f1$index <= window[2]), "Would be excluded by the 7-day rule", kind = "impact")
+  qa("11", "1L chemo patients whose 1L line also contains an immunotherapy", sum(a3$io), kind = "impact")
+
+  # ---- Adjuvant cohort: index = start of the first chemo-containing adjuvant line ----
+  setting_col <- mapping$column[mapping$role == "lot" & mapping$field == "setting"]
+  adj <- filter(lot, adjuvant, !maint, !is.na(start))
+  qa("2", "LineOfTherapy setting column", if (length(setting_col) && !is.na(setting_col[1])) setting_col[1] else "none",
+     kind = "answer")
+  qa("2", "LineSetting values on endometrial lines", paste(sort(unique(na.omit(lot$setting))), collapse = ", "),
+     "Adjuvant = contains 'adjuv' but not 'neo'", kind = "answer")
+  qa("2", "Patients with a non-maintenance adjuvant line", n_distinct(adj$patientid), kind = "answer")
+  if (nrow(adj)) {
+    fa <- adj %>% group_by(patientid) %>%
+      summarise(first_any = min(start), index = if (any(chemo)) min(start[chemo]) else as.Date(NA), .groups = "drop")
+    b1  <- filter(fa, first_any >= window[1], first_any <= window[2])
+    b2  <- b1 %>% left_join(demo, by = "patientid") %>% filter(yr(first_any) - birthyear >= 18)
+    b3  <- filter(b2, !is.na(index))
+    b3a <- filter(b3, !patientid %in% before(filter(adj, chemo), b3))      # criterion 7
+    b4  <- filter(b3a, !patientid %in% before(chemo_lines, b3a))
+    qa("Adj.1", "First non-maintenance adjuvant starting in the window", nrow(b1))
+    qa("Adj.2", "Age >= 18 years at first adjuvant start", nrow(b2))
+    qa("Adj.3", "A non-maintenance adjuvant line contains an RDQ chemotherapy", nrow(b3))
+    qa("Adj.4", "No non-maintenance chemo line before index", nrow(b4), "Any setting, e.g. neoadjuvant")
+    tail_steps(b4, "Adj")
+
+    st <- b4 %>% left_join(coh, by = "patientid") %>% mutate(stage = coalesce(stage, "Unknown"))
+    qa("2", "Adjuvant cohort after step Adj.4, stage I/II", sum(st$stage == "I/II"),
+       "Early-stage at index: outside the stated indication", kind = "impact")
+    qa("2", "Adjuvant cohort after step Adj.4, stage III/IV", sum(st$stage == "III/IV"),
+       "Resected at index, so no measurable disease")
+    qa("2", "Adjuvant cohort after step Adj.4, stage unknown", sum(st$stage == "Unknown"))
+    qa("6", "Adjuvant chemo patients whose index line is not their first adjuvant line",
+       sum(b3$index > b3$first_any), kind = "impact")
+    qa("6", "  ... whose index falls after the window", sum(b3$index > window[2]), kind = "impact")
+    qa("7", "Patients removed by criterion 7", nrow(b3) - nrow(b3a),
+       "0 by construction: index is the first chemo-containing adjuvant line", kind = "impact")
+    qa("8", "Patients in both cohorts at step 1", length(intersect(a1$patientid, b1$patientid)),
+       "Counted once in the union, twice in the sum", kind = "impact")
+    qa("8", "Patients in both cohorts at step 4", length(intersect(a4$patientid, b4$patientid)),
+       "The RDQ expects 0", kind = "impact")
+  }
+
+  mcols <- unique(columns$column[grepl("measur|recist|lesion", tolower(columns$column))])
+  qa("12", "Columns named like measurable / RECIST / lesion",
+     if (length(mcols)) paste(mcols, collapse = ", ") else "none",
+     "The data dictionary has no measurable-disease or response table for endometrial", kind = "answer")
+}, error = function(e) {
+  log_error("part 2", "", conditionMessage(e))
+  qa("ERR", "Part 2 stopped early", conditionMessage(e))
+})
+
+# ---- One verdict per question ------------------------------------------------------
+show_rows <- function(x) paste(paste0(trimws(x$metric), ": ", x$value), collapse = "; ")
+adj_n     <- questions$n_raw[questions$id == "2" & questions$metric == "Patients with a non-maintenance adjuvant line"]
+no_adj    <- length(adj_n) > 0 && isTRUE(adj_n[1] == 0)
+verdict <- function(qid) {
+  r   <- questions[questions$id == qid, ]
+  key <- r[r$kind != "info", ]
+  imp <- r[r$kind == "impact", ]
+  if (!nrow(r)) return(c("Not computed", "See the Errors and Mapping sheets"))
+  if (qid %in% c("6", "7", "8") && no_adj) return(c("Not applicable", "No adjuvant lines in LineOfTherapy"))
+  if (qid == "2" && no_adj)
+    return(c("Answered: no adjuvant lines, so the adjuvant cohort cannot be built from LineOfTherapy", show_rows(key)))
+  if (qid == "D1")
+    return(c(if (isTRUE(r$n_raw[1] == expected_n)) "Answered: matches the RDQ shell"
+             else "Answered: differs from the RDQ shell - update the shell N", show_rows(key)))
+  if (qid == "12")
+    return(c(if (identical(r$value[1], "none")) "Answered: not in the data - drop it or state it as a limitation"
+             else "Answered: check the columns found", show_rows(key)))
+  if (nrow(imp)) {
+    n <- suppressWarnings(max(imp$n_raw, na.rm = TRUE))
+    if (!is.finite(n)) return(c("Not computed", show_rows(key)))
+    if (n == 0) return(c("Closed: the choice changes no counts in this data", show_rows(key)))
+    return(c(paste("Open: affects up to", mask(n), "patients - requestors decide"), show_rows(key)))
+  }
+  c("Answered", show_rows(key))
+}
+q_summary <- bind_rows(lapply(q_list$id, function(qid) {
+  v <- verdict(qid)
+  tibble(id = qid, question = q_list$question[q_list$id == qid], verdict = v[1], evidence = v[2])
+}))
+if (any(questions$id == "ERR"))
+  q_summary <- bind_rows(tibble(id = "ERR", question = "Part 2 stopped early", verdict = "Error",
+                              evidence = questions$value[questions$id == "ERR"][1]), q_summary)
+q_out <- questions %>% left_join(select(q_list, id, question), by = "id") %>%
+  mutate(question = coalesce(question, ifelse(grepl("^(1L|Adj)\\.", id), "Attrition (provisional)", ""))) %>%
+  select(id, question, kind, metric, value, note)
+
+# =============================================================================
+# Output
+# =============================================================================
+prof_df <- if (length(profile)) bind_rows(profile) else
+  tibble(table = character(), column = character(), n_distinct_approx = numeric(), n_missing = numeric())
+run <- tibble(item  = c("catalog", "schema", "refresh used", "refreshes in schema", "tables for refresh",
+                        "tables profiled", "expected N (RDQ shell)", "index window", "data cutoff (parameter)",
+                        "max_levels", "min_cell", "run date"),
+              value = c(catalog, schema, refresh, paste(refreshes, collapse = ", "), length(tabs),
+                        length(prof_tabs), expected_n, paste(window, collapse = " to "), format(cutoff),
+                        max_levels, min_cell, format(Sys.Date())))
+sheets <- list(Run           = run,
+               Summary       = q_summary,
+               Questions     = if (nrow(q_out)) q_out else tibble(note = "nothing computed"),
+               Mapping       = if (nrow(mapping)) mapping else tibble(note = "nothing mapped"),
+               Schemas       = tibble(flatiron_schema = flatiron_schemas),
+               Tables        = cells(tables),
+               Columns       = cells(left_join(columns, prof_df, by = c("table", "column"))),
+               Values        = stack_l(values),
+               Dates         = stack_l(dates),
+               `Chemo names` = stack_l(drugs),
+               Crosstabs     = stack_l(xtabs),
+               Checks        = cells(checks),
+               Errors        = if (nrow(errors)) errors else tibble(note = "no failed queries"))
+
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+wb <- createWorkbook()
+for (s in names(sheets)) {
+  d <- as.data.frame(sheets[[s]])
+  if (!ncol(d)) d <- data.frame(note = "nothing found")
+  addWorksheet(wb, s)
+  writeData(wb, s, d)
+  freezePane(wb, s, firstRow = TRUE)
+  setColWidths(wb, s, cols = seq_len(ncol(d)), widths = "auto")
+}
+saveWorkbook(wb, out_file, overwrite = TRUE)
+dbDisconnect(con)
+
+# ---- Console summary: paste this back --------------------------------------------------
+cat("\nRows per sheet:\n"); print(vapply(sheets, nrow, integer(1)))
+cat("\nMapping:\n"); print(as.data.frame(mapping), row.names = FALSE)
+cat("\nSummary (one verdict per question):\n")
+for (i in seq_len(nrow(q_summary)))
+  cat(sprintf("\n[%s] %s\n  -> %s\n  %s\n", q_summary$id[i], q_summary$question[i], q_summary$verdict[i],
+              substr(q_summary$evidence[i], 1, 400)))
+cat("\nProvisional attrition:\n")
+print(as.data.frame(filter(q_out, grepl("^(1L|Adj)\\.", id))[c("id", "metric", "value")]), row.names = FALSE)
+if (nrow(errors)) {
+  cat("\n", nrow(errors), "queries failed. First ones:\n")
+  print(as.data.frame(mutate(head(errors, 8), error = substr(error, 1, 160))[c("step", "error")]), row.names = FALSE)
+}
+cat("\nWrote", out_file, "\n")
