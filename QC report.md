@@ -1,13 +1,5 @@
 # QC report — GIST RWDP dataset program vs specification (v3)
 
-**Reviewed:** `salzburry/lahnscc-rdq/gist_rwdp_qc` @ `a621682` (photographed copies):
-- `001_Data_Creation_Function.R` (2,440 lines)
-- `001_setup.R` (146 lines)
-- `002_Function_Call.R` (628 lines)
-- `GIST_RWDP_Specification_Document_Draft1.xlsx` (tabs 3.DataPrep through 5D)
-
-**Date:** 12 Nov 2026 · **Type:** independent static QC (code read against spec; program not executed) · **Repo:** not modified
-
 **New in v3:**
 - **Variable QC:** a variable-by-variable trace of all 116 spec variables (plus 9 study periods/parameters) through to the final dataset. Each one was built by one agent and re-traced independently by a second, which corrected 43 first-pass rows.
 - **Final-dataset column census:** all 179 fixed columns traced.
