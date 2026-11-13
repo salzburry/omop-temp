@@ -35,6 +35,14 @@ lot    <- read_tbl("LineOfTherapy", c("PatientID", "LineName", "LineNumber", "Li
 drug   <- read_tbl("DrugEpisode", c("PatientID", "EnhancedCohort", "EpisodeDate"))
 bmk    <- read_tbl("Enhanced_AdvEndometrialBiomarkers", c("PatientID", "BiomarkerName", "BiomarkerStatus", "ResultDate"))
 
+# One row per patient in the cohort and demographics tables, or the joins would inflate every count
+dup_cohort <- sum(duplicated(cohort$patientid))
+dup_demo   <- sum(duplicated(demo$patientid[demo$patientid %in% cohort$patientid]))
+if (dup_cohort > 0 || dup_demo > 0) {
+  stop("Duplicate patients: ", dup_cohort, " in Enhanced_AdvancedEndometrial, ", dup_demo,
+       " in Demographics. Resolve them before counting.")
+}
+
 to_date <- function(x) as.Date(substr(as.character(x), 1, 10), format = "%Y-%m-%d")
 age     <- function(date, birthyear) as.numeric(format(date, "%Y")) - birthyear
 
@@ -189,7 +197,7 @@ checks <- data.frame(
             "EnhancedCohort values in LineOfTherapy",
             "LineSetting values on endometrial lines",
             "Patients with a non-maintenance adjuvant line",
-            "Duplicate patients: Enhanced_AdvancedEndometrial / Demographics (must be 0 / 0 before reading counts)",
+            "Duplicate patients: Enhanced_AdvancedEndometrial / Demographics (the script stops unless 0 / 0)",
             "Cohort patients with no birth year (all patients; those reaching the age step drop there)",
             "Cohort patients with unknown stage (all patients; in neither stage branch)",
             "Endometrial lines with no line name (counted as no chemotherapy)",
@@ -200,8 +208,7 @@ checks <- data.frame(
             paste(sort(unique(lot$enhancedcohort)), collapse = ", "),
             paste(sort(unique(lines$setting)), collapse = ", "),
             nrow(adj),
-            paste(sum(duplicated(cohort$patientid)), "/",
-                  sum(duplicated(demo$patientid[demo$patientid %in% cohort$patientid]))),
+            paste(dup_cohort, "/", dup_demo),
             sum(is.na(pts$birthyear)),
             sum(pts$stage == "Unknown"),
             sum(grepl("endo", tolower(lot$enhancedcohort)) & is.na(lot$linename)),
