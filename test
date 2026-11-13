@@ -1,0 +1,287 @@
+# EC RDQ303944 - Frontline MMRp EC in US
+# Attrition tables for the 1L, adjuvant and front-line cohorts (Flatiron Advanced Endometrial).
+# Needs DATABRICKS_PWD set. Writes one Excel file to /mnt/artifacts/results.
+
+library(DBI)
+library(dplyr)
+library(openxlsx)
+
+# ---- Parameters ----
+schema      <- "clnprw_flatiron_endo_use"
+refresh     <- "2026m10"                # October 2026 delivery (named in the RDQ form)
+index_start <- as.Date("2020-04-01")
+index_end   <- as.Date("2026-09-30")
+cutoff      <- as.Date("2026-09-30")   # data cutoff
+out_dir     <- "/mnt/artifacts/results"
+out_file    <- file.path(out_dir, paste0("TFL_EC_FI_RDQ303944_v0.1_", toupper(format(Sys.Date(), "%d%b%Y")), ".xlsx"))
+
+chemo_list     <- "carboplatin|paclitaxel|docetaxel|cisplatin|gemcitabine|doxorubicin|ifosfamide|capecitabine|topotecan|mitomycin"
+mmr_proficient <- "^normal mmr protein expression|^mss$|^msi-l$"
+mmr_deficient  <- "^loss of mmr protein expression|^msi-h$"
+
+# ---- Connect and read the tables ----
+con <- dbConnect(odbc::odbc(), dsn = "RWDE", pwd = Sys.getenv("DATABRICKS_PWD"), timeout = 120, bigint = "numeric")
+dbExecute(con, "USE CATALOG hive_metastore")
+
+read_tbl <- function(table, cols) {
+  sql <- paste0("SELECT ", paste(cols, collapse = ", "), " FROM ", schema, ".", table, "_", refresh)
+  rename_with(dbGetQuery(con, sql), tolower)
+}
+
+cohort <- read_tbl("Enhanced_AdvancedEndometrial", c("PatientID", "GroupStage", "LocalRecurDate", "DistantRecurDate"))
+demo   <- read_tbl("Demographics", c("PatientID", "BirthYear"))
+lot    <- read_tbl("LineOfTherapy", c("PatientID", "LineName", "LineNumber", "LineSetting",
+                                      "IsMaintenanceTherapy", "EnhancedCohort", "StartDate"))
+drug   <- read_tbl("DrugEpisode", c("PatientID", "EnhancedCohort", "EpisodeDate"))
+bmk    <- read_tbl("Enhanced_AdvEndometrialBiomarkers", c("PatientID", "BiomarkerName", "BiomarkerStatus", "ResultDate"))
+
+to_date <- function(x) as.Date(substr(as.character(x), 1, 10), format = "%Y-%m-%d")
+age     <- function(date, birthyear) as.numeric(format(date, "%Y")) - birthyear
+
+# ---- MMR/MSI results ----
+mmr <- bmk %>%
+  filter(grepl("MMR|MSI", biomarkername)) %>%
+  mutate(status = tolower(trimws(biomarkerstatus)),
+         date   = to_date(resultdate),
+         result = case_when(grepl(mmr_proficient, status) ~ "proficient",
+                            grepl(mmr_deficient, status)  ~ "deficient"))
+
+mmr_status <- function(result) {
+  if (any(result == "deficient") & any(result == "proficient")) "conflicting"
+  else if (any(result == "deficient")) "dMMR"
+  else "pMMR"
+}
+
+# Add MMR status to cohort d: interpretable results dated any time up to index + 14 days
+# (inclusive); undated results do not count. Each cohort uses its own index.
+add_mmr <- function(d) {
+  s <- mmr %>%
+    filter(!is.na(result)) %>%
+    inner_join(select(d, patientid, index), by = "patientid") %>%
+    filter(date <= index + 14) %>%
+    group_by(patientid) %>%
+    summarise(mmr = mmr_status(result), msil_only = all(status == "msi-l"), .groups = "drop")
+  left_join(d, s, by = "patientid")
+}
+
+# ---- Patients: stage at diagnosis, first recurrence, birth year ----
+pts <- cohort %>%
+  transmute(patientid,
+            stage = case_when(grepl("^(III|IV)", groupstage) ~ "III/IV",
+                              grepl("^I{1,2}[ABC]?[0-9]?$", groupstage) ~ "I/II",
+                              TRUE ~ "Unknown"),
+            recur_date = pmin(to_date(localrecurdate), to_date(distantrecurdate), na.rm = TRUE)) %>%
+  left_join(select(demo, patientid, birthyear), by = "patientid")
+
+# ---- Lines of therapy and drug episodes (endometrial only) ----
+lines <- lot %>%
+  filter(grepl("endo", tolower(enhancedcohort))) %>%
+  transmute(patientid,
+            start   = to_date(startdate),
+            line    = linenumber,
+            setting = tolower(linesetting),
+            maint   = tolower(ismaintenancetherapy) %in% "true",
+            chemo   = grepl(chemo_list, tolower(linename)))
+
+chemo_lines <- filter(lines, chemo, !maint)
+episodes <- drug %>%
+  filter(grepl("endo", tolower(enhancedcohort))) %>%
+  transmute(patientid, date = to_date(episodedate))
+
+# Patients in d with a line in l starting before their index date
+had_line_before <- function(d, l) {
+  l %>%
+    inner_join(select(d, patientid, index), by = "patientid") %>%
+    filter(start < index) %>%
+    pull(patientid)
+}
+
+# ---- 1L cohort: index = start of the first non-maintenance 1L line ----
+l1 <- lines %>%
+  filter(line == 1, !maint) %>%
+  group_by(patientid) %>%
+  slice_min(start, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(patientid, index = start, chemo) %>%
+  inner_join(pts, by = "patientid")
+
+l1_window <- filter(l1, index >= index_start, index <= index_end)
+l1_age    <- filter(l1_window, age(index, birthyear) >= 18)
+l1_chemo  <- filter(l1_age, chemo)
+l1_final  <- filter(l1_chemo, !patientid %in% had_line_before(l1_chemo, chemo_lines)) %>% add_mmr()
+
+# ---- Adjuvant cohort: index = start of the first chemo-containing adjuvant line ----
+adj <- lines %>%
+  filter(grepl("adjuvant", setting), !grepl("neoadjuvant", setting), !maint) %>%
+  group_by(patientid) %>%
+  summarise(first_adj = min(start),
+            index     = if (any(chemo)) min(start[chemo]) else as.Date(NA),
+            .groups = "drop") %>%
+  inner_join(pts, by = "patientid")
+
+adj_window <- filter(adj, first_adj >= index_start, first_adj <= index_end)
+adj_age    <- filter(adj_window, age(first_adj, birthyear) >= 18)
+adj_chemo  <- filter(adj_age, !is.na(index))
+adj_final  <- filter(adj_chemo, !patientid %in% had_line_before(adj_chemo, chemo_lines)) %>% add_mmr()
+
+# ---- Front-line cohort: union of both; a patient in both takes the adjuvant index ----
+fl_window <- union(l1_window$patientid, adj_window$patientid)
+fl_age    <- union(l1_age$patientid, adj_age$patientid)
+fl_chemo  <- union(l1_chemo$patientid, adj_chemo$patientid)
+fl_final  <- bind_rows(adj_final, filter(l1_final, !patientid %in% adj_final$patientid))
+
+# ---- Known MMR, stage, MMRp and treatment-history rows ----
+# Known MMR status first, then stage within it.
+# Tx-naive and no tx in 1 year are separate rows under stage I/II MMRp (as in the shells).
+# Tx-naive: no line of therapy before index.
+# No tx in 1 year: no drug episode in [index - 365 days, index - 1 day].
+mmr_stage_rows <- function(d) {
+  naive  <- setdiff(d$patientid, had_line_before(d, lines))
+  recent <- episodes %>%
+    inner_join(select(d, patientid, index), by = "patientid") %>%
+    filter(date < index, date >= index - 365) %>%
+    pull(patientid)
+  known <- filter(d, !is.na(mmr))
+  s34   <- filter(known, stage == "III/IV")
+  s12   <- filter(known, stage == "I/II")
+  s12p  <- filter(s12, mmr == "pMMR")
+  c(nrow(known),
+    nrow(s34),
+    sum(s34$mmr == "pMMR"),
+    nrow(s12),
+    nrow(s12p),
+    sum(s12p$patientid %in% naive),
+    sum(!s12p$patientid %in% recent))
+}
+
+# ---- Attrition tables (RDQ shell layout) ----
+make_table <- function(step1, chemo_row, n) {
+  data.frame(Criterion = c("Full Flatiron Database", step1, "Age >= 18 years", chemo_row,
+                           "Patients without a non-maintenance chemo line prior to index",
+                           "Patients with known MMR status",
+                           "Stage III/IV", "   MMRp",
+                           "Stage I/II", "   MMRp",
+                           "      Tx-naive patients", "      No tx in 1 year prior to index date"),
+             N = n,
+             `% (of higher level)` = round(100 * n / n[c(NA, 1, 2, 3, 4, 5, 6, 7, 6, 9, 10, 10)], 1),
+             check.names = FALSE)
+}
+
+n_all <- nrow(pts)
+
+t_1l <- make_table("Patients receiving non-maintenance 1L advanced starting between April 2020 and Sept 2026",
+                   "Patients receiving non-maintenance 1L chemo",
+                   c(n_all, nrow(l1_window), nrow(l1_age), nrow(l1_chemo), nrow(l1_final), mmr_stage_rows(l1_final)))
+
+t_adj <- make_table("Patients receiving first non-maintenance adjuvant starting between April 2020 and Sept 2026",
+                    "Patients receiving non-maintenance adjuvant chemo line",
+                    c(n_all, nrow(adj_window), nrow(adj_age), nrow(adj_chemo), nrow(adj_final), mmr_stage_rows(adj_final)))
+
+t_fl <- make_table("Patients receiving first line non-maintenance adjuvant or advanced regimen starting between April 2020 and Sept 2026",
+                   "Patients receiving a non-maintenance chemo line either in 1L advanced or any of the adjuvant lines",
+                   c(n_all, length(fl_window), length(fl_age), length(fl_chemo), nrow(fl_final), mmr_stage_rows(fl_final)))
+
+# ---- Data checks ----
+checks <- data.frame(
+  check = c("Patients in Enhanced_AdvancedEndometrial (RDQ shells: 8114, from an earlier delivery)",
+            "Latest LineOfTherapy start date",
+            "Latest DrugEpisode date",
+            "EnhancedCohort values in LineOfTherapy",
+            "LineSetting values on endometrial lines",
+            "Patients with a non-maintenance adjuvant line",
+            "Duplicate patients: Enhanced_AdvancedEndometrial / Demographics (must be 0 / 0 before reading counts)",
+            "Cohort patients with no birth year (all patients; those reaching the age step drop there)",
+            "Cohort patients with unknown stage (all patients; in neither stage branch)",
+            "Endometrial lines with no line name (counted as no chemotherapy)",
+            "Endometrial drug episodes with no date (ignored in the 1-year lookback)"),
+  value = c(n_all,
+            format(max(to_date(lot$startdate), na.rm = TRUE)),
+            format(max(to_date(drug$episodedate), na.rm = TRUE)),
+            paste(sort(unique(lot$enhancedcohort)), collapse = ", "),
+            paste(sort(unique(lines$setting)), collapse = ", "),
+            nrow(adj),
+            paste(sum(duplicated(cohort$patientid)), "/",
+                  sum(duplicated(demo$patientid[demo$patientid %in% cohort$patientid]))),
+            sum(is.na(pts$birthyear)),
+            sum(pts$stage == "Unknown"),
+            sum(grepl("endo", tolower(lot$enhancedcohort)) & is.na(lot$linename)),
+            sum(is.na(episodes$date))))
+
+# Every MMR/MSI status value in the data and how the script classes it
+# (a common value shown as "no result" means the wording differs from the dictionary)
+mmr_values <- mmr %>%
+  count(biomarkername, biomarkerstatus, result) %>%
+  arrange(desc(n)) %>%
+  transmute(check = paste0("MMR/MSI records: ", biomarkername, " = ", biomarkerstatus,
+                           " (classed as ", coalesce(result, "no result"), ")"),
+            value = as.character(n))
+checks <- bind_rows(checks, mmr_values)
+
+# ---- Open questions: patients affected in this delivery ----
+f <- fl_final
+
+# Q1: prior chemotherapy
+removed <- filter(l1_chemo, !patientid %in% l1_final$patientid)       # 1L patients excluded for prior chemo
+adj_chemo_lines <- filter(chemo_lines, grepl("adjuvant", setting), !grepl("neoadjuvant", setting))
+last_tx <- episodes %>%
+  inner_join(select(removed, patientid, index), by = "patientid") %>%
+  filter(date < index) %>%
+  group_by(patientid) %>%
+  summarise(gap = as.numeric(first(index) - max(date)), .groups = "drop")
+
+# Q5: patients with an interpretable MMR/MSI result that has no date
+undated <- mmr$patientid[!is.na(mmr$result) & is.na(mmr$date)]
+
+# Q6: lines for other cancers
+other_lines <- lot %>%
+  filter(!grepl("endo", tolower(enhancedcohort))) %>%
+  transmute(patientid, start = to_date(startdate))
+
+questions <- data.frame(
+  question = c(rep("Q1 Prior chemotherapy rule (criterion 7 or shell row) and the >12-month recurrence exception", 3),
+               "Q2 Adjuvant patients initially diagnosed at stage I/II: all of them?",
+               rep("Q3 Stage at initial diagnosis or disease state at index; documented recurrence?", 2),
+               rep("Q4 Study window: start 1 Mar or 1 Apr 2020, end 30 Sep or 7 days before cutoff?", 2),
+               rep("Q5 MMR/MSI: undated and conflicting results, MSI-L?", 3),
+               "Q6 Treatment history: endometrial treatment only, or any cancer?"),
+  count = c("1L: excluded for a prior chemo line that is not adjuvant (shell row only)",
+            "Adjuvant: excluded for a prior chemo line that is not adjuvant, e.g. neoadjuvant (shell row only)",
+            "1L: excluded for prior chemo, last endometrial treatment of any kind >12 months before 1L",
+            "Adjuvant cohort stage I/II patients",
+            "Front-line stage III/IV MMRp with a recorded recurrence on or before index",
+            "Front-line stage I/II MMRp with no recorded recurrence on or before index",
+            "1L or first adjuvant start in March 2020 (excluded by criterion 5)",
+            "1L or first adjuvant start in the last 7 days before cutoff",
+            "Front-line: conflicting MMR/MSI results (not MMRp)",
+            "Front-line: MMRp only through MSI-L",
+            "Front-line: no known MMR status, but an interpretable result with no date (would count if undated results were allowed)",
+            "Front-line: a line of therapy for another cancer before index (screening count, may change no row)"),
+  n = c(sum(!removed$patientid %in% had_line_before(removed, adj_chemo_lines)),
+        nrow(adj_chemo) - nrow(adj_final),
+        sum(last_tx$gap > 365),
+        sum(adj_final$stage == "I/II"),
+        sum(f$stage == "III/IV" & f$mmr %in% "pMMR" & f$recur_date <= f$index, na.rm = TRUE),
+        sum(f$stage == "I/II" & f$mmr %in% "pMMR" & (is.na(f$recur_date) | f$recur_date > f$index)),
+        length(unique(c(l1$patientid[format(l1$index, "%Y-%m") %in% "2020-03"],
+                        adj$patientid[format(adj$first_adj, "%Y-%m") %in% "2020-03"]))),
+        length(unique(c(l1_window$patientid[l1_window$index > cutoff - 7],
+                        adj_window$patientid[adj_window$first_adj > cutoff - 7]))),
+        sum(f$mmr %in% "conflicting"),
+        sum(f$msil_only %in% TRUE),
+        sum(is.na(f$mmr) & f$patientid %in% undated),
+        length(unique(had_line_before(f, other_lines)))))
+
+# ---- Write and print ----
+# Write to a temporary file, check it reopens with all sheets, then copy it over the final file,
+# so a file left by an earlier run can never pass for this run's output.
+sheets <- list(`1L cohort` = t_1l, `Adjuvant cohort` = t_adj, `Front-line cohort` = t_fl,
+               `Data checks` = checks, `Open questions` = questions)
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+tmp_file <- tempfile(fileext = ".xlsx")
+write.xlsx(sheets, tmp_file)
+if (!file.exists(tmp_file) || !identical(getSheetNames(tmp_file), names(sheets)) ||
+    !file.copy(tmp_file, out_file, overwrite = TRUE)) stop("The Excel file was not written: ", out_file)
+unlink(tmp_file)
+
+print(t_1l); print(t_adj); print(t_fl); print(checks); print(questions)
+dbDisconnect(con)
