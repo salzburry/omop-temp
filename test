@@ -1,0 +1,1330 @@
+LA-HNSCC RDQ (VeevaRIO 338681): all code files
+Recreate each file at the path shown, inside the lahnscc_rdq folder, then run from that folder:
+  Rscript run_all.R
+Files: run_all.R, R/00_setup.R, R/01_table1.R, R/02_seer_compare.R, R/03_first_run_checks.R,
+       inputs/seer_table2_laHNSCC.csv (needed for the SEER comparison),
+       tests/mock_run.R (optional: tests the code on fake data, not needed for the real run)
+
+
+########## FILE: run_all.R ##########
+# =============================================================================
+# LA-HNSCC RDQ (VeevaRIO 338681) - run from the lahnscc_rdq folder: source("run_all.R")
+# =============================================================================
+source("R/00_setup.R")          # parameters, connection, source tables
+source("R/01_table1.R")         # study population, Table 1, chemo date check
+source("R/02_seer_compare.R")   # Flatiron vs SEER (skipped if no SEER table)
+########## END OF FILE: run_all.R ##########
+
+
+########## FILE: R/00_setup.R ##########
+# =============================================================================
+# 00_setup.R : parameters, connection, source tables
+# =============================================================================
+# LA-HNSCC RDQ - descriptive characteristics of LA-HNSCC patients in Flatiron,
+# compared with SEER. VeevaRIO 338681; asset 61431, Dostarlimab (GSK4057190).
+# Source: Flatiron "GSK Dostarlimab Locally Advanced Head & Neck Custom Data",
+# July 2026 delivery, data cut-off December 2025.
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(DBI); library(dbplyr); library(dplyr); library(tidyr)
+  library(lubridate); library(openxlsx)
+})
+
+# ---- Parameters ---------------------------------------------------------------
+catalog   <- "hive_metastore"
+schema    <- "clnprw_flatiron_la_hnc_use"
+refresh   <- "2026m07"                 # suffix of every table in this delivery
+datacut   <- as.Date("2025-12-31")
+dx_years  <- 2019:2025                 # years shown in Table 1
+out_dir   <- "/mnt/artifacts/results"
+out_stem  <- paste0("TFL_338681_HNSCC_FI_RDQ_v0.1_", toupper(format(Sys.Date(), "%d%b%Y")))
+seer_file <- "inputs/seer_table2_laHNSCC.csv"   # SEER comparator for 02_seer_compare.R: SEER RDQ
+                                                 # Table 2 (locally advanced HNSCC, 2019-2023)
+
+# Study population (RDQ I/E, updated Nov 2026: "LA definition in Flatiron database").
+# Inclusion: an ICD code for one of these primary sites. The RDQ lists ICD-10 /
+# ICD-O-3 site codes; Flatiron's Diagnosis table holds ICD-10-CM and ICD-9-CM, so
+# each site has both. ICD-10-CM codes base of tongue and pyriform sinus as C01 and
+# C12 (no 4th character; C01.9 and C12.9 in the RDQ). Codes are matched on the code
+# itself with dots and spaces removed (ICD-10 codes start with a letter, ICD-9 codes
+# do not), so a missing or differently spelled DiagnosisCodeSystem does not matter.
+incl_sites <- tibble::tribble(
+  ~site,                                     ~rdq_codes,                   ~icd10,      ~icd9,
+  "Lip",                                     "C00.0-C00.9",                "^C00",      "^140",
+  "Base of tongue",                          "C01.9",                      "^C01",      "^1410",
+  "Other tongue",                            "C02.0-C02.9",                "^C02",      "^141[1-9]",
+  "Gum",                                     "C03.0-C03.9",                "^C03",      "^143",
+  "Floor of mouth",                          "C04.0-C04.9",                "^C04",      "^144",
+  "Palate",                                  "C05.0-C05.9",                "^C05",      "^145[2-5]",
+  "Other mouth",                             "C06.0-C06.9",                "^C06",      "^145[01689]",
+  "Tonsil",                                  "C09.0-C09.9",                "^C09",      "^146[0-2]",
+  "Oropharynx",                              "C10.0-C10.9",                "^C10",      "^146[3-9]",
+  "Hypopharynx",                             "C12.9, C13.0-C13.9",         "^C1[23]",   "^148",
+  "Other/ill-defined oral cavity & pharynx", "C14.0, C14.2, C14.8",        "^C14[028]", "^149",
+  "Larynx",                                  "C32.0-C32.3, C32.8, C32.9",  "^C32",      "^161")
+# Exclusion: an ICD code for a head and neck site not in the list above (this
+# replaces the earlier C11/C12 rule). Pyriform sinus C12 is included: the RWB lead's
+# email takes precedence over the RDQ form and the SEER Appendix, which leave it
+# out. NULL drops the step, so a patient with any included-site code is kept.
+excl_other_hn <- tibble::tribble(
+  ~site,                                        ~icd10,     ~icd9,
+  "Salivary glands (C07-C08)",                  "^C0[78]",  "^142",
+  "Nasopharynx (C11)",                          "^C11",     "^147",
+  "Nasal cavity, middle ear, sinuses (C30-C31)", "^C3[01]",  "^160")
+
+# Baseline period: days relative to the index date (DiagnosisDate, the initial
+# LA-HNSCC diagnosis), both ends included. Type of Reporting Source is read from
+# the practices the patient visited in it.
+baseline_days <- c(-90, 30)
+
+# Surgery groups (RDQ; SurgeryType coding of Enhanced_LAHNC_PrimarySurgery)
+surgery_map <- c("primary tumor resection only"                      = "Resected",
+                 "primary tumor resection and lymph node dissection" = "Resected",
+                 "lymph node dissection only"                        = "Unresected",
+                 "unknown/not specified"                             = "Unknown")
+no_surgery_group <- "Unresected"           # no primary-surgery record: counted as Unresected, as SEER
+                                           # does; "No surgery record" shows them in their own column
+seer_no_surgery_group <- "Unresected"      # SEER comparison only, when Table 1 has that own column:
+                                           # SEER has no such group and counts no surgery as Unresected
+
+# "Receipt of chemotherapy / radiation (1L)" = SEER first course of treatment
+first_course_settings <- c("NEOADJUVANT", "INDUCTION CHEMO", "CONCURRENT", "ADJUVANT",
+                           "EARLY", "RADIATION THERAPY")   # DrugEpisode.LineSetting
+count_cetuximab  <- FALSE              # FALSE: never chemo, whatever DetailedDrugCategory says. SEER*Rx
+                                       # codes cetuximab as biologic/immunotherapy for diagnoses from 2013
+drug_cohorts     <- NULL               # DrugEpisode.EnhancedCohort value(s) for LA-HNSCC lines;
+                                       # NULL = the delivery must hold a single value
+rt_lookback_days <- 30                 # RT may start up to 30 days before diagnosis
+rt_sites <- c("primary site (includes regional lymph node involvement)",
+              "unknown/not documented")                     # RTSite (missing counts too)
+
+# ---- Connection ---------------------------------------------------------------
+connect <- function() {
+  pwd <- Sys.getenv("DATABRICKS_PWD")
+  if (!nzchar(pwd)) stop("Set the DATABRICKS_PWD environment variable.", call. = FALSE)
+  dbConnect(odbc::odbc(), dsn = "RWDE", pwd = pwd, timeout = 120)
+}
+con <- connect()
+invisible(dbExecute(con, paste("USE CATALOG", catalog)))
+
+# ---- Source tables ------------------------------------------------------------
+# Tables are renamed on load (t_ prefix, "enh", abbreviations such as
+# drg_epsode), so each one is found by a pattern on its name without the
+# _<refresh> suffix. Exactly one table must match; edit a pattern if needed.
+hnc <- "^(t_)?enh(anced)?_?(la_?)?hnc"
+tbl_patterns <- c(
+  cohort    = paste0(hnc, "$"),                          # Enhanced_LAHNC
+  surgery   = paste0(hnc, "_?pr(i|m)[a-z]*_?su?rg"),     # Enhanced_LAHNC_PrimarySurgery
+  radiation = paste0(hnc, "_?(ra?d|rt($|_))"),           # Enhanced_LAHNC_RadiationTherapy
+  localrec  = paste0(hnc, "_?lo?c[a-z]*_?rec"),          # Enhanced_LAHNC_LocalRecurrence
+  metrec    = paste0(hnc, "_?me?t[a-z]*_?rec"),          # Enhanced_LAHNC_MetRecurrence
+  drugep    = "^(t_)?(enh(anced)?_?(la_?)?hnc_?)?dr?u?g_?ep",   # DrugEpisode
+  diagnosis = "^(t_)?diagnosis$",
+  demo      = "^(t_)?demographics?$",
+  practice  = "^(t_)?practices?$",
+  visit     = "^(t_)?visits?$")
+
+find_tables <- function(tables) {
+  tables <- tables[grepl(paste0("_", refresh, "$"), tolower(tables))]
+  stems  <- sub(paste0("_", refresh, "$"), "", tolower(tables))
+  sapply(names(tbl_patterns), function(k) {
+    hit <- tables[grepl(tbl_patterns[[k]], stems)]
+    if (length(hit) != 1)
+      stop("Table '", k, "': ", length(hit), " tables match pattern ", tbl_patterns[[k]],
+           " for refresh ", refresh, ". Tables in the schema:\n  ",
+           paste(sort(tables), collapse = "\n  "), call. = FALSE)
+    hit
+  })
+}
+schema_tables <- dbGetQuery(con, paste("SHOW TABLES IN", schema))$tableName
+tbl_map <- find_tables(schema_tables)
+print(tbl_map)
+
+src <- function(key) tbl(con, in_schema(schema, tbl_map[[key]])) %>% rename_with(tolower)
+########## END OF FILE: R/00_setup.R ##########
+
+
+########## FILE: R/01_table1.R ##########
+# =============================================================================
+# 01_table1.R : study population, Table 1, chemotherapy date check
+# =============================================================================
+# Writes <stem>.xlsx (Table 1, Attrition, Chemo date check),
+# <stem>_table1_long.csv and <stem>_ads.rds to out_dir.
+# =============================================================================
+
+norm <- function(x) tolower(gsub("[[:space:]]+", " ", trimws(x)))
+fetch <- function(key, ...) src(key) %>% filter(patientid %in% !!ids) %>% select(patientid, ...) %>% collect()
+site_of <- function(code, sites) {          # the site whose ICD-10 or ICD-9 pattern matches, else NA
+  k <- toupper(gsub("[[:space:].]", "", code))
+  out <- rep(NA_character_, length(k))
+  for (i in seq_len(NROW(sites))) out[is.na(out) & grepl(paste0(sites$icd10[i], "|", sites$icd9[i]), k)] <- sites$site[i]
+  out
+}
+
+# ---- Study population ------------------------------------------------------------------
+# Flatiron's LA-HNSCC criteria are applied in the delivery; the RDQ limits it to the
+# primary sites in incl_sites and drops patients with another head and neck site.
+cohort <- src("cohort") %>%
+  select(patientid, diagnosisdate, advanceddiagnosisdate, groupstage, hpvstatus) %>% collect() %>%
+  mutate(dx_date = as.Date(diagnosisdate), adv_date = as.Date(advanceddiagnosisdate))
+stopifnot(!anyDuplicated(cohort$patientid))
+ids <- cohort$patientid
+dx_codes <- fetch("diagnosis", diagnosiscode) %>%       # the patients' head and neck site codes
+  mutate(incl_site = site_of(diagnosiscode, incl_sites), other_hn = site_of(diagnosiscode, excl_other_hn)) %>%
+  filter(!is.na(incl_site) | !is.na(other_hn))
+in_site <- cohort %>% filter(patientid %in% dx_codes$patientid[!is.na(dx_codes$incl_site)])
+cohort  <- in_site %>% filter(!patientid %in% dx_codes$patientid[!is.na(dx_codes$other_hn)])
+attrition <- tibble(
+  step = c("All patients in Enhanced_LAHNC",
+           paste("With an ICD code for an included primary site: C00-C06, C09-C10, C12-C13,",
+                 "C14.0/C14.2/C14.8, C32 (ICD-9 140-141, 143-146, 148-149, 161)"),
+           if (!is.null(excl_other_hn))
+             paste("Excluding patients with an ICD code for another head and neck site:",
+                   paste(excl_other_hn$site, collapse = "; "))),
+  n_patients = c(length(ids), nrow(in_site), if (!is.null(excl_other_hn)) nrow(cohort)))
+print(attrition)
+ids <- cohort$patientid
+
+# ---- Surgery group: Resected > Unknown > Unresected per patient --------------------
+surg <- fetch("surgery", surgerytype) %>%
+  mutate(s = norm(coalesce(surgerytype, "")),
+         grp = coalesce(unname(surgery_map[s]),            # values outside the coding: by keyword
+                        case_when(grepl("lymph node|neck dissection", s) & !grepl("primary", s) ~ "Unresected",
+                                  grepl("resection", s) ~ "Resected", TRUE ~ "Unknown"))) %>%
+  group_by(patientid) %>%
+  summarise(surg_group = if (any(grp == "Resected")) "Resected" else if (any(grp == "Unknown")) "Unknown"
+                         else "Unresected", .groups = "drop")
+
+# ---- Chemotherapy, first course: first-course line + DetailedDrugCategory chemo ------
+drugs <- fetch("drugep", linesetting, drugname, detaileddrugcategory, episodedate, enhancedcohort)
+if (!is.null(drug_cohorts)) drugs <- filter(drugs, enhancedcohort %in% drug_cohorts)
+if (is.null(drug_cohorts) && n_distinct(drugs$enhancedcohort) > 1)   # another disease's lines must not count
+  stop("DrugEpisode has several EnhancedCohort values (", paste(unique(drugs$enhancedcohort), collapse = ", "),
+       "). Set drug_cohorts in 00_setup.R to the LA-HNSCC value(s).", call. = FALSE)
+drugs <- drugs %>%
+  mutate(first = toupper(norm(linesetting)) %in% first_course_settings,
+         cetux = grepl("cetuximab", norm(coalesce(drugname, ""))),   # by count_cetuximab, not by its category
+         chemo = (grepl("chemo", norm(coalesce(detaileddrugcategory, ""))) & !cetux) | (count_cetuximab & cetux))
+if (any(drugs$first) && !any(drugs$first & drugs$chemo))
+  stop("First-course drug episodes exist but none is chemotherapy - check DetailedDrugCategory.", call. = FALSE)
+
+# ---- Radiation, first course ---------------------------------------------------------
+# End of first course = earliest of first locoregional recurrence, distant
+# recurrence and AdvancedDiagnosisDate. A month/year-only start date must lie
+# wholly inside the window.
+first_date <- function(key, col) fetch(key, d = !!rlang::sym(col)) %>% mutate(d = as.Date(d)) %>%
+  filter(!is.na(d)) %>% group_by(patientid) %>% summarise(d = min(d), .groups = "drop")
+fc_end <- cohort %>% select(patientid, dx_date, adv_date) %>%
+  left_join(first_date("localrec", "localrecurdate") %>% rename(lr = d), by = "patientid") %>%
+  left_join(first_date("metrec", "distantmetdate") %>% rename(dm = d), by = "patientid") %>%
+  transmute(patientid, dx_date, fc_end = pmin(adv_date, lr, dm, na.rm = TRUE))
+rt_ids <- fetch("radiation", rtstartdate, rtstartdategranularity, rtsite) %>%
+  filter(norm(coalesce(rtsite, "Unknown/not documented")) %in% rt_sites) %>%
+  mutate(start = as.Date(rtstartdate), g = toupper(coalesce(trimws(rtstartdategranularity), "DAY")),
+         lo = case_when(g == "YEAR" ~ floor_date(start, "year"), g == "MONTH" ~ floor_date(start, "month"),
+                        TRUE ~ start),
+         hi = case_when(g == "YEAR" ~ ceiling_date(start, "year", change_on_boundary = TRUE) - 1,
+                        g == "MONTH" ~ ceiling_date(start, "month", change_on_boundary = TRUE) - 1,
+                        TRUE ~ start)) %>%
+  inner_join(fc_end, by = "patientid") %>%
+  filter(!is.na(start), lo >= dx_date - rt_lookback_days, is.na(fc_end) | hi < fc_end) %>%
+  pull(patientid)
+
+# ---- Analysis dataset: one row per patient --------------------------------------------
+outside <- sprintf("Outside %d-%d", min(dx_years), max(dx_years))
+stage_of <- function(x) {
+  y <- toupper(gsub("(?i)stage|\\s", "", x, perl = TRUE))
+  case_when(grepl("^(0|0IS|T?IS)$", y) ~ "0", grepl("^IV[ABC]?$", y) ~ "IV", grepl("^III[ABC]?$", y) ~ "III",
+            grepl("^II[ABC]?$", y) ~ "II", grepl("^I[ABC]?$", y) ~ "I", TRUE ~ "Unknown")
+}
+demo <- fetch("demo", birthyear, birthsex, race, ethnicity)
+if (anyDuplicated(demo$patientid)) stop("Demographics has more than one row for a patient.", call. = FALSE)
+# Type of Reporting Source: PracticeType of the practices with a visit in the
+# baseline period (Visit.PracticeID joined to Practice on patient and practice).
+# No visit in the baseline period = Unknown.
+visits <- src("visit") %>% filter(patientid %in% !!ids) %>% distinct(patientid, practiceid, visitdate) %>% collect() %>%
+  left_join(distinct(fetch("practice", practiceid, practicetype)), by = c("patientid", "practiceid"),
+            relationship = "many-to-many") %>%
+  left_join(select(cohort, patientid, dx_date), by = "patientid") %>%
+  mutate(day = as.numeric(as.Date(visitdate) - dx_date),
+         baseline = !is.na(day) & day >= baseline_days[1] & day <= baseline_days[2])
+practice <- visits %>% filter(baseline) %>% group_by(patientid) %>%
+  summarise(acad = any(norm(practicetype) %in% "academic"), comm = any(norm(practicetype) %in% "community"))
+ads <- cohort %>%
+  left_join(demo, by = "patientid") %>%
+  left_join(practice, by = "patientid") %>%
+  left_join(surg, by = "patientid") %>%
+  mutate(
+    surg_group = factor(coalesce(surg_group, no_surgery_group),
+                        unique(c("Unresected", "Resected", "Unknown", no_surgery_group))),
+    sex = factor(case_when(norm(birthsex) %in% c("f", "female") ~ "Female",
+                           norm(birthsex) %in% c("m", "male") ~ "Male", TRUE ~ "Unknown"),
+                 c("Male", "Female", "Unknown")),
+    age = year(dx_date) - suppressWarnings(as.numeric(birthyear)),          # birth year only
+    age_cat = cut(age, c(-Inf, 17, 39, 64, 74, Inf),
+                  c("<18 years", "18-39 years", "40-64 years", "65-74 years", "75+ years")),
+    race_eth = factor(case_when(
+      norm(race) == "hispanic or latino" | norm(ethnicity) == "hispanic or latino" ~ "Hispanic (All Races)",
+      norm(race) == "white" ~ "Non-Hispanic White",
+      norm(race) == "black or african american" ~ "Non-Hispanic Black",
+      norm(race) == "american indian or alaska native" ~ "Non-Hispanic American Indian/Alaska Native",
+      norm(race) %in% c("asian", "native hawaiian or other pacific islander") ~ "Non-Hispanic Asian or Pacific Islander",
+      TRUE ~ "Other/Unknown"),
+      c("Non-Hispanic White", "Non-Hispanic Black", "Non-Hispanic American Indian/Alaska Native",
+        "Non-Hispanic Asian or Pacific Islander", "Hispanic (All Races)", "Other/Unknown")),
+    dx_year = factor(ifelse(is.na(dx_date), NA, ifelse(year(dx_date) %in% dx_years, year(dx_date), outside)),
+                     c(dx_years, if (any(!is.na(dx_date) & !year(dx_date) %in% dx_years)) outside)),
+    stage = factor(stage_of(groupstage), c("0", "I", "II", "III", "IV", "Unknown")),
+    hpv = factor(case_when(norm(hpvstatus) == "hpv positive" ~ "Positive",
+                           norm(hpvstatus) == "hpv negative" ~ "Negative", TRUE ~ "Other/Unknown"),
+                 c("Positive", "Negative", "Other/Unknown")),
+    chemo = factor(ifelse(patientid %in% drugs$patientid[drugs$first & drugs$chemo], "Yes", "No/Unknown"),
+                   c("Yes", "No/Unknown")),
+    radiation = factor(ifelse(patientid %in% rt_ids, "Yes", "No/Unknown"), c("Yes", "No/Unknown")),
+    reporting = factor(case_when(acad & comm ~ "Both Academic and Community", acad ~ "Academic",
+                                 comm ~ "Community", TRUE ~ "Unknown"),
+                       c("Academic", "Community", "Both Academic and Community", "Unknown")))
+if (nrow(ads) != nrow(cohort) || anyDuplicated(ads$patientid))
+  stop("The analysis dataset must have exactly one row per cohort patient.", call. = FALSE)
+
+# ---- Table 1: Overall | Unresected | Resected | Unknown [| No surgery record] (n, column %)
+groups   <- c("Overall", levels(ads$surg_group))
+grp_data <- c(list(Overall = ads), split(ads, ads$surg_group))
+block <- function(var, header) {
+  body <- bind_rows(lapply(groups, function(g) {
+    d <- grp_data[[g]]
+    if (var == "age") {                                                     # continuous
+      q <- quantile(d$age, c(.25, .5, .75), na.rm = TRUE)
+      return(tibble(label = c("Mean (sd)", "Median [IQR]"), group = g, n_num = NA, pct = "",
+                    n = if (all(is.na(d$age))) "-" else
+                      c(sprintf("%.1f (%s)", mean(d$age, na.rm = TRUE),
+                                ifelse(sum(!is.na(d$age)) > 1, sprintf("%.1f", sd(d$age, na.rm = TRUE)), "-")),
+                        sprintf("%.1f [%.1f, %.1f]", q[2], q[1], q[3]))))
+    }
+    x <- if (var == "overall") rep("Overall", nrow(d)) else as.character(d[[var]])
+    x[is.na(x)] <- "Unknown"                                                # "Unknown" row only if missing
+    levs <- if (var == "overall") "Overall" else c(levels(ads[[var]]), if (anyNA(ads[[var]])) "Unknown")
+    n <- vapply(levs, function(l) sum(x == l), numeric(1))
+    den <- if (var == "overall") nrow(ads) else nrow(d)
+    tibble(label = levs, group = g, n_num = n, n = as.character(n),
+           pct = if (den > 0) sprintf("%.1f", 100 * n_num / den) else "-")
+  }))
+  bind_rows(tibble(label = header, group = groups, n = "", n_num = NA, pct = "", is_header = TRUE),
+            mutate(body, is_header = FALSE)) %>% mutate(section = header)
+}
+# Baseline identifier of each variable (Table 1 "Baseline variable" column):
+# Yes = assessed at the index date (diagnosis) or in the baseline period;
+# No = time-invariant, not tied to a date, or assessed after the baseline period.
+baseline_var <- c(
+  "Sex"                            = "No",    # time-invariant (Demographics)
+  "Age at diagnosis (years)"       = "Yes",   # at the index date
+  "Age at diagnosis (categorical)" = "Yes",
+  "Race/Ethnicity"                 = "No",    # time-invariant (Demographics)
+  "Year of Diagnosis"              = "Yes",   # index date
+  "Stage at diagnosis"             = "Yes",   # at the index date
+  "HPV status"                     = "No",    # patient-level HPVStatus, no assessment date
+  "Receipt of chemotherapy (1L)"   = "No",    # first course of treatment, after the baseline period
+  "Receipt of radiation (1L)"      = "No",
+  "Type of Reporting Source"       = "Yes")   # visits in the baseline period
+long <- bind_rows(
+  block("overall", "Incidence of Head and Neck Squamous Cell Carcinoma"), block("sex", "Sex"),
+  block("age", "Age at diagnosis (years)"), block("age_cat", "Age at diagnosis (categorical)"),
+  block("race_eth", "Race/Ethnicity"), block("dx_year", "Year of Diagnosis"),
+  block("stage", "Stage at diagnosis"), block("hpv", "HPV status"),
+  block("chemo", "Receipt of chemotherapy (1L)"), block("radiation", "Receipt of radiation (1L)"),
+  block("reporting", "Type of Reporting Source")) %>%
+  mutate(baseline = coalesce(unname(baseline_var[section]), ""))   # Incidence row: not a variable
+if (!setequal(names(baseline_var), setdiff(unique(long$section), long$section[1])))
+  stop("baseline_var must name every Table 1 variable once.", call. = FALSE)
+table1 <- long %>%
+  pivot_wider(id_cols = c(section, label, is_header, baseline), names_from = group, values_from = c(n, pct)) %>%
+  select(section, label, baseline, is_header,
+         all_of(as.vector(rbind(paste0("n_", groups), paste0("pct_", groups)))))
+
+footnotes <- c(
+  paste0("Source: Flatiron GSK Dostarlimab LA Head & Neck custom data (", schema, ", refresh ", refresh,
+         "); data cut-off ", format(datacut, "%d%b%Y"), "."),
+  paste0("Study population: Enhanced_LAHNC patients with an ICD-10-CM / ICD-9-CM code for an included primary site ",
+         "(RDQ site codes: ", paste0(incl_sites$site, " ", incl_sites$rdq_codes, collapse = "; "), ").",
+         if (!is.null(excl_other_hn)) paste0(" Patients with a code for another head and neck site are excluded: ",
+                                             paste(excl_other_hn$site, collapse = "; "), ".")),
+  paste0("Baseline variable: Yes = assessed at the index date (initial diagnosis) or in the baseline period (",
+         abs(baseline_days[1]), " days before to ", baseline_days[2], " days after the index date): age, year of ",
+         "diagnosis, stage at diagnosis, type of reporting source. No = not based on the baseline period: sex and ",
+         "race/ethnicity (time-invariant), HPV status (patient-level status with no assessment date), chemotherapy ",
+         "and radiation (first course of treatment)."),
+  "Percentages are column percentages within each surgery group; the Overall row shows each group's share of the cohort.",
+  paste0("Surgery: Resected = primary tumour resection +/- lymph node dissection; Unresected = lymph node ",
+         "dissection only; Unknown = unknown/not specified; ",
+         if (no_surgery_group %in% c("Unresected", "Resected", "Unknown"))
+           paste0("patients with no primary-surgery record are counted as ", no_surgery_group, ".")
+         else paste0(no_surgery_group, " = patients with no primary-surgery record.")),
+  "Age = year of diagnosis - birth year (Flatiron provides birth year only).",
+  paste0("Chemotherapy / radiation (1L) = SEER first course. Chemotherapy: DetailedDrugCategory chemotherapy",
+         if (count_cetuximab) " or cetuximab" else " (cetuximab not counted)", " in a ", paste(first_course_settings, collapse = ", "),
+         " line. Radiation: RT to the primary or an unknown site starting no earlier than ", rt_lookback_days,
+         " days before diagnosis and before the first recurrence or advanced diagnosis."),
+  paste0("Type of Reporting Source: practice type of the Flatiron practices the patient visited in the baseline ",
+         "period; Unknown = no visit in the baseline period."),
+  "Rows not in the SEER shell (so each block adds up to N): Sex Unknown, Race/Ethnicity Other/Unknown, and any age or year Unknown / Outside row.")
+
+# ---- Chemotherapy date check (diagnostic only; Table 1 unchanged) ---------------------
+# First-course chemo episodes against the radiation window, and how many chemo
+# "Yes" patients a date window would change.
+chk <- drugs %>% filter(first, chemo, patientid %in% ids) %>% left_join(fc_end, by = "patientid") %>%
+  mutate(ep = as.Date(episodedate),
+         position = case_when(is.na(ep) ~ "No episode date",
+                              !is.na(fc_end) & ep >= fc_end ~ "After end of first course",
+                              is.na(dx_date) ~ "No diagnosis date",
+                              ep < dx_date - rt_lookback_days ~ "Before window",
+                              TRUE ~ "Inside window"))
+chk_pat <- chk %>% group_by(patientid) %>%
+  summarise(inside = any(position == "Inside window"), undated = any(grepl("^No ", position)))
+chemo_check <- bind_rows(
+  count(chk, line_setting = toupper(norm(linesetting)), position, name = "n"),
+  tibble(position = c("Chemo Yes patients", "Would change to No/Unknown under a date window",
+                      "Cannot be placed (missing date)"),
+         n = c(nrow(chk_pat), sum(!chk_pat$inside & !chk_pat$undated), sum(!chk_pat$inside & chk_pat$undated))))
+print(as.data.frame(chemo_check), row.names = FALSE)
+
+# ---- Outputs ---------------------------------------------------------------------------
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+wb <- createWorkbook()
+addWorksheet(wb, "Table 1", gridLines = FALSE)
+writeData(wb, "Table 1", "Table 1", startRow = 1)
+writeData(wb, "Table 1", sprintf("Number of cases in Flatiron database, %d to %d", min(dx_years), max(dx_years)),
+          startRow = 1, startCol = 2)
+writeData(wb, "Table 1", "Baseline variable", startRow = 2, startCol = 2)
+for (i in seq_along(groups)) {
+  writeData(wb, "Table 1", groups[i], startRow = 2, startCol = 2 * i + 1)
+  writeData(wb, "Table 1", t(c("n", "%")), startRow = 3, startCol = 2 * i + 1, colNames = FALSE)
+}
+out <- table1 %>% filter(!(is_header & section == "Sex")) %>%   # shell: no "Sex" header row
+  mutate(baseline = ifelse(duplicated(section) | baseline == "", NA, baseline))   # once, on each variable's first row
+writeData(wb, "Table 1", out %>% select(-section, -is_header), startRow = 4, colNames = FALSE)
+addStyle(wb, "Table 1", createStyle(textDecoration = "bold", fgFill = "#D9D9D9"),
+         rows = c(1:3, 3 + which(out$is_header)), cols = 1:(2 + 2 * length(groups)), gridExpand = TRUE)
+addStyle(wb, "Table 1", createStyle(halign = "center"), rows = 2:(nrow(out) + 3), cols = 2, stack = TRUE)
+writeData(wb, "Table 1", footnotes, startRow = nrow(out) + 5)
+setColWidths(wb, "Table 1", cols = 1:2, widths = c(52, 10))
+addWorksheet(wb, "Attrition");        writeData(wb, "Attrition", attrition)
+addWorksheet(wb, "Chemo date check"); writeData(wb, "Chemo date check", chemo_check)
+xlsx_path <- file.path(out_dir, paste0(out_stem, ".xlsx"))
+saveWorkbook(wb, xlsx_path, overwrite = TRUE)
+write.csv(select(long, section, label, baseline, is_header, group, n, n_num, pct),
+          file.path(out_dir, paste0(out_stem, "_table1_long.csv")), row.names = FALSE)
+saveRDS(ads, file.path(out_dir, paste0(out_stem, "_ads.rds")))
+########## END OF FILE: R/01_table1.R ##########
+
+
+########## FILE: R/02_seer_compare.R ##########
+# =============================================================================
+# 02_seer_compare.R : Flatiron vs SEER - how representative is Flatiron?
+# =============================================================================
+# Input: the SEER RDQ's Table 1 in inputs/seer_table1_TEMPLATE.csv layout
+# (section, label, group, n, pct, mean, sd), saved as seer_file. For each row
+# give the SEER count (n) or column % (pct; on the Incidence row, the group's
+# share of the whole cohort); mean and sd on the age "Mean (sd)" row. Leave a
+# category blank if SEER does not report it - it is then left out on both sides.
+# SEER has no "No surgery record" column: when Table 1 has one, its patients are
+# compared within seer_no_surgery_group (00_setup.R); Table 1 itself is unchanged.
+# Adds sheets "SEER comparison" and "Representativeness" to the workbook.
+# Standardized differences (SMD) are used, not p-values: |SMD| < 0.1 Similar,
+# 0.1-0.2 Small difference, >= 0.2 Meaningful difference.
+# =============================================================================
+
+if (!file.exists(seer_file)) {
+  message("No SEER table at ", seer_file, " - SEER comparison skipped.")
+} else {
+
+key <- function(x) tolower(gsub("[[:space:]]+", " ", trimws(x)))
+txt <- readLines(seer_file, warn = FALSE)
+txt[1] <- sub("^\xef\xbb\xbf", "", txt[1], useBytes = TRUE)                # Excel "CSV UTF-8" BOM
+seer <- read.csv(text = txt, colClasses = "character", check.names = FALSE)
+if (!all(c("section", "label", "group", "n", "pct", "mean", "sd") %in% names(seer)))
+  stop("SEER table needs columns section, label, group, n, pct, mean, sd.", call. = FALSE)
+
+# Match sections, labels and groups to Table 1 (ignoring case and spacing)
+t1 <- distinct(filter(long, !is_header), section, label)
+m  <- match(paste(key(seer$section), key(seer$label)), paste(key(t1$section), key(t1$label)))
+if (anyNA(m)) stop("SEER rows not in Table 1: ", paste(unique(paste(seer$section, seer$label, sep = " / ")[is.na(m)]),
+                   collapse = "; "), call. = FALSE)
+seer$section <- t1$section[m]; seer$label <- t1$label[m]
+seer$group <- groups[match(key(seer$group), key(groups))]
+if (anyNA(seer$group)) stop("SEER group must be one of: ", paste(groups, collapse = ", "), call. = FALSE)
+merge_ns <- !no_surgery_group %in% c("Unresected", "Resected", "Unknown") && !no_surgery_group %in% seer$group
+if (merge_ns && !isTRUE(seer_no_surgery_group %in% c("Unresected", "Unknown")))
+  stop("Table 1 has a '", no_surgery_group, "' column that the SEER table does not have. Set ",
+       "seer_no_surgery_group in R/00_setup.R to the SEER group to compare these patients in (Unresected or Unknown).",
+       call. = FALSE)
+if (merge_ns) message("SEER comparison: '", no_surgery_group, "' patients are compared within ", seer_no_surgery_group, ".")
+cmp_groups <- if (merge_ns) setdiff(groups, no_surgery_group) else groups
+cmp_data <- grp_data
+if (merge_ns) {
+  cmp_data[[seer_no_surgery_group]] <- bind_rows(cmp_data[[seer_no_surgery_group]], cmp_data[[no_surgery_group]])
+  cmp_data[[no_surgery_group]] <- NULL
+}
+if (anyDuplicated(seer[c("section", "label", "group")])) stop("Duplicated SEER rows.", call. = FALSE)
+for (v in c("n", "pct", "mean", "sd")) {
+  x <- trimws(seer[[v]])
+  x <- gsub("%$", "", ifelse(grepl("^[0-9]{1,3}(,[0-9]{3})+$", x), gsub(",", "", x), x))
+  val <- suppressWarnings(as.numeric(x))
+  bad <- (!is.na(x) & x != "" & is.na(val)) | (!is.na(val) & (!is.finite(val) | val < 0))
+  if (any(bad)) stop("SEER '", v, "' must be blank or a number >= 0: ",
+                     paste(unique(seer[[v]][bad]), collapse = ", "), call. = FALSE)
+  seer[[v]] <- val
+}
+
+smd_prop <- function(a, b) {
+  d <- sqrt((a * (1 - a) + b * (1 - b)) / 2)
+  ifelse(d > 0, (a - b) / d, ifelse(abs(a - b) < 1e-12, 0, sign(a - b) * Inf))
+}
+smd_multi <- function(a, b) {                       # Yang & Dalton 2012, generalised inverse
+  if (max(abs(a - b)) < 1e-12) return(0)
+  k <- (a + b) > 0; a <- a[k]; b <- b[k]
+  x <- a[-1] - b[-1]
+  cv <- function(p) { s <- -outer(p, p); diag(s) <- p * (1 - p); s }
+  S <- (cv(a[-1]) + cv(b[-1])) / 2
+  e <- eigen(S, symmetric = TRUE); keep <- e$values > 1e-12
+  Si <- e$vectors[, keep, drop = FALSE] %*% diag(1 / e$values[keep], sum(keep)) %*% t(e$vectors[, keep, drop = FALSE])
+  if (!any(keep) || max(abs(x - S %*% Si %*% x)) > 1e-8) return(Inf)   # complete separation
+  sqrt(max(0, drop(t(x) %*% Si %*% x)))
+}
+rate <- function(s) case_when(is.na(s) ~ "Not assessable", abs(s) < 0.1 ~ "Similar",
+                              abs(s) < 0.2 ~ "Small difference", TRUE ~ "Meaningful difference")
+
+# One variable for one group: Flatiron counts vs SEER n or pct, over the
+# categories SEER reports.
+compare <- function(fi, se, variable, group) {
+  d <- left_join(fi, se, by = "label")
+  r <- !is.na(d$n) | !is.na(d$pct)
+  x <- if (all(!is.na(d$n[r]))) d$n else if (all(!is.na(d$pct[r]))) d$pct else
+    stop("SEER ", variable, " / ", group, ": give n for every category or pct for every category.", call. = FALSE)
+  ok <- sum(r) >= 2 && sum(d$fi_n[r]) > 0 && sum(x[r]) > 0
+  d <- d %>% mutate(flatiron_pct = ifelse(r & ok, 100 * fi_n / sum(fi_n[r]), NA),
+                    seer_pct = ifelse(r & ok, 100 * x / sum(x[r]), NA),
+                    smd = smd_prop(flatiron_pct / 100, seer_pct / 100))
+  s <- if (ok) smd_multi(d$flatiron_pct[r] / 100, d$seer_pct[r] / 100) else NA
+  i <- which.max(abs(d$flatiron_pct - d$seer_pct))
+  list(rows = tibble(Group = group, Variable = variable, Category = d$label, `Flatiron n` = d$fi_n,
+                     `Flatiron %` = round(d$flatiron_pct, 1), `SEER %` = round(d$seer_pct, 1),
+                     `Difference (pct points)` = round(d$flatiron_pct - d$seer_pct, 1),
+                     SMD = round(d$smd, 3), Rating = ifelse(r, rate(d$smd), "No SEER value (left out)")),
+       var = tibble(Group = group, Variable = variable, SMD = round(s, 3),
+                    Rating = if (ok) rate(s) else "Not assessable (fewer than 2 SEER categories)",
+                    `Largest difference` = if (length(i)) d$label[i] else NA,
+                    `Flatiron % in categories SEER does not report` =
+                      round(100 * sum(d$fi_n[!r]) / max(sum(d$fi_n), 1), 1)))
+}
+
+fi <- filter(long, !is_header, !is.na(n_num)) %>%
+  mutate(group = if (merge_ns) replace(group, group == no_surgery_group, seer_no_surgery_group) else group) %>%
+  group_by(section, label, group) %>% summarise(fi_n = sum(n_num), .groups = "drop")
+inc <- long$section[1]
+res <- list()
+if ("Overall" %in% seer$group)                                         # surgery split (share of cohort)
+  res[[1]] <- compare(fi %>% filter(section == inc, group != "Overall") %>% transmute(label = group, fi_n),
+                      seer %>% filter(section == inc, group != "Overall") %>% transmute(label = group, n, pct),
+                      "Surgery group (share of cohort)", "Overall")
+for (g in intersect(cmp_groups, seer$group))
+  for (v in setdiff(unique(fi$section), inc))
+    res[[length(res) + 1]] <- compare(fi %>% filter(section == v, group == g) %>% select(label, fi_n),
+                                      seer %>% filter(section == v, group == g) %>% select(label, n, pct), v, g)
+age <- seer %>% filter(label == "Mean (sd)", !is.na(mean)) %>%
+  inner_join(tibble(group = cmp_groups, m = sapply(cmp_data[cmp_groups], function(d) mean(d$age, na.rm = TRUE)),
+                    s = sapply(cmp_data[cmp_groups], function(d) sd(d$age, na.rm = TRUE))), by = "group") %>%
+  transmute(Group = group, Variable = "Age at diagnosis (years)", SMD = round((m - mean) / sqrt((s^2 + sd^2) / 2), 3),
+            Rating = rate(SMD), `Largest difference` = sprintf("Mean %.1f vs %.1f", m, mean))
+
+seer_rows <- bind_rows(lapply(res, `[[`, "rows"))
+seer_vars <- bind_rows(bind_rows(lapply(res, `[[`, "var")), age) %>% arrange(match(Group, groups))
+print(as.data.frame(seer_vars[1:4]), row.names = FALSE)
+
+seer_rows$SMD[!is.finite(seer_rows$SMD)] <- NA                         # Excel cannot show Inf / NaN
+seer_vars$SMD[!is.finite(seer_vars$SMD)] <- NA
+addWorksheet(wb, "SEER comparison");    writeData(wb, "SEER comparison", seer_rows)
+addWorksheet(wb, "Representativeness"); writeData(wb, "Representativeness", seer_vars)
+writeData(wb, "Representativeness", c(
+  "SMD: multi-category standardized difference (Yang & Dalton 2012); age: difference in means / pooled SD. A blank SMD rated Meaningful difference = complete separation.",
+  "Rating: |SMD| < 0.1 Similar; 0.1 to < 0.2 Small difference; >= 0.2 Meaningful difference.",
+  "Categories SEER does not report (blank n and pct) are left out on both sides; their Flatiron share is shown.",
+  if (merge_ns) paste0("Flatiron patients with no surgery record are compared within ", seer_no_surgery_group,
+                       " (SEER counts no primary-site surgery as Unresected); Table 1 shows them separately.")),
+  startRow = nrow(seer_vars) + 3)
+saveWorkbook(wb, xlsx_path, overwrite = TRUE)
+}
+########## END OF FILE: R/02_seer_compare.R ##########
+
+
+########## FILE: R/03_first_run_checks.R ##########
+# =============================================================================
+# 03_first_run_checks.R : one-off checks for the open questions (prints only)
+# =============================================================================
+# Run once after run_all.R, in the same R session:  source("R/03_first_run_checks.R")
+# Nothing is written; the outputs of run_all.R are unchanged.
+# =============================================================================
+options(width = 200)                           # print the wide tables on one line
+
+# 1. Surgery group by whether the patient has a primary-surgery record
+#    (patients without one go to no_surgery_group)
+with_record <- unique(fetch("surgery", surgerytype)$patientid)
+surg_rec <- table(`Surgery group` = ads$surg_group,
+                  `Primary-surgery record` = ifelse(ads$patientid %in% with_record, "Yes", "No"))
+message("\n1. Surgery group by primary-surgery record:"); print(surg_rec)
+
+# 2. Stage edition: HPV-positive oropharynx at stage IVA/IVB exists only in
+#    AJCC 7th edition (the 8th has no IVA/IVB for HPV-positive oropharynx).
+opc <- ads %>% inner_join(fetch("cohort", primarysite), by = "patientid") %>%
+  filter(norm(primarysite) == "oropharynx")
+message("\n2. Oropharynx: HPVStatus x GroupStage")
+print(table(HPV = opc$hpvstatus, GroupStage = opc$groupstage, useNA = "ifany"))
+
+# 3. Study population by primary-site codes, against Flatiron's PrimarySite
+site_pat <- dx_codes %>% group_by(patientid) %>%
+  summarise(incl = any(!is.na(incl_site)), other = any(!is.na(other_hn)), .groups = "drop")
+site_grp <- src("cohort") %>% select(patientid, primarysite) %>% collect() %>%
+  left_join(site_pat, by = "patientid") %>%
+  mutate(incl = coalesce(incl, FALSE), other = coalesce(other, FALSE),
+         population = case_when(incl & !other ~ "1 Included site only (kept)",
+                                incl & other & !is.null(excl_other_hn) ~ "2 Included + other H&N site (excluded)",
+                                incl ~ "2 Included + other H&N site (kept)",
+                                other ~ "3 Other H&N site only (excluded)",
+                                TRUE ~ "4 No H&N site code (excluded)"))
+message("\n3a. Study population by site codes (rows: Flatiron PrimarySite):")
+print(table(PrimarySite = site_grp$primarysite, site_grp$population, useNA = "ifany"))
+message("3b. Patients in the study population by included site (a patient can have several):")
+print(as.data.frame(count(distinct(filter(dx_codes, patientid %in% ids, !is.na(incl_site)), patientid, incl_site),
+                          incl_site, name = "patients")), row.names = FALSE)
+message("3c. Codes for other head and neck sites (patients):")
+excl_codes <- count(distinct(filter(dx_codes, !is.na(other_hn)), patientid, other_hn,
+                             code = toupper(trimws(diagnosiscode))), other_hn, code, name = "patients")
+print(as.data.frame(excl_codes), row.names = FALSE)
+
+# 4. Radiation courses against Table 1's first-course window, placed exactly as
+#    01 does (a month/year-only start date must lie wholly inside the window)
+rt_chk <- fetch("radiation", rtstartdate, rtstartdategranularity, rtsite) %>%
+  inner_join(fc_end, by = "patientid") %>%
+  mutate(start = as.Date(rtstartdate), g = toupper(coalesce(trimws(rtstartdategranularity), "DAY")),
+         lo = case_when(g == "YEAR" ~ floor_date(start, "year"), g == "MONTH" ~ floor_date(start, "month"),
+                        TRUE ~ start),
+         hi = case_when(g == "YEAR" ~ ceiling_date(start, "year", change_on_boundary = TRUE) - 1,
+                        g == "MONTH" ~ ceiling_date(start, "month", change_on_boundary = TRUE) - 1,
+                        TRUE ~ start),
+         win_lo = dx_date - rt_lookback_days,
+         site_ok = norm(coalesce(rtsite, "Unknown/not documented")) %in% rt_sites,
+         position = case_when(!site_ok ~ "Distant site (not counted)",
+                              is.na(start) ~ "No start date",
+                              is.na(dx_date) ~ "No diagnosis date",
+                              hi < win_lo ~ sprintf("More than %d days before diagnosis", rt_lookback_days),
+                              !is.na(fc_end) & lo >= fc_end ~ "After end of first course",
+                              lo < win_lo | (!is.na(fc_end) & hi >= fc_end) ~
+                                "Month/year date crosses a window edge (not counted)",
+                              TRUE ~ "Inside window"))                # = counted in Table 1
+message("\n4. Radiation courses by position:")
+print(as.data.frame(count(rt_chk, position, name = "courses")), row.names = FALSE)
+rt_pat <- rt_chk %>% group_by(patientid) %>%
+  summarise(site_ok = any(site_ok), inside = any(position == "Inside window"))
+message("Patients with primary/unknown-site RT but none inside the window (counted No): ",
+        sum(rt_pat$site_ok & !rt_pat$inside))
+message("Patients with a course inside the window: ", sum(rt_pat$inside),
+        " (Table 1 radiation Yes: ", sum(ads$radiation == "Yes"), ")")
+
+# 5. Type of Reporting Source: baseline period (Table 1) against any time, and
+#    when patients' first Flatiron visit falls relative to diagnosis
+type_of <- function(acad, comm) case_when(acad & comm ~ "Both Academic and Community", acad ~ "Academic",
+                                          comm ~ "Community", TRUE ~ "Unknown")
+ever <- fetch("practice", practicetype) %>% group_by(patientid) %>%
+  summarise(any_time = type_of(any(norm(practicetype) %in% "academic"), any(norm(practicetype) %in% "community")))
+rep_chk <- table(`Baseline period (Table 1)` = ads$reporting,
+                 `Any time` = coalesce(ever$any_time[match(ads$patientid, ever$patientid)], "Unknown"))
+message(sprintf("\n5. Type of Reporting Source, baseline period (%+d to %+d days) vs any time:",
+                baseline_days[1], baseline_days[2]))
+print(rep_chk)
+first_visit <- visits %>% group_by(patientid) %>% summarise(day = suppressWarnings(min(day, na.rm = TRUE))) %>%
+  filter(is.finite(day))
+message("First Flatiron visit, days from diagnosis (patients with a dated visit and diagnosis date: ",
+        nrow(first_visit), "; no visit at all: ", sum(!ads$patientid %in% visits$patientid), "):")
+print(quantile(first_visit$day, c(0, .1, .25, .5, .75, .9, 1)))
+message("Visits with no matching Practice row (practice type unknown): ", sum(is.na(visits$practicetype)))
+########## END OF FILE: R/03_first_run_checks.R ##########
+
+
+########## FILE: inputs/seer_table2_laHNSCC.csv ##########
+"section","label","group","n","pct","mean","sd"
+"Incidence of Head and Neck Squamous Cell Carcinoma","Overall","Overall",36402,,,
+"Sex","Male","Overall",27169,,,
+"Sex","Female","Overall",9233,,,
+"Sex","Unknown","Overall",,,,
+"Age at diagnosis (years)","Mean (sd)","Overall",,,64.8,11.2
+"Age at diagnosis (categorical)","<18 years","Overall",2,,,
+"Age at diagnosis (categorical)","18-39 years","Overall",608,,,
+"Age at diagnosis (categorical)","40-64 years","Overall",17438,,,
+"Age at diagnosis (categorical)","65-74 years","Overall",11370,,,
+"Age at diagnosis (categorical)","75+ years","Overall",6984,,,
+"Race/Ethnicity","Non-Hispanic White","Overall",26381,,,
+"Race/Ethnicity","Non-Hispanic Black","Overall",3441,,,
+"Race/Ethnicity","Non-Hispanic American Indian/Alaska Native","Overall",245,,,
+"Race/Ethnicity","Non-Hispanic Asian or Pacific Islander","Overall",2141,,,
+"Race/Ethnicity","Hispanic (All Races)","Overall",4194,,,
+"Race/Ethnicity","Other/Unknown","Overall",,,,
+"Year of Diagnosis","2019","Overall",7549,,,
+"Year of Diagnosis","2020","Overall",7260,,,
+"Year of Diagnosis","2021","Overall",7558,,,
+"Year of Diagnosis","2022","Overall",7859,,,
+"Year of Diagnosis","2023","Overall",6176,,,
+"Year of Diagnosis","2024","Overall",,,,
+"Year of Diagnosis","2025","Overall",,,,
+"Stage at diagnosis","0","Overall",0,,,
+"Stage at diagnosis","I","Overall",5931,,,
+"Stage at diagnosis","II","Overall",2890,,,
+"Stage at diagnosis","III","Overall",7999,,,
+"Stage at diagnosis","IV","Overall",18507,,,
+"Stage at diagnosis","Unknown","Overall",1075,,,
+"HPV status","Positive","Overall",,,,
+"HPV status","Negative","Overall",,,,
+"HPV status","Other/Unknown","Overall",,,,
+"Receipt of chemotherapy (1L)","Yes","Overall",,,,
+"Receipt of chemotherapy (1L)","No/Unknown","Overall",,,,
+"Receipt of radiation (1L)","Yes","Overall",,,,
+"Receipt of radiation (1L)","No/Unknown","Overall",,,,
+"Type of Reporting Source","Academic","Overall",,,,
+"Type of Reporting Source","Community","Overall",,,,
+"Type of Reporting Source","Both Academic and Community","Overall",,,,
+"Type of Reporting Source","Unknown","Overall",,,,
+"Incidence of Head and Neck Squamous Cell Carcinoma","Overall","Unresected",19946,,,
+"Sex","Male","Unresected",15894,,,
+"Sex","Female","Unresected",4052,,,
+"Sex","Unknown","Unresected",,,,
+"Age at diagnosis (years)","Mean (sd)","Unresected",,,65.4,10.6
+"Age at diagnosis (categorical)","<18 years","Unresected",0,,,
+"Age at diagnosis (categorical)","18-39 years","Unresected",137,,,
+"Age at diagnosis (categorical)","40-64 years","Unresected",9583,,,
+"Age at diagnosis (categorical)","65-74 years","Unresected",6375,,,
+"Age at diagnosis (categorical)","75+ years","Unresected",3851,,,
+"Race/Ethnicity","Non-Hispanic White","Unresected",14816,,,
+"Race/Ethnicity","Non-Hispanic Black","Unresected",2092,,,
+"Race/Ethnicity","Non-Hispanic American Indian/Alaska Native","Unresected",140,,,
+"Race/Ethnicity","Non-Hispanic Asian or Pacific Islander","Unresected",770,,,
+"Race/Ethnicity","Hispanic (All Races)","Unresected",2128,,,
+"Race/Ethnicity","Other/Unknown","Unresected",,,,
+"Year of Diagnosis","2019","Unresected",4240,,,
+"Year of Diagnosis","2020","Unresected",4208,,,
+"Year of Diagnosis","2021","Unresected",4352,,,
+"Year of Diagnosis","2022","Unresected",4220,,,
+"Year of Diagnosis","2023","Unresected",2926,,,
+"Year of Diagnosis","2024","Unresected",,,,
+"Year of Diagnosis","2025","Unresected",,,,
+"Stage at diagnosis","0","Unresected",0,,,
+"Stage at diagnosis","I","Unresected",3749,,,
+"Stage at diagnosis","II","Unresected",2368,,,
+"Stage at diagnosis","III","Unresected",4395,,,
+"Stage at diagnosis","IV","Unresected",8551,,,
+"Stage at diagnosis","Unknown","Unresected",883,,,
+"HPV status","Positive","Unresected",,,,
+"HPV status","Negative","Unresected",,,,
+"HPV status","Other/Unknown","Unresected",,,,
+"Receipt of chemotherapy (1L)","Yes","Unresected",,,,
+"Receipt of chemotherapy (1L)","No/Unknown","Unresected",,,,
+"Receipt of radiation (1L)","Yes","Unresected",,,,
+"Receipt of radiation (1L)","No/Unknown","Unresected",,,,
+"Type of Reporting Source","Academic","Unresected",,,,
+"Type of Reporting Source","Community","Unresected",,,,
+"Type of Reporting Source","Both Academic and Community","Unresected",,,,
+"Type of Reporting Source","Unknown","Unresected",,,,
+"Incidence of Head and Neck Squamous Cell Carcinoma","Overall","Resected",16425,,,
+"Sex","Male","Resected",11255,,,
+"Sex","Female","Resected",5170,,,
+"Sex","Unknown","Resected",,,,
+"Age at diagnosis (years)","Mean (sd)","Resected",,,64.1,11.9
+"Age at diagnosis (categorical)","<18 years","Resected",2,,,
+"Age at diagnosis (categorical)","18-39 years","Resected",471,,,
+"Age at diagnosis (categorical)","40-64 years","Resected",7840,,,
+"Age at diagnosis (categorical)","65-74 years","Resected",4982,,,
+"Age at diagnosis (categorical)","75+ years","Resected",3130,,,
+"Race/Ethnicity","Non-Hispanic White","Resected",11544,,,
+"Race/Ethnicity","Non-Hispanic Black","Resected",1344,,,
+"Race/Ethnicity","Non-Hispanic American Indian/Alaska Native","Resected",105,,,
+"Race/Ethnicity","Non-Hispanic Asian or Pacific Islander","Resected",1371,,,
+"Race/Ethnicity","Hispanic (All Races)","Resected",2061,,,
+"Race/Ethnicity","Other/Unknown","Resected",,,,
+"Year of Diagnosis","2019","Resected",3301,,,
+"Year of Diagnosis","2020","Resected",3049,,,
+"Year of Diagnosis","2021","Resected",3200,,,
+"Year of Diagnosis","2022","Resected",3635,,,
+"Year of Diagnosis","2023","Resected",3240,,,
+"Year of Diagnosis","2024","Resected",,,,
+"Year of Diagnosis","2025","Resected",,,,
+"Stage at diagnosis","0","Resected",0,,,
+"Stage at diagnosis","I","Resected",2178,,,
+"Stage at diagnosis","II","Resected",522,,,
+"Stage at diagnosis","III","Resected",3600,,,
+"Stage at diagnosis","IV","Resected",9937,,,
+"Stage at diagnosis","Unknown","Resected",188,,,
+"HPV status","Positive","Resected",,,,
+"HPV status","Negative","Resected",,,,
+"HPV status","Other/Unknown","Resected",,,,
+"Receipt of chemotherapy (1L)","Yes","Resected",,,,
+"Receipt of chemotherapy (1L)","No/Unknown","Resected",,,,
+"Receipt of radiation (1L)","Yes","Resected",,,,
+"Receipt of radiation (1L)","No/Unknown","Resected",,,,
+"Type of Reporting Source","Academic","Resected",,,,
+"Type of Reporting Source","Community","Resected",,,,
+"Type of Reporting Source","Both Academic and Community","Resected",,,,
+"Type of Reporting Source","Unknown","Resected",,,,
+"Incidence of Head and Neck Squamous Cell Carcinoma","Overall","Unknown",31,,,
+"Sex","Male","Unknown",20,,,
+"Sex","Female","Unknown",11,,,
+"Sex","Unknown","Unknown",,,,
+"Age at diagnosis (years)","Mean (sd)","Unknown",,,65,7.8
+"Age at diagnosis (categorical)","<18 years","Unknown",0,,,
+"Age at diagnosis (categorical)","18-39 years","Unknown",0,,,
+"Age at diagnosis (categorical)","40-64 years","Unknown",15,,,
+"Age at diagnosis (categorical)","65-74 years","Unknown",13,,,
+"Age at diagnosis (categorical)","75+ years","Unknown",3,,,
+"Race/Ethnicity","Non-Hispanic White","Unknown",21,,,
+"Race/Ethnicity","Non-Hispanic Black","Unknown",5,,,
+"Race/Ethnicity","Non-Hispanic American Indian/Alaska Native","Unknown",0,,,
+"Race/Ethnicity","Non-Hispanic Asian or Pacific Islander","Unknown",0,,,
+"Race/Ethnicity","Hispanic (All Races)","Unknown",5,,,
+"Race/Ethnicity","Other/Unknown","Unknown",,,,
+"Year of Diagnosis","2019","Unknown",8,,,
+"Year of Diagnosis","2020","Unknown",3,,,
+"Year of Diagnosis","2021","Unknown",6,,,
+"Year of Diagnosis","2022","Unknown",4,,,
+"Year of Diagnosis","2023","Unknown",10,,,
+"Year of Diagnosis","2024","Unknown",,,,
+"Year of Diagnosis","2025","Unknown",,,,
+"Stage at diagnosis","0","Unknown",0,,,
+"Stage at diagnosis","I","Unknown",4,,,
+"Stage at diagnosis","II","Unknown",0,,,
+"Stage at diagnosis","III","Unknown",4,,,
+"Stage at diagnosis","IV","Unknown",19,,,
+"Stage at diagnosis","Unknown","Unknown",4,,,
+"HPV status","Positive","Unknown",,,,
+"HPV status","Negative","Unknown",,,,
+"HPV status","Other/Unknown","Unknown",,,,
+"Receipt of chemotherapy (1L)","Yes","Unknown",,,,
+"Receipt of chemotherapy (1L)","No/Unknown","Unknown",,,,
+"Receipt of radiation (1L)","Yes","Unknown",,,,
+"Receipt of radiation (1L)","No/Unknown","Unknown",,,,
+"Type of Reporting Source","Academic","Unknown",,,,
+"Type of Reporting Source","Community","Unknown",,,,
+"Type of Reporting Source","Both Academic and Community","Unknown",,,,
+"Type of Reporting Source","Unknown","Unknown",,,,
+########## END OF FILE: inputs/seer_table2_laHNSCC.csv ##########
+
+
+########## FILE: tests/mock_run.R ##########
+# =============================================================================
+# Mock test: builds a fake LA-HNC schema in SQLite (dictionary table and field
+# names, renamed GSK-style) and runs the programs with checks. Fake data only.
+#   Rscript tests/mock_run.R      (from the lahnscc_rdq folder)
+# =============================================================================
+suppressPackageStartupMessages({ library(DBI); library(RSQLite); library(dplyr) })
+mock_dir <- tempfile("rdq_mock_"); dir.create(mock_dir)
+check <- function(ok, what) { if (!isTRUE(all(ok))) stop("CHECK FAILED: ", what, call. = FALSE); cat("  ok -", what, "\n") }
+expect_error <- function(expr, pattern, what) {
+  msg <- tryCatch({ force(expr); NA_character_ }, error = function(e) conditionMessage(e))
+  check(!is.na(msg) && grepl(pattern, msg), paste0(what, " (", msg, ")"))
+}
+
+base_fix <- function(id) list(id = id, dx = "2020-06-15", adv = NA, birthyear = 1960,
+                              birthsex = "M", race = "White", eth = "Not Hispanic or Latino",
+                              hpv = "HPV negative", stage = "III",
+                              dx_codes = list(c("C01", "ICD-10-CM")),
+                              surg = character(), drugs = list(), rt = list(),
+                              localrec = NA, metrec = NA,
+                              visits = list(c("COMMUNITY", "0")))   # practice type, visit day from diagnosis
+fx <- function(id, ...) { f <- base_fix(id); a <- list(...); f[names(a)] <- a; f }
+fixtures <- list(
+  fx("F01", surg = c("Lymph node dissection only", "Unknown/not specified")),
+  fx("F02", surg = c("Lymph node dissection only", "Primary tumor resection only")),
+  fx("F03", surg = "Endoscopic mucosal resection"),
+  base_fix("F04"),
+  fx("F05", drugs = list(c("ADVANCED", "cisplatin"), c("CONCURRENT", "pembrolizumab"))),
+  fx("F06", drugs = list(c("NEOADJUVANT", "cetuximab"))),
+  fx("F07", drugs = list(c("RADIATION THERAPY", "cisplatin"))),
+  fx("F08", drugs = list(c("CONCURRENT", "ondansetron"))),
+  fx("F09", rt = list(c("2020-05-15", "Day", "Primary site (Includes regional lymph node involvement)"))),
+  fx("F10", rt = list(c("2020-05-17", "Day", "Primary site (Includes regional lymph node involvement)"))),
+  fx("F11", adv = "2021-01-10", rt = list(c("2021-01-10", "Day", "Primary site (Includes regional lymph node involvement)"))),
+  fx("F12", adv = "2021-01-10", rt = list(c("2021-01-09", "Day", "Primary site (Includes regional lymph node involvement)"))),
+  fx("F13", rt = list(c("2020-07-25", "Day", NA))),
+  fx("F14", localrec = "2020-12-01", rt = list(c("2021-01-05", "Day", "Primary site (Includes regional lymph node involvement)"))),
+  fx("F15", rt = list(c("2020-01-01", "Year", "Primary site (Includes regional lymph node involvement)"))),
+  fx("F16", dx_codes = list(c("C01", "ICD-10-CM"), c("C11.9", NA))),
+  fx("F17", dx_codes = list(c("148.1", "ICD-9-CM"))),
+  fx("F18", dx_codes = list(c("148.0", "ICD-9-CM"))),
+  fx("F19", hpv = " hpv positive "),
+  fx("F20", birthsex = NA),
+  fx("F21", rt = list(c("2020-07-25", "Day", "Distant site"))),
+  fx("F22", rt = list(c("2020-06-01", "Month", "Primary site (Includes regional lymph node involvement)"))),
+  fx("F23", metrec = "2020-09-01", rt = list(c("2020-10-01", "Day", "Primary site (Includes regional lymph node involvement)"))),
+  fx("F24", drugs = list(c("CONCURRENT", "testimmuno"))),
+  fx("F25", dx_codes = list(c("C12", "ICD-10-CM"))),                                # pyriform sinus: now included
+  fx("F26", dx_codes = list(c("C07", "ICD-10-CM"))),                                # parotid only
+  fx("F27", dx_codes = list(c("C10.9", "ICD-10-CM"), c("C30.0", "ICD-10-CM"))),     # + nasal cavity
+  fx("F28", dx_codes = list(c(" c14.2", "ICD-10-CM"), c("C77.0", "ICD-10-CM"))),
+  fx("F29", dx_codes = list(c("C76.0", "ICD-10-CM"), c("C77.0", "ICD-10-CM"))),     # no included site
+  fx("F30", visits = list(c("ACADEMIC", "10"), c("COMMUNITY", "200"))),            # community after baseline
+  fx("F31", visits = list(c("ACADEMIC", "-91"), c("COMMUNITY", "31"))),            # both just outside
+  fx("F32", visits = list(c("ACADEMIC", "-90"), c("COMMUNITY", "30"))),            # both on the edges
+  fx("F33", visits = list(c("ACADEMIC", NA))),                                      # practice, no visit
+  fx("F34", dx_codes = list(c("C109", "ICD-10-CM")))                                # no dot
+)
+expected <- tibble::tribble(
+  ~patientid, ~surg_group,  ~chemo_seer, ~chemo_cyto, ~chemo_any, ~rt_within, ~rt_overlap, ~excluded, ~hpv,       ~sex,      ~reporting,
+  "F01",      "Unknown",    "No/Unknown","No/Unknown","No/Unknown","No/Unknown","No/Unknown", FALSE,   "Negative", "Male",    "Community",
+  "F02",      "Resected",   "No/Unknown","No/Unknown","No/Unknown","No/Unknown","No/Unknown", FALSE,   "Negative", "Male",    "Community",
+  "F03",      "Resected",   "No/Unknown","No/Unknown","No/Unknown","No/Unknown","No/Unknown", FALSE,   "Negative", "Male",    "Community",
+  "F04",      "Unresected", "No/Unknown","No/Unknown","No/Unknown","No/Unknown","No/Unknown", FALSE,   "Negative", "Male",    "Community",
+  "F05",      "Unresected", "No/Unknown","No/Unknown","Yes",       "No/Unknown","No/Unknown", FALSE,   "Negative", "Male",    "Community",
+  "F06",      "Unresected", "Yes",       "No/Unknown","Yes",       "No/Unknown","No/Unknown", FALSE,   "Negative", "Male",    "Community",
+  "F07",      "Unresected", "Yes",       "Yes",       "Yes",       "No/Unknown","No/Unknown", FALSE,   "Negative", "Male",    "Community",
+  "F08",      "Unresected", "No/Unknown","No/Unknown","No/Unknown","No/Unknown","No/Unknown", FALSE,   "Negative", "Male",    "Community",
+  "F09",      "Unresected", "No/Unknown","No/Unknown","No/Unknown","No/Unknown","No/Unknown", FALSE,   "Negative", "Male",    "Community",
+  "F10",      "Unresected", "No/Unknown","No/Unknown","No/Unknown","Yes",       "Yes",        FALSE,   "Negative", "Male",    "Community",
+  "F11",      "Unresected", "No/Unknown","No/Unknown","No/Unknown","No/Unknown","No/Unknown", FALSE,   "Negative", "Male",    "Community",
+  "F12",      "Unresected", "No/Unknown","No/Unknown","No/Unknown","Yes",       "Yes",        FALSE,   "Negative", "Male",    "Community",
+  "F13",      "Unresected", "No/Unknown","No/Unknown","No/Unknown","Yes",       "Yes",        FALSE,   "Negative", "Male",    "Community",
+  "F14",      "Unresected", "No/Unknown","No/Unknown","No/Unknown","No/Unknown","No/Unknown", FALSE,   "Negative", "Male",    "Community",
+  "F15",      "Unresected", "No/Unknown","No/Unknown","No/Unknown","No/Unknown","Yes",        FALSE,   "Negative", "Male",    "Community",
+  "F16",      NA,           NA,          NA,          NA,          NA,          NA,           TRUE,    NA,         NA,        NA,
+  "F17",      "Unresected", "No/Unknown","No/Unknown","No/Unknown","No/Unknown","No/Unknown", FALSE,   "Negative", "Male",    "Community",
+  "F18",      "Unresected", "No/Unknown","No/Unknown","No/Unknown","No/Unknown","No/Unknown", FALSE,   "Negative", "Male",    "Community",
+  "F19",      "Unresected", "No/Unknown","No/Unknown","No/Unknown","No/Unknown","No/Unknown", FALSE,   "Positive", "Male",    "Community",
+  "F20",      "Unresected", "No/Unknown","No/Unknown","No/Unknown","No/Unknown","No/Unknown", FALSE,   "Negative", "Unknown", "Community",
+  "F21",      "Unresected", "No/Unknown","No/Unknown","No/Unknown","No/Unknown","No/Unknown", FALSE,   "Negative", "Male",    "Community",
+  "F22",      "Unresected", "No/Unknown","No/Unknown","No/Unknown","Yes",       "Yes",        FALSE,   "Negative", "Male",    "Community",
+  "F23",      "Unresected", "No/Unknown","No/Unknown","No/Unknown","No/Unknown","No/Unknown", FALSE,   "Negative", "Male",    "Community",
+  "F24",      "Unresected", "No/Unknown","No/Unknown","Yes",       "No/Unknown","No/Unknown", FALSE,   "Negative", "Male",    "Community",
+  "F25",      "Unresected", "No/Unknown","No/Unknown","No/Unknown","No/Unknown","No/Unknown", FALSE,   "Negative", "Male",    "Community",
+  "F26",      NA,           NA,          NA,          NA,          NA,          NA,           TRUE,    NA,         NA,        NA,
+  "F27",      NA,           NA,          NA,          NA,          NA,          NA,           TRUE,    NA,         NA,        NA,
+  "F28",      "Unresected", "No/Unknown","No/Unknown","No/Unknown","No/Unknown","No/Unknown", FALSE,   "Negative", "Male",    "Community",
+  "F29",      NA,           NA,          NA,          NA,          NA,          NA,           TRUE,    NA,         NA,        NA,
+  "F30",      "Unresected", "No/Unknown","No/Unknown","No/Unknown","No/Unknown","No/Unknown", FALSE,   "Negative", "Male",    "Academic",
+  "F31",      "Unresected", "No/Unknown","No/Unknown","No/Unknown","No/Unknown","No/Unknown", FALSE,   "Negative", "Male",    "Unknown",
+  "F32",      "Unresected", "No/Unknown","No/Unknown","No/Unknown","No/Unknown","No/Unknown", FALSE,   "Negative", "Male",    "Both Academic and Community",
+  "F33",      "Unresected", "No/Unknown","No/Unknown","No/Unknown","No/Unknown","No/Unknown", FALSE,   "Negative", "Male",    "Unknown",
+  "F34",      "Unresected", "No/Unknown","No/Unknown","No/Unknown","No/Unknown","No/Unknown", FALSE,   "Negative", "Male",    "Community"
+)
+
+drug_class <- c(cisplatin = "chemotherapy", carboplatin = "chemotherapy", docetaxel = "chemotherapy",
+                cetuximab = "targeted therapy", pembrolizumab = "immunotherapy",
+                ondansetron = "antiemetic", testimmuno = "immunotherapy")
+# testimmuno: DrugCategory says chemotherapy, DetailedDrugCategory immunotherapy -
+# chemotherapy is read from DetailedDrugCategory only, so it must not count
+drug_cat <- function(d) ifelse(d == "ondansetron", "antiemetic",
+                               ifelse(d == "testimmuno", "chemotherapy", "antineoplastic"))
+
+build_mock <- function(n = 400, seed = 20261104) {
+  set.seed(seed)
+  con <- dbConnect(SQLite(), ":memory:")
+  invisible(dbExecute(con, "ATTACH ':memory:' AS clnprw_flatiron_la_hnc_use"))
+  put <- function(name, df) dbWriteTable(con, Id(schema = "clnprw_flatiron_la_hnc_use",
+                                                table = paste0(name, "_2026m07")), df)
+  ids <- sprintf("P%04d", 1:n)
+  dx  <- as.Date("2018-06-01") + sample(0:(365 * 5), n, TRUE)
+  adv <- ifelse(runif(n) < .3, as.character(dx + sample(200:900, n, TRUE)), NA)
+
+  coh <- data.frame(
+    PatientID = ids, DiagnosisDate = as.character(dx), AdvancedDiagnosisDate = adv,
+    AdvancedDiagnosisCriteria = ifelse(is.na(adv), NA, "Distant recurrence"),
+    GroupStage  = sample(c("III", "IV", "IVA", "IVB", "Unknown/not documented"), n, TRUE),
+    PrimarySite = sample(c("Oral cavity", "Oropharynx", "Hypopharynx", "Larynx", "Pharynx NOS",
+                           "Tongue NOS", "Unknown primary Head & Neck cancer"), n, TRUE),
+    SmokingStatus = sample(c("History of smoking", "No history of smoking"), n, TRUE),
+    HPVTested = sample(c("Yes", "No/unknown"), n, TRUE),
+    HPVStatus = sample(c("HPV positive", "HPV negative", "HPV equivocal", "Results pending", NA), n, TRUE))
+  dxr <- data.frame(PatientID = ids,
+    DiagnosisCode = sample(c("C01", "C10.9", "C32.1", "C11.9", "C12", "146.0", "147.1", "C07", "C30.0", "C77.0"),
+                           n, TRUE, prob = c(.3, .25, .2, .04, .05, .05, .03, .03, .03, .02))) %>%
+    mutate(DiagnosisCodeSystem = ifelse(grepl("^C", DiagnosisCode), "ICD-10-CM", "ICD-9-CM"))
+  demo <- data.frame(PatientID = ids,
+    BirthSex = sample(c("M", "F", NA), n, TRUE, prob = c(.74, .25, .01)),
+    BirthYear = sample(c(1935:2004, NA), n, TRUE),
+    Race = sample(c("White", "Black or African American", "Asian", "Other Race",
+                    "Hispanic or Latino", NA), n, TRUE, prob = c(.6, .1, .05, .1, .05, .1)),
+    Ethnicity = sample(c("Not Hispanic or Latino", "Hispanic or Latino", NA), n, TRUE))
+  prac <- data.frame(PatientID = sample(ids, n * 1.3, TRUE),
+    PracticeType = sample(c("COMMUNITY", "ACADEMIC"), n * 1.3, TRUE, prob = c(.8, .2))) %>%
+    mutate(PracticeID = sprintf("%s%d", substr(PracticeType, 1, 2), seq_along(PatientID) %% 5 + 1))
+
+  s_ids <- sample(ids, n * .8)
+  s_types <- c("Primary tumor resection only", "Primary tumor resection and lymph node dissection",
+               "Lymph node dissection only", "Unknown/not specified", "Endoscopic mucosal resection")
+  surg <- data.frame(PatientID = c(s_ids, sample(s_ids, 40)),
+    SurgeryType = sample(s_types, length(s_ids) + 40, TRUE, prob = c(.3, .3, .2, .15, .05)))
+  surg$SurgeryDate <- as.character(dx[match(surg$PatientID, ids)] + 30)
+
+  d_ids <- sample(ids, n * .7); nd <- length(d_ids)
+  drugs <- data.frame(PatientID = d_ids,
+    LineSetting = sample(c("CONCURRENT", "ADJUVANT", "INDUCTION CHEMO", "NEOADJUVANT", "EARLY",
+                           "RADIATION THERAPY", "ADVANCED", "LOCOREGIONAL"), nd, TRUE),
+    DrugName = sample(c("cisplatin", "carboplatin", "cetuximab", "pembrolizumab", "ondansetron"),
+                      nd, TRUE),
+    EpisodeDate = as.character(dx[match(d_ids, ids)] + 60))
+
+  r_ids <- sample(ids, n * .7)
+  rt <- data.frame(PatientID = r_ids,
+    RTStartDate = as.character(dx[match(r_ids, ids)] + sample(-60:400, length(r_ids), TRUE)),
+    RTStartDateGranularity = sample(c("Day", "Month", "Year"), length(r_ids), TRUE, prob = c(.9, .05, .05)),
+    RTSite = sample(c("Primary site (Includes regional lymph node involvement)",
+                      "Distant lymph nodes", "Distant site", NA), length(r_ids), TRUE,
+                    prob = c(.7, .1, .1, .1)))
+  lr_ids <- sample(ids, n * .1)
+  lrec <- data.frame(PatientID = lr_ids, LocalRecurSite = "Local site",
+                     LocalRecurDate = as.character(dx[match(lr_ids, ids)] + sample(150:700, length(lr_ids), TRUE)))
+  m_ids <- sample(ids, n * .05)
+  mrec <- data.frame(PatientID = m_ids,
+                     DistantMetDate = as.character(dx[match(m_ids, ids)] + sample(150:700, length(m_ids), TRUE)))
+  prac <- distinct(prac)                                  # 0-3 visits per patient-practice, -200 to +400 days
+  visit <- prac[rep(seq_len(nrow(prac)), sample(0:3, nrow(prac), TRUE)), c("PatientID", "PracticeID")]
+  visit$VisitDate <- as.character(dx[match(visit$PatientID, ids)] + sample(-200:400, nrow(visit), TRUE))
+
+  # ---- fixtures ----
+  for (f in fixtures) {
+    coh <- rbind(coh, data.frame(PatientID = f$id, DiagnosisDate = f$dx, AdvancedDiagnosisDate = f$adv,
+      AdvancedDiagnosisCriteria = NA, GroupStage = f$stage, PrimarySite = "Larynx",
+      SmokingStatus = "History of smoking", HPVTested = "Yes", HPVStatus = f$hpv))
+    for (dc in f$dx_codes) dxr <- rbind(dxr, data.frame(PatientID = f$id, DiagnosisCode = dc[1],
+                                                       DiagnosisCodeSystem = dc[2]))
+    demo <- rbind(demo, data.frame(PatientID = f$id, BirthSex = f$birthsex, BirthYear = f$birthyear,
+                                   Race = f$race, Ethnicity = f$eth))
+    for (v in f$visits) {
+      prac <- rbind(prac, data.frame(PatientID = f$id, PracticeType = v[1], PracticeID = paste0("FX_", v[1])))
+      if (!is.na(v[2])) visit <- rbind(visit, data.frame(PatientID = f$id, PracticeID = paste0("FX_", v[1]),
+                                                         VisitDate = as.character(as.Date(f$dx) + as.numeric(v[2]))))
+    }
+    for (s in f$surg) surg <- rbind(surg, data.frame(PatientID = f$id, SurgeryType = s, SurgeryDate = f$dx))
+    for (d in f$drugs) drugs <- rbind(drugs, data.frame(PatientID = f$id, LineSetting = d[1],
+                                                        DrugName = d[2], EpisodeDate = f$dx))
+    for (r in f$rt) rt <- rbind(rt, data.frame(PatientID = f$id, RTStartDate = r[1],
+                                               RTStartDateGranularity = r[2], RTSite = r[3]))
+    if (!is.na(f$localrec)) lrec <- rbind(lrec, data.frame(PatientID = f$id, LocalRecurSite = "Local site",
+                                                           LocalRecurDate = f$localrec))
+    if (!is.na(f$metrec)) mrec <- rbind(mrec, data.frame(PatientID = f$id, DistantMetDate = f$metrec))
+  }
+  drugs <- drugs %>% mutate(DrugCategory = drug_cat(DrugName),
+                            DetailedDrugCategory = unname(drug_class[DrugName]),
+                            EnhancedCohort = "LAHNC")
+
+  put("t_enh_lahnc", coh)
+  put("t_diagnosis", dxr)
+  put("t_demographics", demo)
+  put("t_practice", distinct(prac))
+  put("t_visit", mutate(visit, VisitType = "Treatment"))
+  put("t_enh_lahnc_primarysurgery", surg)
+  put("t_enh_lahnc_drg_epsode", drugs)            # prostate-style GSK rename
+  put("t_enh_lahnc_radiationtherapy", rt)
+  put("t_enh_lahnc_localrecurrence", lrec)
+  put("t_enh_lahnc_metrecurrence", mrec)
+  put("t_enh_lahnc_salvagesurgery", data.frame(PatientID = "P0001", SalvageSurgeryType = "Neck Dissection (ND)"))
+  con
+}
+
+# Run 00 (with the connection and table listing pointed at the mock), then
+# 01 and 02, with parameter overrides applied after 00.
+run <- function(con, overrides = list(), seer = file.path(mock_dir, "none.csv"), steps = c("01", "02")) {
+  s0 <- readLines("R/00_setup.R")
+  s0 <- sub("^con <- connect\\(\\)$", "con <- mock_con", s0)
+  s0 <- sub("^invisible\\(dbExecute\\(con, paste\\(\"USE CATALOG\", catalog\\)\\)\\)$", "", s0)
+  s0 <- sub("^schema_tables <- .*$", paste0("schema_tables <- DBI::dbGetQuery(con, \"SELECT name FROM ",
+            "clnprw_flatiron_la_hnc_use.sqlite_master WHERE type = 'table'\")$name"), s0)
+  stopifnot(sum(grepl("mock_con|sqlite_master", s0)) == 2)
+  assign("mock_con", con, envir = globalenv())
+  warns <- character()
+  withCallingHandlers({
+    capture.output(suppressMessages({
+      eval(parse(text = s0), envir = globalenv())
+      assign("out_dir", file.path(mock_dir, "out"), envir = globalenv())
+      assign("out_stem", "MOCK", envir = globalenv())
+      assign("seer_file", seer, envir = globalenv())
+      for (nm in names(overrides)) assign(nm, overrides[[nm]], envir = globalenv())
+      for (st in steps) sys.source(list.files("R", paste0("^", st, "_"), full.names = TRUE), envir = globalenv())
+    }))
+  }, warning = function(w) { warns <<- c(warns, conditionMessage(w)); invokeRestart("muffleWarning") })
+  invisible(warns)
+}
+S_ <- function(t) paste0("clnprw_flatiron_la_hnc_use.", t, "_2026m07")
+
+# =============================================================================
+cat("\n[1] Main run\n")
+con <- build_mock()
+w <- run(con)
+check(all(file.exists(file.path(out_dir, paste0("MOCK", c(".xlsx", "_table1_long.csv", "_ads.rds"))))),
+      "outputs written")
+check(identical(unname(tbl_map[["drugep"]]), "t_enh_lahnc_drg_epsode_2026m07"), "GSK-style drg_epsode table found")
+tot <- long %>% filter(!is_header, !is.na(n_num), section != section[1]) %>% group_by(section, group) %>%
+  summarise(t = sum(n_num), .groups = "drop") %>% mutate(N = sapply(grp_data[group], nrow))
+check(all(tot$t == tot$N), "every block adds up to its group N")
+rows <- long %>% filter(!is_header, !is.na(n_num)) %>% group_by(section, label) %>%
+  summarise(ok = n_num[group == "Overall"] == sum(n_num[group != "Overall"]), .groups = "drop")
+check(all(rows$ok), "Overall = sum of the surgery groups on every row")
+check_fixtures <- function(label, chemo_col = "chemo_cyto", nosurg = "Unresected") {
+  e <- expected
+  check(!any(e$patientid[e$excluded] %in% ads$patientid) && all(e$patientid[!e$excluded] %in% ads$patientid),
+        paste(label, "- primary sites (C12 and ICD-9 148.x kept; C07-only, C76/C77-only, + C11 or C30 excluded)"))
+  e <- e[!e$excluded, ]
+  e$surg_group[e$surg_group == "Unresected"] <- nosurg
+  got <- ads[match(e$patientid, ads$patientid), ]
+  for (cc in list(c("surg_group", "surg_group"), c(chemo_col, "chemo"), c("rt_within", "radiation"),
+                  c("hpv", "hpv"), c("sex", "sex"), c("reporting", "reporting"))) {
+    bad <- e$patientid[as.character(got[[cc[2]]]) != e[[cc[1]]]]
+    check(!length(bad), paste0(label, " - fixtures ", cc[2], if (length(bad)) paste(":", paste(bad, collapse = ","))))
+  }
+}
+check_fixtures("main")
+check(identical(groups, c("Overall", "Unresected", "Resected", "Unknown")) &&
+        identical(unname(unlist(openxlsx::read.xlsx(xlsx_path, "Table 1", rows = 2, colNames = FALSE))),
+                  c("Baseline variable", groups)),
+      "Table 1 has the shell's four columns (no surgery record counted as Unresected)")
+raw_coh <- dbGetQuery(con, paste("select PatientID from", S_("t_enh_lahnc")))
+check(nrow(attrition) == 3 && attrition$n_patients[1] == nrow(raw_coh) && attrition$n_patients[3] == nrow(ads) &&
+        all(diff(attrition$n_patients) <= 0) && attrition$n_patients[2] > attrition$n_patients[3],
+      "attrition: all patients, included primary site, other head and neck site excluded")
+inc_codes <- c("C00.1", "C01", "C01.9", "C02.4", "C03.9", "C04.0", "C05.1", "C06.89", "C09.9", "C10.0", "C12", "C12.9",
+               "C13.1", "C14.0", "C14.2", "C14.8", "C32.0", "C32.9", " c10.9 ", "C109", "140.3", "141.0", "141.4", "143.1",
+               "144.9", "145.2", "145.0", "146.0", "146.5", "148.1", "149.0", "161.3")
+inc_site <- c("Lip", "Base of tongue", "Base of tongue", "Other tongue", "Gum", "Floor of mouth", "Palate", "Other mouth",
+              "Tonsil", "Oropharynx", "Hypopharynx", "Hypopharynx", "Hypopharynx",
+              rep("Other/ill-defined oral cavity & pharynx", 3), "Larynx", "Larynx", "Oropharynx", "Oropharynx", "Lip",
+              "Base of tongue", "Other tongue", "Gum", "Floor of mouth", "Palate", "Other mouth", "Tonsil", "Oropharynx",
+              "Hypopharynx", "Other/ill-defined oral cavity & pharynx", "Larynx")
+other_codes <- c("C07", "C08.0", "C11.9", "C30.0", "C31.9", "142.0", "147.1", "160.2")
+none_codes  <- c("C14.1", "C15.9", "C33", "C44.00", "C76.0", "C77.0", "Z85.810", "V10.01", "196.0", "014.0", "C1", NA)
+check(identical(site_of(inc_codes, incl_sites), inc_site) && !anyNA(site_of(other_codes, excl_other_hn)) &&
+        all(is.na(site_of(c(other_codes, none_codes), incl_sites))) &&
+        all(is.na(site_of(c(inc_codes, none_codes), excl_other_hn))),
+      "site codes: ICD-10-CM and ICD-9 mapped to the RDQ's sites (dots, spaces and case ignored)")
+t1x <- openxlsx::read.xlsx(xlsx_path, "Table 1", rows = 4:(3 + nrow(out)), cols = 1:2, colNames = FALSE,
+                           skipEmptyRows = FALSE)
+bl <- t1x[!is.na(t1x[[2]]), ]
+check(nrow(bl) == length(baseline_var) &&
+        identical(setNames(bl[[2]], bl[[1]])[c("Male", "Age at diagnosis (years)", "Race/Ethnicity", "HPV status",
+                                               "Receipt of chemotherapy (1L)", "Type of Reporting Source")],
+                  setNames(c("No", "Yes", "No", "No", "No", "Yes"),
+                           c("Male", "Age at diagnosis (years)", "Race/Ethnicity", "HPV status",
+                             "Receipt of chemotherapy (1L)", "Type of Reporting Source"))) &&
+        all(long$baseline[long$section != long$section[1]] %in% c("Yes", "No")) &&
+        "baseline" %in% names(read.csv(file.path(out_dir, "MOCK_table1_long.csv"))),
+      "Baseline variable identifier: once per variable in Table 1 (Sex on its first row), and in the long file")
+w <- run(con, steps = c("01", "03"))
+check(sum(surg_rec) == nrow(ads) && all(surg_rec[, "No"][names(surg_rec[, "No"]) != no_surgery_group] == 0) && nrow(opc) > 0 &&
+        nrow(site_grp) == attrition$n_patients[1] && sum(grepl("kept", site_grp$population)) == nrow(ads) &&
+        nrow(rt_chk) > 0 && sum(rep_chk) == nrow(ads), "first-run checks script runs")
+check(rep_chk["Academic", "Both Academic and Community"] >= 1 &&
+        ever$any_time[ever$patientid == "F30"] == "Both Academic and Community" &&
+        identical(site_grp$population[match(c("F16", "F26", "F29"), site_grp$patientid)],
+                  c("2 Included + other H&N site (excluded)", "3 Other H&N site only (excluded)",
+                    "4 No H&N site code (excluded)")),
+      "first-run checks: practice type baseline vs any time (F30), study population groups (F16, F26, F29)")
+check(setequal(rt_pat$patientid[rt_pat$inside], rt_ids) &&
+        setequal(rt_pat$patientid[rt_pat$site_ok & !rt_pat$inside], setdiff(rt_pat$patientid[rt_pat$site_ok], rt_ids)) &&
+        any(grepl("crosses a window edge", rt_chk$position)),
+      "radiation check: 'Inside window' and 'counted No' match Table 1 (month/year dates included)")
+con1 <- con; con6 <- build_mock()
+invisible(dbExecute(con6, paste("UPDATE", S_("t_enh_lahnc"), "SET DiagnosisDate = NULL WHERE PatientID = 'F10'")))
+w <- run(con6, steps = c("01", "03"))
+check(ads$radiation[ads$patientid == "F10"] == "No/Unknown" &&
+        all(rt_chk$position[rt_chk$patientid == "F10" & rt_chk$site_ok] == "No diagnosis date") &&
+        "F10" %in% rt_pat$patientid[rt_pat$site_ok & !rt_pat$inside],
+      "radiation check: no diagnosis date is not 'Inside window' and is counted No")
+con7 <- build_mock()
+xq7 <- function(sql) invisible(dbExecute(con7, sql))
+xq7(paste("INSERT INTO", S_("t_diagnosis"), "(PatientID, DiagnosisCode, DiagnosisCodeSystem) VALUES ('F16', 'C11.9', NULL)"))
+xq7(paste("UPDATE", S_("t_enh_lahnc_drg_epsode"), "SET DetailedDrugCategory = 'chemotherapy' WHERE PatientID = 'F06'"))
+w <- run(con7, steps = c("01", "03"))
+check(excl_codes$patients[excl_codes$code == "C11.9"] ==
+        n_distinct(dx_codes$patientid[toupper(dx_codes$diagnosiscode) == "C11.9"]) &&
+        sum(toupper(dx_codes$diagnosiscode) == "C11.9") > excl_codes$patients[excl_codes$code == "C11.9"],
+      "excluded codes are counted in patients, not diagnosis rows")
+check(ads$chemo[ads$patientid == "F06"] == "No/Unknown",
+      "cetuximab coded chemotherapy is not counted with count_cetuximab = FALSE")
+w <- run(con7, list(count_cetuximab = TRUE), steps = "01")
+check(ads$chemo[ads$patientid == "F06"] == "Yes", "... and is counted with count_cetuximab = TRUE")
+con <- con1                                  # run() sets con to the mock it was given
+w <- run(con, steps = c("01", "03"))
+raw <- dbGetQuery(con, paste("select * from", S_("t_enh_lahnc_drg_epsode")))
+fc <- unique(raw$PatientID[raw$DetailedDrugCategory == "chemotherapy" & raw$LineSetting %in% first_course_settings])
+check(all(ads$chemo[ads$patientid %in% fc] == "Yes"), "first-course DetailedDrugCategory chemotherapy -> chemo Yes")
+
+cat("\n[2] Table-name patterns\n")
+styles <- list(
+  c(cohort = "t_enh_lahnc", surgery = "t_enh_lahnc_primarysurgery", radiation = "t_enh_lahnc_radiationtherapy",
+    localrec = "t_enh_lahnc_localrecurrence", metrec = "t_enh_lahnc_metrecurrence", drugep = "t_drugepisode",
+    diagnosis = "t_diagnosis", demo = "t_demographics", practice = "t_practice", visit = "t_visit"),
+  c(cohort = "t_enh_lahnc", surgery = "t_enh_lahnc_prmry_srgry", radiation = "t_enh_lahnc_rad_thrpy",
+    localrec = "t_enh_lahnc_lcl_recur", metrec = "t_enh_lahnc_met_recur", drugep = "t_enh_lahnc_drg_epsode",
+    diagnosis = "t_diagnosis", demo = "t_demographics", practice = "t_practice", visit = "t_visit"),
+  c(cohort = "t_enh_la_hnc", surgery = "t_enh_la_hnc_primary_surgery", radiation = "t_enh_la_hnc_rt",
+    localrec = "t_enh_la_hnc_locoregional_recurrence", metrec = "t_enh_la_hnc_metastatic_recurrence",
+    drugep = "t_drug_episode", diagnosis = "t_diagnosis", demo = "t_demographics", practice = "t_practice",
+    visit = "t_visits"))
+others <- c("t_enh_lahnc_salvagesurgery", "t_enh_lahnc_biomarkers", "t_enh_lahnc_deepdiagnosis", "t_lineoftherapy",
+            "t_telemedicine", "t_lab", "t_medicationorder", "t_ecog", "t_mortality_v2", "t_enh_lahnc_cardiac_cci")
+for (st in styles) {
+  hit <- find_tables(paste0(c(st, others), "_2026m07"))
+  check(identical(unname(hit[names(st)]), paste0(unname(st), "_2026m07")),
+        paste("patterns find each table once:", st[["surgery"]], "/", st[["drugep"]]))
+}
+check(identical(unname(find_tables(paste0(c(styles[[1]], "t_enh_lahnc"), c(rep("_2026m07", length(styles[[1]])), "_2026m06")))[["cohort"]]),
+                "t_enh_lahnc_2026m07"), "only tables of the requested refresh are used")
+
+cat("\n[3] Parameters and stops\n")
+w <- run(con, list(count_cetuximab = TRUE));    check_fixtures("count_cetuximab TRUE", chemo_col = "chemo_seer")
+w <- run(con, list(no_surgery_group = "Unknown")); check_fixtures("no-surgery Unknown", nosurg = "Unknown")
+check(identical(groups, c("Overall", "Unresected", "Resected", "Unknown")), "... and Table 1 keeps its 4 shell columns")
+w <- run(con, list(no_surgery_group = "No surgery record")); check_fixtures("no-surgery own column", nosurg = "No surgery record")
+check(identical(groups, c("Overall", "Unresected", "Resected", "Unknown", "No surgery record")) &&
+        identical(unname(unlist(openxlsx::read.xlsx(xlsx_path, "Table 1", rows = 2, colNames = FALSE))),
+                  c("Baseline variable", groups)),
+      "... and no_surgery_group = 'No surgery record' gives them their own Table 1 column")
+w <- run(con, list(excl_other_hn = NULL))
+check(all(c("F16", "F27") %in% ads$patientid) && !any(c("F26", "F29") %in% ads$patientid) && nrow(attrition) == 2,
+      "excl_other_hn = NULL: an included-site code is enough (F16 with C11, F27 with C30 kept)")
+w <- run(con, list(baseline_days = c(-365, 365)))
+check(all(ads$reporting[match(c("F30", "F31", "F32", "F33"), ads$patientid)] ==
+            c(rep("Both Academic and Community", 3), "Unknown")), "baseline_days widens the practice-type window")
+con2 <- build_mock()
+invisible(dbExecute(con2, paste("ALTER TABLE", S_("t_enh_lahnc_localrecurrence"), "DROP COLUMN LocalRecurDate")))
+expect_error(run(con2), "localrecurdate", "a recurrence table without its date column stops the run")
+invisible(dbExecute(con2, paste("DROP TABLE", S_("t_enh_lahnc_localrecurrence"))))
+expect_error(run(con2), "localrec", "a missing recurrence table stops the run")
+con4 <- build_mock()
+invisible(dbExecute(con4, paste("INSERT INTO", S_("t_demographics"), "SELECT * FROM", S_("t_demographics"),
+                                "WHERE PatientID = 'F04'")))
+expect_error(run(con4), "more than one row", "a duplicate Demographics row stops the run")
+con5 <- build_mock()
+invisible(dbExecute(con5, paste("INSERT INTO", S_("t_enh_lahnc_drg_epsode"), "(PatientID, LineSetting, DrugName,",
+  "EpisodeDate, DrugCategory, DetailedDrugCategory, EnhancedCohort) VALUES ('F05', 'ADJUVANT', 'cisplatin',",
+  "'2020-08-01', 'antineoplastic', 'chemotherapy', 'OTHER_CANCER')")))
+expect_error(run(con5), "EnhancedCohort", "chemo lines from another disease setting stop the run")
+w <- run(con5, list(drug_cohorts = "LAHNC"))
+check(ads$chemo[ads$patientid == "F05"] == "No/Unknown" && nrow(ads) == n_distinct(ads$patientid),
+      "drug_cohorts = 'LAHNC' leaves out the other disease's chemo (F05 stays No/Unknown)")
+invisible(dbExecute(con5, paste("INSERT INTO", S_("t_enh_lahnc_drg_epsode"), "(PatientID, LineSetting, DrugName,",
+  "EpisodeDate, DrugCategory, DetailedDrugCategory, EnhancedCohort) VALUES ('F04', 'CONCURRENT', 'cisplatin',",
+  "'2020-07-01', 'antineoplastic', 'chemotherapy', 'LAHNC_ALT')")))
+w <- run(con5, list(drug_cohorts = c("LAHNC", "LAHNC_ALT")))
+check(ads$chemo[ads$patientid == "F04"] == "Yes" && ads$chemo[ads$patientid == "F05"] == "No/Unknown",
+      "several drug_cohorts values are all used (F04 Yes from LAHNC_ALT; F05 other cancer still left out)")
+
+cat("\n[4] Chemotherapy date check\n")
+con3 <- build_mock()
+q  <- function(s) dbGetQuery(con3, s); xq <- function(s) invisible(dbExecute(con3, s))
+cand <- q(paste0("select distinct c.PatientID, c.DiagnosisDate from ", S_("t_enh_lahnc"), " c join ", S_("t_diagnosis"),
+                 " d on c.PatientID = d.PatientID where d.DiagnosisCode in ('C01','C10.9','C32.1') and c.PatientID like 'P%'",
+                 " and c.PatientID not in (select PatientID from ", S_("t_diagnosis"), " where DiagnosisCode in ('C11.9','147.1','C07','C30.0'))",
+                 " and c.PatientID not in (select PatientID from ", S_("t_enh_lahnc_localrecurrence"), ")",
+                 " and c.PatientID not in (select PatientID from ", S_("t_enh_lahnc_metrecurrence"), ") order by c.PatientID limit 6"))
+cid <- setNames(cand$PatientID, paste0("C", 1:6)); cdx <- setNames(as.Date(cand$DiagnosisDate), names(cid))
+xq(paste0("delete from ", S_("t_enh_lahnc_drg_epsode"), " where PatientID like 'P%'"))
+xq(paste0("update ", S_("t_enh_lahnc"), " set AdvancedDiagnosisDate = NULL where PatientID in ('", paste(cid, collapse = "','"), "')"))
+ins <- function(p, setting, date) xq(sprintf(paste("insert into %s (PatientID, LineSetting, DrugName, EpisodeDate,",
+  "DrugCategory, DetailedDrugCategory, EnhancedCohort) values ('%s','%s','cisplatin',%s,'antineoplastic','chemotherapy','LAHNC')"),
+  S_("t_enh_lahnc_drg_epsode"), cid[p], setting, if (is.na(date)) "NULL" else paste0("'", date, "'")))
+ins("C1", "CONCURRENT", cdx["C1"] + 10)           # inside
+ins("C2", "NEOADJUVANT", cdx["C2"] - 60)          # before -> would change
+ins("C3", "ADJUVANT", cdx["C3"] + 300)            # after advanced dx -> would change
+xq(sprintf("update %s set AdvancedDiagnosisDate = '%s' where PatientID = '%s'", S_("t_enh_lahnc"), cdx["C3"] + 200, cid["C3"]))
+ins("C4", "CONCURRENT", NA)                       # no episode date
+ins("C5", "ADVANCED", cdx["C5"] - 90)             # not first course -> not counted
+ins("C6", "ADJUVANT", cdx["C6"] + 140)            # no diagnosis date but after a known advanced dx
+xq(sprintf("update %s set DiagnosisDate = NULL, AdvancedDiagnosisDate = '%s' where PatientID = '%s'",
+           S_("t_enh_lahnc"), cdx["C6"] + 100, cid["C6"]))
+w <- run(con3)
+pos <- table(factor(chk$position, c("Inside window", "Before window", "After end of first course", "No episode date")))
+check(identical(as.integer(pos), c(2L, 1L, 2L, 1L)), "episodes inside / before / after / no date = 2 / 1 / 2 / 1 (incl. fixture F07)")
+v <- setNames(chemo_check$n, chemo_check$position)
+check(v[["Chemo Yes patients"]] == 6 && v[["Would change to No/Unknown under a date window"]] == 3 &&
+        v[["Cannot be placed (missing date)"]] == 1, "6 chemo patients: 3 would change, 1 cannot be placed")
+check(!cid["C5"] %in% chk$patientid, "ADVANCED-line chemo not counted")
+check(all(ads$chemo[ads$patientid %in% cid[c("C2", "C3", "C6")]] == "Yes"), "the check does not change Table 1")
+
+cat("\n[5] SEER comparison\n")
+w <- run(con, steps = "01")
+seer_csv <- file.path(mock_dir, "seer.csv")
+fill <- function(basis = "n", grp = groups) {
+  l <- long %>% filter(!is_header, !is.na(n_num), group %in% grp,
+                       !(section == "Sex" & label == "Unknown"), !(section == "Race/Ethnicity" & label == "Other/Unknown"),
+                       !(label == "Unknown" & section %in% c("Age at diagnosis (categorical)", "Year of Diagnosis")),
+                       !grepl("^Outside", label))
+  N <- sapply(grp_data, nrow) * 10
+  s <- l %>% mutate(n = n_num * 10, pct = round(100 * n / ifelse(section == long$section[1], N[["Overall"]], N[group]), 1),
+                    mean = NA_real_, sd = NA_real_)
+  if (basis == "n") s$pct <- NA else s$n <- NA
+  age <- tibble(section = "Age at diagnosis (years)", label = "Mean (sd)", group = grp, n = NA, pct = NA,
+                mean = sapply(grp_data[grp], function(d) mean(d$age, na.rm = TRUE)),
+                sd = sapply(grp_data[grp], function(d) sd(d$age, na.rm = TRUE)))
+  bind_rows(select(s, section, label, group, n, pct, mean, sd), age)
+}
+put <- function(d) write.csv(d, seer_csv, row.names = FALSE, na = "")
+seer_run <- function() run(con, seer = seer_csv)
+w <- seer_run()
+check(!"SEER comparison" %in% names(wb), "missing SEER table: comparison skipped")
+put(fill("n")); w <- seer_run()
+ok <- filter(seer_vars, !grepl("^Not", Rating))
+check(nrow(ok) > 0 && all(abs(ok$SMD) < 1e-9), "SEER = Flatiron's own counts: every SMD is 0")
+check(all(c("SEER comparison", "Representativeness") %in% openxlsx::getSheetNames(xlsx_path)), "SEER sheets written")
+put(fill("pct")); w <- seer_run()
+ok <- filter(seer_vars, !grepl("^Not", Rating))
+check(all(abs(ok$SMD) < 0.02), "SEER percentages only: SMDs ~0 (rounding)")
+d <- fill("n"); d$n[d$label == "Hispanic (All Races)"] <- d$n[d$label == "Hispanic (All Races)"] + 2000
+put(d); w <- seer_run()
+ok <- filter(seer_vars, !grepl("^Not", Rating))
+check(all(grepl("^Meaningful", ok$Rating[ok$Variable == "Race/Ethnicity"])) &&
+        all(ok$Rating[ok$Variable != "Race/Ethnicity"] == "Similar"), "different race mix: only race is flagged")
+d <- fill("n"); d$label[d$label == "75+ years"] <- "75+  Years"; d$group[d$group == "Overall"] <- "overall"
+put(d); w <- seer_run()
+check(all(abs(filter(seer_vars, !grepl("^Not", Rating))$SMD) < 1e-9), "labels and groups matched ignoring case and spacing")
+d <- fill("n"); d$n[d$section == "Sex" & d$label == "Female" & d$group == "Overall"] <- NA
+put(d); w <- seer_run()
+check(grepl("fewer than 2", seer_vars$Rating[seer_vars$Group == "Overall" & seer_vars$Variable == "Sex"]),
+      "a variable with one SEER category is not assessable")
+txt <- readLines(seer_csv); writeBin(c(as.raw(c(0xef, 0xbb, 0xbf)), charToRaw(paste0(paste(txt, collapse = "\n"), "\n"))), seer_csv)
+w <- seer_run(); check(all(abs(filter(seer_vars, !grepl("^Not", Rating))$SMD) < 1e-9), "CSV with a UTF-8 BOM")
+d <- fill("n"); d$label[d$label == "75+ years"] <- "75 plus"; put(d)
+expect_error(seer_run(), "not in Table 1", "a SEER label not in Table 1 stops the run")
+d <- fill("n"); d <- rbind(d, d[3, ]); put(d)
+expect_error(seer_run(), "Duplicated", "duplicated SEER rows stop the run")
+for (bv in list(c("n", "abc"), c("n", "Inf"), c("sd", "-5"))) {
+  d <- fill("n"); d[[bv[1]]] <- as.character(d[[bv[1]]])
+  d[[bv[1]]][if (bv[1] == "n") 2 else which(d$label == "Mean (sd)")[1]] <- bv[2]; put(d)
+  expect_error(seer_run(), "must be blank or a number", paste0("SEER ", bv[1], " = ", bv[2], " stops the run"))
+}
+d <- fill("n"); f <- d$section == "Sex" & d$label == "Female" & d$group == "Overall"
+d$n[f] <- NA; d$pct[f] <- 25; put(d)                     # Male has n only, Female pct only
+expect_error(seer_run(), "give n for every category", "mixed n and pct within a variable stops the run")
+own <- list(no_surgery_group = "No surgery record")
+w <- run(con, steps = "01"); put(fill("n"))              # SEER = Flatiron with no surgery counted as Unresected
+w <- run(con, own, seer = seer_csv)                      # Table 1 with its own No surgery record column
+ok <- filter(seer_vars, !grepl("^Not", Rating))
+check(identical(groups[5], "No surgery record") && !"No surgery record" %in% seer_vars$Group &&
+        nrow(ok) > 0 && all(abs(ok$SMD) < 1e-9),
+      "with its own Table 1 column, no-surgery patients are compared within Unresected (every SMD is 0)")
+expect_error(run(con, c(own, list(seer_no_surgery_group = "Resected")), seer = seer_csv), "seer_no_surgery_group",
+             "seer_no_surgery_group other than Unresected or Unknown stops the run")
+
+cat("\n[6] SEER Table 2 input (inputs/seer_table2_laHNSCC.csv)\n")
+s2 <- read.csv("inputs/seer_table2_laHNSCC.csv", check.names = FALSE)
+inc_sec <- "Incidence of Head and Neck Squamous Cell Carcinoma"
+n2 <- filter(s2, !is.na(n))
+inc_n <- setNames(n2$n[n2$section == inc_sec], n2$group[n2$section == inc_sec])
+blk <- n2 %>% filter(section != inc_sec) %>% group_by(section, group) %>% summarise(t = sum(n), .groups = "drop")
+rws <- n2 %>% group_by(section, label) %>% summarise(ok = n[group == "Overall"] == sum(n[group != "Overall"]), .groups = "drop")
+check(inc_n[["Overall"]] == 36402 && all(blk$t == inc_n[blk$group]) && all(rws$ok) &&
+        nrow(filter(s2, label == "Mean (sd)", !is.na(mean), !is.na(sd))) == 4,
+      "transcription: each variable adds up to its group N, Overall = sum of the surgery groups, age mean/sd for 4 groups")
+check(!any(n2$section %in% c("HPV status", "Receipt of chemotherapy (1L)", "Receipt of radiation (1L)", "Type of Reporting Source")),
+      "HPV, chemotherapy, radiation and reporting source are left blank")
+w <- run(con, seer = "inputs/seer_table2_laHNSCC.csv")
+check(all(c("SEER comparison", "Representativeness") %in% openxlsx::getSheetNames(xlsx_path)) &&
+        setequal(unique(seer_vars$Group), c("Overall", "Unresected", "Resected", "Unknown")) &&
+        all(grepl("^Not assessable", seer_vars$Rating[seer_vars$Variable %in% c("HPV status", "Type of Reporting Source")])),
+      "the Table 2 input matches Table 1's labels and runs with the default settings")
+
+cat("\nALL CHECKS PASSED\n")
+########## END OF FILE: tests/mock_run.R ##########
