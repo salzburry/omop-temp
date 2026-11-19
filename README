@@ -1,0 +1,200 @@
+# =============================================================================
+# 04_open_questions.R : data answers to the open sign-off questions (README)
+# =============================================================================
+# Run from the lahnscc_rdq folder:   Rscript R/04_open_questions.R
+# It runs run_all.R first unless that has already run in this R session.
+# Writes <stem>_open_questions.xlsx to out_dir and prints the main tables.
+#   Q1  Unknown T or N: how many patients the T1-T2 N1 rule cannot decide, and what
+#       their GroupStage implies.
+#   Q2  T/N staging: T/N against GroupStage under AJCC 7th and 8th edition rules; the
+#       stage, HPV and p16 fields available.
+#   Q3  Surgery as first course: surgeries outside each candidate window, and the
+#       patients whose surgery group would change.
+# rw-TTD is not a data question and is not covered. Nothing in Table 1 changes.
+# =============================================================================
+if (!exists("ads") || !exists("cohort_hn")) source("run_all.R")
+options(width = 200)
+answers <- list()
+answer <- function(sheet, expr) {             # one sheet per answer; a failure is recorded, not fatal
+  res <- tryCatch(expr, error = function(e) tibble(note = paste("Not answered:", conditionMessage(e))))
+  answers[[sheet]] <<- res
+  message("\n== ", sheet, " =="); print(as.data.frame(res), row.names = FALSE)
+  invisible(res)
+}
+gs_of <- function(x) {                        # Flatiron GroupStage -> III / IVA / IVB / IV / other
+  y <- toupper(gsub("(?i)stage|[[:space:]]", "", coalesce(x, ""), perl = TRUE))
+  case_when(y %in% c("IVA", "IVB", "IVC", "IV", "III", "II", "I") ~ y,
+            grepl("^III[ABC]$", y) ~ "III", TRUE ~ "Unknown")
+}
+t_sub <- function(x) {                        # T category keeping T4a / T4b: "T4a" -> "T4A", "cT4" -> "T4"
+  y <- tn_key(x); full <- "^(Y?[CP]|Y)?(T[0-4])([A-C])?$"
+  ifelse(grepl(full, y), paste0(sub(full, "\\2", y), ifelse(sub(full, "\\2", y) == "T4", sub(full, "\\3", y), "")),
+         NA_character_)
+}
+hpv_pos <- function(x) norm(x) %in% "hpv positive"
+is_opc  <- function(x) norm(x) %in% "oropharynx"
+# AJCC 8th stages HPV-positive oropharynx, and HPV-positive unknown primary (T0), on the p16+ grid
+p16_grid <- function(site, hpv) hpv_pos(hpv) & (is_opc(site) | grepl("unknown primary", norm(site)))
+
+# ---- Q1 Unknown T or N ------------------------------------------------------------------
+# GroupStage settles some undetermined patients. On the AJCC grid used for all sites in the 7th
+# edition (and in the 8th for all but HPV+ oropharynx / unknown primary), T1-T2 N1 M0 is stage III:
+# T1-T2 at III means N1; stage IVA/IVB (or a bare IV, read as M0) rules out T1-T2 N1; stage I-II
+# means N0. IVC (M1) can be any T and N. For HPV+ oropharynx / unknown primary, IVA/IVB exist only
+# on that grid, so they also rule out T1-T2 N1; III and a bare IV depend on the edition (Q2).
+q1 <- cohort_hn %>%
+  mutate(t_read = tn_status(t_stage, t_cat), n_read = tn_status(n_stage, n_cat), gs = gs_of(groupstage),
+         hpv_opc = p16_grid(primarysite, hpvstatus),
+         rule = case_when(t_cat %in% c("T1", "T2") & n_cat %in% "N1" ~ "Excluded: T1-T2 N1",
+                          (!is.na(t_cat) & !t_cat %in% c("T1", "T2")) | (!is.na(n_cat) & !n_cat %in% "N1") ~
+                            "Kept: not T1-T2 N1",
+                          TRUE ~ "Undetermined (kept): could be T1-T2 N1, T or N unknown or unrecognised"),
+         why = case_when(!grepl("^Undetermined", rule) ~ NA_character_,
+                         is.na(t_cat) & is.na(n_cat) ~ "T and N unknown",
+                         is.na(t_cat) ~ "T unknown, N1", TRUE ~ "T1-T2, N unknown"),
+         implied = case_when(
+           is.na(why) ~ NA_character_,
+           gs == "Unknown" ~ "GroupStage does not settle it",
+           gs == "IVC" ~ "Stage IVC (M1): any T and N, not settled",
+           hpv_opc & gs %in% c("III", "IV") ~ "HPV+ oropharynx / unknown primary at III or IV: depends on the staging edition (Q2)",
+           gs %in% c("IV", "IVA", "IVB") ~ "Stage IV (M0) rules out T1-T2 N1: stays",
+           !hpv_opc & gs %in% c("I", "II") & why != "T unknown, N1" ~ "Stage I-II implies N0: stays",
+           why == "T1-T2, N unknown" & gs == "III" ~ "Stage III implies N1: would be excluded",
+           why == "T unknown, N1" & gs == "III" ~ "Stage III: T1-T3, not settled",
+           why == "T and N unknown" & gs == "III" ~ "Stage III: T1-T2 N1 or T3 N0-N1, not settled",
+           TRUE ~ "GroupStage does not settle it"))
+n_unk <- sum(is.na(q1$t_cat) | is.na(q1$n_cat))
+answer("Q1 T1-T2 N1 rule", count(q1, rule, name = "patients") %>%
+         mutate(note = c(sprintf("If undetermined patients were excluded instead, the primary population would be %d, not %d.",
+                                 sum(q1$rule == "Kept: not T1-T2 N1"), sum(q1$rule != "Excluded: T1-T2 N1")),
+                         sprintf("All patients with T or N unknown or unrecognised: %d (as on the Attrition sheet); %d of them are kept whatever the unknown value, because their known T or N rules out T1-T2 N1.",
+                                 n_unk, n_unk - sum(grepl("^Undetermined", q1$rule))),
+                         rep("", max(0, n() - 2)))[seq_len(n())]))
+answer("Q1 undetermined", count(filter(q1, !is.na(why)), why, gs, implied, name = "patients"))
+answer("Q1 T by N read", count(q1, t_read, n_read, name = "patients"))
+
+# ---- Q2 T/N staging ---------------------------------------------------------------------
+stage_common <- function(t, n) case_when(     # AJCC 7th (all sites); 8th clinical except p16+ oropharynx
+  n == "N3" ~ "IVB", t == "T4B" ~ "IVB", t == "T4A" ~ "IVA", t == "T4" ~ "IVA/IVB", n == "N2" ~ "IVA",
+  t == "T3" ~ "III", n == "N1" ~ "III", t == "T2" ~ "II", t == "T1" ~ "I", TRUE ~ NA_character_)
+stage_p16 <- function(t, n) case_when(        # AJCC 8th clinical, p16-positive oropharynx
+  substr(t, 1, 2) == "T4" | n == "N3" ~ "III", t == "T3" | n == "N2" ~ "II",
+  t %in% c("T0", "T1", "T2") & n %in% c("N0", "N1") ~ "I", TRUE ~ NA_character_)
+fits <- function(expected, gs) !is.na(expected) &
+  (expected == gs | (expected == "IVA/IVB" & gs %in% c("IVA", "IVB")) | (gs == "IV" & expected %in% c("IVA", "IVB", "IVA/IVB")))
+q2 <- cohort_hn %>%
+  mutate(ts = t_sub(t_stage), gs = gs_of(groupstage),
+         group = ifelse(p16_grid(primarysite, hpvstatus), "HPV+ oropharynx / unknown primary", "All other patients"),
+         exp7 = stage_common(ts, n_cat),
+         exp8 = ifelse(group == "All other patients", stage_common(ts, n_cat), stage_p16(ts, n_cat))) %>%
+  filter(!is.na(ts), !is.na(n_cat), gs != "Unknown")
+answer("Q2 edition check", q2 %>% group_by(group) %>%
+         summarise(`patients with T, N and GroupStage` = n(),
+                   `fit AJCC 7th` = sum(fits(exp7, gs)), `fit AJCC 8th (clinical)` = sum(fits(exp8, gs)),
+                   `fit neither` = sum(!fits(exp7, gs) & !fits(exp8, gs)), .groups = "drop") %>%
+         mutate(note = ifelse(group != "All other patients",
+                              "The editions differ here: more fits under one edition shows which one TStage/NStage/GroupStage follow.",
+                              "Both editions use the same grid here: this checks that T/N and GroupStage agree.")))
+answer("Q2 misfits", q2 %>% filter(!fits(exp7, gs) & !fits(exp8, gs)) %>%
+         count(group, T = ts, N = n_cat, GroupStage = gs, `AJCC 7th` = exp7, `AJCC 8th` = exp8, name = "patients") %>%
+         arrange(desc(patients)))
+coh_cols <- colnames(src("cohort"))
+answer("Q2 cohort fields", {
+  hits <- grep("stage|tnm|ajcc|edition|clinical|patholog|hpv|p16", coh_cols, value = TRUE, ignore.case = TRUE)
+  bind_rows(tibble(field = "(all Enhanced_LAHNC columns)", value = paste(coh_cols, collapse = ", "), patients = NA_integer_),
+            bind_rows(lapply(hits, function(v) {
+              x <- src("cohort") %>% count(value = .data[[v]]) %>% collect() %>% arrange(desc(n))
+              tibble(field = v, value = as.character(x$value), patients = as.integer(x$n)) %>% head(40)
+            })))
+})
+answer("Q2 HPV p16 tables", {
+  tabs <- grep(paste0("(bio|bm|mrk|mark|hpv|p16).*_", refresh, "$"), schema_tables, value = TRUE, ignore.case = TRUE)
+  if (!length(tabs)) {
+    other <- setdiff(grep(paste0("_", refresh, "$"), schema_tables, value = TRUE, ignore.case = TRUE), tbl_map)
+    tibble(note = paste0("No table name matched bio/bm/mrk/mark/hpv/p16 for refresh ", refresh, ". Tables not used by the ",
+                         "analysis: ", paste(other, collapse = ", ")))
+  }
+  else bind_rows(lapply(tabs, function(t) {
+    tb <- tbl(con, in_schema(schema, t)) %>% rename_with(tolower)
+    cols <- grep("biomarker|test|type|method|assay|result|status|name", colnames(tb), value = TRUE)
+    bind_rows(tibble(table = t, field = "(columns)", value = paste(colnames(tb), collapse = ", "), records = NA_integer_),
+              bind_rows(lapply(cols, function(v) {
+                x <- tb %>% count(value = .data[[v]]) %>% collect()
+                x <- if (nrow(x) > 40) filter(x, grepl("hpv|p16", value, ignore.case = TRUE)) else x
+                tibble(table = t, field = v, value = as.character(x$value), records = as.integer(x$n))
+              })))
+  }))
+})
+
+# ---- Q3 Surgery as first course ---------------------------------------------------------
+# The RWB lead's comment: count surgeries "on or after dx date and on or before start of 1L".
+# Candidate readings of "start of 1L" (all inclusive):
+#   (a) the first ADVANCED-setting drug episode;
+#   (b) the end of first course used for radiation (first recurrence or AdvancedDiagnosisDate);
+#   (c) the first drug episode of any setting (surgery before any systemic therapy);
+#   (d) no end: on or after diagnosis only.
+# Undated records, and month/year-only dates that straddle the diagnosis date or the window end,
+# cannot be placed: they stay in every window (as in Table 1), so the counts show only what the
+# window removes. Patients with no surgery left in the window count as no_surgery_group.
+answer("Q3 surgery windows", {
+  scols <- colnames(src("surgery"))
+  cand <- grep("date", scols, value = TRUE); cand <- cand[!grepl("granularity", cand)]
+  dcol <- if ("surgerydate" %in% scols) "surgerydate" else cand
+  if (length(dcol) != 1)
+    stop("cannot tell which primary-surgery column is the surgery date (", length(dcol), " candidates: ",
+         paste(dcol, collapse = ", "), "); its columns: ", paste(scols, collapse = ", "))
+  gcol <- intersect(paste0(dcol, "granularity"), scols)
+  rec <- src("surgery") %>% filter(patientid %in% !!ids) %>%
+    select(patientid, surgerytype, sdate = all_of(dcol), any_of(c(gran = gcol))) %>% collect()
+  if (!"gran" %in% names(rec)) rec$gran <- NA_character_
+  rec <- rec %>% mutate(sdate = as.Date(sdate), g = toupper(coalesce(trimws(gran), "DAY")),
+                        lo = case_when(g == "YEAR" ~ floor_date(sdate, "year"), g == "MONTH" ~ floor_date(sdate, "month"),
+                                       TRUE ~ sdate),
+                        hi = case_when(g == "YEAR" ~ ceiling_date(sdate, "year", change_on_boundary = TRUE) - 1,
+                                       g == "MONTH" ~ ceiling_date(sdate, "month", change_on_boundary = TRUE) - 1,
+                                       TRUE ~ sdate))
+  ends <- ads %>% select(patientid, dx_date) %>%
+    left_join(select(fc_end, patientid, fc_end), by = "patientid") %>%
+    left_join(drugs %>% filter(toupper(norm(linesetting)) == "ADVANCED", !is.na(episodedate)) %>%
+                group_by(patientid) %>% summarise(adv1 = min(as.Date(episodedate)), .groups = "drop"), by = "patientid") %>%
+    left_join(drugs %>% filter(!is.na(episodedate)) %>%
+                group_by(patientid) %>% summarise(sys1 = min(as.Date(episodedate)), .groups = "drop"), by = "patientid")
+  rec <- left_join(rec, ends, by = "patientid")
+  q3_new <<- list()
+  defs <- list("(a) to first ADVANCED-setting drug episode" = "adv1",
+               "(b) to end of first course (recurrence / advanced diagnosis)" = "fc_end",
+               "(c) to first drug episode of any setting" = "sys1",
+               "(d) on or after diagnosis, no end" = NA)
+  bind_rows(lapply(names(defs), function(d) {
+    end <- if (is.na(defs[[d]])) as.Date(NA) else rec[[defs[[d]]]]
+    pos <- case_when(is.na(rec$sdate) ~ "undated (kept)", is.na(rec$dx_date) ~ "no diagnosis date (kept)",
+                     rec$hi < rec$dx_date ~ "before diagnosis",
+                     !is.na(end) & rec$lo > end ~ "after the window end",
+                     rec$lo < rec$dx_date | (!is.na(end) & rec$hi > end) ~ "month/year date across a window edge (kept)",
+                     TRUE ~ "in window")
+    new <- ads %>% select(patientid, current = surg_group) %>%
+      left_join(surg_patient_group(rec[!pos %in% c("before diagnosis", "after the window end"), ]), by = "patientid") %>%
+      mutate(current = as.character(current), new = coalesce(surg_group, no_surgery_group))
+    q3_new[[d]] <<- new                       # per patient, for checking
+    bind_rows(if (d == names(defs)[1]) tibble(definition = "all", item = paste("surgery date column used:", dcol,
+                                                                                if (length(gcol)) paste("with", gcol) else ""), n = NA_integer_),
+              tibble(definition = d, item = paste("surgery records:", names(table(pos))), n = as.integer(table(pos))),
+              count(new, current, new) %>%
+                transmute(definition = d, item = paste0("patients: ", current, " -> ", new), n))
+  }))
+})
+
+# ---- Write ------------------------------------------------------------------------------
+wq <- createWorkbook()
+for (sh in names(answers)) { addWorksheet(wq, sh); writeData(wq, sh, answers[[sh]]) }
+addWorksheet(wq, "Notes")
+writeData(wq, "Notes", c(
+  "Data answers to the README's open sign-off questions; Table 1 is unchanged.",
+  "Q1: the T1-T2 N1 rule on the population before that exclusion; GroupStage inference uses the AJCC grid shared by the 7th edition and the 8th (except HPV+ oropharynx / unknown primary, where only IVA/IVB settle it).",
+  "Q2: a majority fit for HPV+ oropharynx / unknown primary under one edition indicates which edition the T/N and GroupStage follow; field lists show any edition, clinical/pathological or p16 fields.",
+  "Q3: candidate readings of 'start of 1L' for the surgery window (end date included); undated records and month/year dates across a window edge stay in; patients with no surgery left in the window count as no_surgery_group.",
+  "rw-TTD is not covered: it is not a data question.",
+  "Counts under 5 are for internal use only (Flatiron masking rules)."))
+q_path <- file.path(out_dir, paste0(out_stem, "_open_questions.xlsx"))
+saveWorkbook(wq, q_path, overwrite = TRUE)
+message("\nWritten: ", q_path)
