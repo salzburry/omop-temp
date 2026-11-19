@@ -1,0 +1,26 @@
+# =============================================================================
+# 05_find_tnm.R : where are T, N and M stage in this delivery? (prints only)
+# =============================================================================
+# Run from the lahnscc_rdq folder:   Rscript R/05_find_tnm.R
+# Lists every table of the delivery (refresh) with its columns, and the values of
+# any column that looks like T, N or M stage, a TNM/AJCC field or a group stage.
+# The cohort table (Enhanced_LAHNC) of 2026m07 has GroupStage but no TStage/NStage,
+# so the T1-T2 N1 exclusion stops; this shows whether another table holds them.
+# =============================================================================
+if (!exists("con") || !exists("schema_tables")) source("R/00_setup.R")
+options(width = 200)
+tnm_pat <- "stage|tnm|ajcc|edition|(^|_)[tnm]_?(cat|category|class)|tumou?r|node|metast|clinical|patholog"
+tnm_tabs <- sort(schema_tables[grepl(paste0("_", refresh, "$"), schema_tables, ignore.case = TRUE)])
+tnm_scan <- do.call(rbind, lapply(tnm_tabs, function(t) {
+  tb <- tbl(con, in_schema(schema, t)) %>% rename_with(tolower)
+  cols <- colnames(tb)
+  cat("\n==", t, "==\n", paste(cols, collapse = ", "), "\n")
+  hits <- grep(tnm_pat, cols, value = TRUE)
+  for (v in hits) {
+    x <- tb %>% count(value = .data[[v]]) %>% collect() %>% arrange(desc(n))
+    cat("  --", v, "(", nrow(x), "values )\n"); print(as.data.frame(head(x, 25)), row.names = FALSE)
+  }
+  data.frame(table = t, stage_like_columns = paste(hits, collapse = ", "))
+}))
+cat("\nSummary: tables with stage-like columns\n")
+print(tnm_scan[tnm_scan$stage_like_columns != "", ], row.names = FALSE, right = FALSE)
